@@ -1,0 +1,26 @@
+{
+  "name": "centy-hr-bff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "seed:test-hr": "tsx scripts/seed-test-hr-data.ts"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^8.3.0",
+    "@supabase/supabase-js": "^2.99.3",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
