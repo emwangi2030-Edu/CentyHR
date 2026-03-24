@@ -2,7 +2,32 @@
 
 Centy uses **custom fields on the document** (not ERPNext Workflow) so the BFF can drive first vs second approver with `frappe.client.set_value`.
 
-## Leave Application
+## Option A — Automated (recommended)
+
+On the **Frappe bench** server, from the repo copy or deploy of this file:
+
+`bff/scripts/install_two_stage_erpnext_fields.py`
+
+```bash
+cd /path/to/frappe-bench
+bench --site YOUR_SITE console
+```
+
+In the Python console:
+
+```python
+exec(open("/absolute/path/to/install_two_stage_erpnext_fields.py").read())
+install_two_stage_erpnext_fields()
+import frappe
+frappe.db.commit()
+```
+
+- Idempotent: safe to re-run (`create_custom_fields(..., update=True)`).
+- If `insert_after` fails on your site (custom form layout), edit the script’s `insert_after` (`status` / `approval_status`) or use Option B.
+
+## Option B — Manual (Customize Form)
+
+### Leave Application
 
 1. Open **Customize Form** → *Leave Application*.
 2. Add a **Check** field:
@@ -11,7 +36,7 @@ Centy uses **custom fields on the document** (not ERPNext Workflow) so the BFF c
    - **Allow on Submit:** Yes (required so submitted leaves can be updated)
 3. Save.
 
-## Expense Claim
+### Expense Claim
 
 1. **Customize Form** → *Expense Claim*.
 2. Add the same pattern:
