@@ -11,3 +11,17 @@ export interface HrContext {
   /** HR can create/submit claims for employees in the same company. */
   canSubmitOnBehalf: boolean;
 }
+
+/** ERPNext Asset doctype fields. */
+export interface Asset {
+  name: string;
+  asset_name: string;
+  item_code?: string;
+  asset_category?: string;
+  location?: string;
+  custodian?: string; // Employee name
+  status: string;
+  image?: string;
+  purchase_date?: string;
+  // Add more fields as needed
+}

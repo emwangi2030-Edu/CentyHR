@@ -4,6 +4,7 @@ import { healthRoutes } from "./routes/health.js";
 import { employeeRoutes } from "./routes/employee.js";
 import { employeePublicRoutes } from "./routes/employeePublic.js";
 import { expenseRoutes } from "./routes/expenses.js";
+import { assetsRoutes } from "./routes/assets.js";
 
 async function main() {
   const prefix = config.BASE_PATH;
@@ -15,6 +16,7 @@ async function main() {
   await app.register(employeePublicRoutes, { prefix });
   await app.register(employeeRoutes, { prefix });
   await app.register(expenseRoutes, { prefix });
+  await app.register(assetsRoutes, { prefix });
   await app.listen({ port: config.PORT, host: config.HR_BFF_HOST });
 }
 
