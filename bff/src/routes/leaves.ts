@@ -180,6 +180,65 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
+  /** Leave Allocation rows (balances) — employees see only self; HR must pass `?employee=`. */
+  app.get("/v1/leave-balances", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const qEmp = String((req.query as { employee?: string })?.employee ?? "").trim();
+    try {
+      let employeeId: string;
+      if (ctx.canSubmitOnBehalf) {
+        if (!qEmp) {
+          return reply
+            .status(400)
+            .send({ error: "employee query parameter is required for HR leave balance lookup" });
+        }
+        const empDoc = await erp.getDoc(ctx.creds, "Employee", qEmp);
+        if (String(empDoc.company) !== ctx.company) {
+          return reply.status(403).send({ error: "Employee not in your Company" });
+        }
+        employeeId = qEmp;
+      } else {
+        const selfId = await resolveSelfEmployee(ctx);
+        if (!selfId) {
+          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        }
+        if (qEmp && qEmp !== selfId) {
+          return reply.status(403).send({ error: "You may only view your own leave balances" });
+        }
+        employeeId = selfId;
+      }
+      const rows = await erp.getList(ctx.creds, "Leave Allocation", {
+        filters: [
+          ["company", "=", ctx.company],
+          ["employee", "=", employeeId],
+          ["docstatus", "!=", 2],
+        ],
+        fields: [
+          "name",
+          "leave_type",
+          "from_date",
+          "to_date",
+          "new_leaves_allocated",
+          "total_leaves_allocated",
+          "carry_forward",
+          "docstatus",
+        ],
+        order_by: "modified desc",
+        limit_page_length: 100,
+      });
+      return { data: rows };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
   app.get("/v1/leave-applications/summary", async (req, reply) => {
     let ctx: HrContext;
     try {
