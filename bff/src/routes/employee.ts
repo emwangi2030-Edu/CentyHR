@@ -90,6 +90,7 @@ const EMPLOYEE_CREATE_FIELDS = new Set([
   "first_name",
   "last_name",
   "gender",
+  "date_of_birth",
   "date_of_joining",
   "department",
   "designation",
@@ -359,9 +360,18 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     doc.last_name = last;
     doc.employee_name = `${first} ${last}`.trim();
 
+    const rawGender = String(doc.gender ?? "").trim().toLowerCase();
+    if (rawGender === "m" || rawGender === "male") doc.gender = "Male";
+    else if (rawGender === "f" || rawGender === "female") doc.gender = "Female";
+
     const doj = String(doc.date_of_joining ?? "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(doj)) {
       doc.date_of_joining = new Date().toISOString().slice(0, 10);
+    }
+
+    const dob = String(doc.date_of_birth ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
+      doc.date_of_birth = String(doc.date_of_joining ?? "").slice(0, 10);
     }
 
     try {
