@@ -138,9 +138,11 @@ export class ErpNextClient {
     doctype: string,
     opts: {
       filters?: unknown[];
+      or_filters?: unknown[];
       fields?: string[];
       order_by?: string;
       limit_page_length?: number;
+      limit_start?: number;
     }
   ): Promise<unknown[]> {
     const payload: Record<string, unknown> = {
@@ -149,7 +151,9 @@ export class ErpNextClient {
       filters: opts.filters ?? [],
       limit_page_length: opts.limit_page_length ?? 20,
     };
+    if (opts.or_filters && opts.or_filters.length > 0) payload.or_filters = opts.or_filters;
     if (opts.order_by) payload.order_by = opts.order_by;
+    if (opts.limit_start != null) payload.limit_start = opts.limit_start;
     const data = (await this.callMethod(creds, "frappe.client.get_list", payload)) as {
       message?: unknown[];
     };
