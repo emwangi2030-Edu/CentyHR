@@ -9,6 +9,8 @@ import { ErpError } from "../erpnext/client.js";
 import { publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 import * as config from "../config.js";
+import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
+import { leaveManagerBlockedByDayCeiling, leaveManagerDayCeilingMessage } from "../lib/leaveManagerApprovePolicy.js";
 
 const erp = defaultClient();
 
@@ -133,15 +135,23 @@ async function approveLeaveOnce(ctx: HrContext, name: string): Promise<ApproveLe
     };
   }
   const maxDays = config.LEAVE_MANAGER_APPROVE_MAX_DAYS;
-  if (maxDays != null && !ctx.canSubmitOnBehalf) {
-    const days = Number(cur.total_leave_days ?? 0);
-    if (Number.isFinite(days) && days > maxDays) {
-      return {
-        ok: false,
-        status: 403,
-        error: `Only HR may approve leave longer than ${maxDays} day(s) (configure LEAVE_MANAGER_APPROVE_MAX_DAYS)`,
-      };
-    }
+  if (
+    maxDays != null &&
+    leaveManagerBlockedByDayCeiling(cur.total_leave_days, maxDays, ctx.canSubmitOnBehalf)
+  ) {
+    logHrPolicyDenial("leave_approve_day_ceiling", {
+      company: ctx.company,
+      user_email: ctx.userEmail,
+      app_role: ctx.appRole ?? null,
+      leave_application: name,
+      total_leave_days: cur.total_leave_days ?? null,
+      leave_manager_max_days: maxDays,
+    });
+    return {
+      ok: false,
+      status: 403,
+      error: leaveManagerDayCeilingMessage(maxDays),
+    };
   }
   await erp.callMethod(ctx.creds, "frappe.client.set_value", {
     doctype: "Leave Application",

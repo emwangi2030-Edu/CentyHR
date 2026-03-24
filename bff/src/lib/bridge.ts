@@ -1,6 +1,15 @@
 import crypto from "crypto";
 
-export type BridgePayload = { email: string; company: string; canHr: boolean; exp: number };
+/** Signed by Pay Hub; `appRole` is optional for older bridge tokens. */
+export type BridgePayload = {
+  email: string;
+  company: string;
+  canHr: boolean;
+  exp: number;
+  displayName?: string;
+  /** Pay Hub `user.role` — stage-1 vs stage-2 UX and future BFF rules. */
+  appRole?: string;
+};
 
 export function verifyBridgeAuth(header: string, secret: string): BridgePayload | null {
   const parts = header.split(".");

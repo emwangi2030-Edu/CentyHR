@@ -10,6 +10,8 @@ export interface HrContext {
   creds: ErpCredentials;
   /** HR can create/submit claims for employees in the same company. */
   canSubmitOnBehalf: boolean;
+  /** Pay Hub application role from signed bridge (optional on legacy tokens). */
+  appRole?: string;
 }
 
 /** ERPNext Asset doctype fields. */

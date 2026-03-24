@@ -48,11 +48,13 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
       );
     }
 
+    const appRoleRaw = verified.appRole != null ? String(verified.appRole).trim() : "";
     return {
       userEmail: verified.email,
       company: verified.company,
       creds,
       canSubmitOnBehalf: verified.canHr,
+      ...(appRoleRaw ? { appRole: appRoleRaw } : {}),
     };
   }
 
@@ -60,6 +62,7 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
     const userEmail = String(req.headers["x-dev-user-email"] ?? "").trim();
     const company = String(req.headers["x-dev-company"] ?? "").trim();
     const canSubmitOnBehalf = req.headers["x-dev-hr"] === "1";
+    const appRole = String(req.headers["x-dev-app-role"] ?? "").trim();
     if (!userEmail || !company) {
       throw new HttpError("Missing X-Dev-User-Email or X-Dev-Company", 401);
     }
@@ -71,6 +74,7 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
       company,
       creds: { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET },
       canSubmitOnBehalf,
+      ...(appRole ? { appRole } : {}),
     };
   }
 

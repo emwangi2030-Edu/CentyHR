@@ -10,7 +10,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "seed:test-hr": "tsx scripts/seed-test-hr-data.ts"
+    "seed:test-hr": "tsx scripts/seed-test-hr-data.ts",
+    "test": "tsx --test src/lib/leaveManagerApprovePolicy.test.ts"
   },
   "dependencies": {
     "@fastify/multipart": "^8.3.0",

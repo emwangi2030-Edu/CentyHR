@@ -17,6 +17,7 @@ import {
   upsertCompanyRules,
   type PolicyWarningPublic,
 } from "../lib/expenseRules.js";
+import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
 
 const erp = defaultClient();
 
@@ -72,6 +73,16 @@ async function approveExpenseClaimOnce(
     canSubmitOnBehalf: ctx.canSubmitOnBehalf,
   });
   if (wfBlock) {
+    if (wfBlock.code === "approve_ceiling") {
+      logHrPolicyDenial("expense_approve_amount_ceiling", {
+        company: ctx.company,
+        user_email: ctx.userEmail,
+        app_role: ctx.appRole ?? null,
+        expense_claim: claimName,
+        claim_total: cur.total_claimed_amount ?? cur.grand_total ?? null,
+        ceiling: pack.workflow.approve_ceiling_for_non_finance ?? null,
+      });
+    }
     return { ok: false, status: 400, error: `Policy: ${wfBlock.message}` };
   }
   await erp.callMethod(ctx.creds, "frappe.client.set_value", {
