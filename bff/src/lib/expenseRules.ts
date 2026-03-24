@@ -58,10 +58,19 @@ function getSupabase(): SupabaseClient | null {
   return supabase;
 }
 
+/** Default two-stage labels for UIs (`workflow.steps`) — line manager then HR / finance. */
+function defaultWorkflowSteps(): NonNullable<ExpenseWorkflow["steps"]> {
+  return [
+    { key: "submit", label: "Submit", lane: "employee" },
+    { key: "line_manager", label: "Line manager", lane: "approver" },
+    { key: "hr_finance", label: "HR / Finance", lane: "finance" },
+  ];
+}
+
 function defaultPack(): CompanyRulesPack {
   return {
     policy: {},
-    workflow: {},
+    workflow: { steps: defaultWorkflowSteps() },
     feature_flags: { wallet_pay: true, offline_pay: true, bulk_actions: true },
   };
 }
@@ -103,9 +112,13 @@ export async function loadCompanyRulesPack(companyKey: string): Promise<CompanyR
     return empty;
   }
 
+  const wf = (data?.workflow as ExpenseWorkflow) ?? {};
   const pack: CompanyRulesPack = {
     policy: (data?.policy as ExpensePolicy) ?? {},
-    workflow: (data?.workflow as ExpenseWorkflow) ?? {},
+    workflow: {
+      ...wf,
+      steps: wf.steps && wf.steps.length > 0 ? wf.steps : defaultWorkflowSteps(),
+    },
     feature_flags: normalizeFlags((data?.feature_flags as ExpenseFeatureFlags) ?? {}),
   };
   cache.set(companyKey, { pack, exp: now + TTL_MS });

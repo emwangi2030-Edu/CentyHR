@@ -41,3 +41,15 @@ export const ERP_API_SECRET = process.env.ERP_API_SECRET ?? "";
  */
 export const SUPABASE_URL = process.env.SUPABASE_URL ?? "";
 export const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+
+/**
+ * Optional: max leave days a document `leave_approver` (line manager) may approve without HR.
+ * If a request exceeds this, only `canSubmitOnBehalf` may approve — mirrors expense
+ * `approve_ceiling_for_non_finance`. Unset = no day ceiling (ERP / single approver field still applies).
+ */
+export const LEAVE_MANAGER_APPROVE_MAX_DAYS: number | null = (() => {
+  const raw = process.env.LEAVE_MANAGER_APPROVE_MAX_DAYS?.trim();
+  if (raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+})();

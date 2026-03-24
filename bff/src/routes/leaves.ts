@@ -8,6 +8,7 @@ import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
 import { publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
+import * as config from "../config.js";
 
 const erp = defaultClient();
 
@@ -131,6 +132,17 @@ async function approveLeaveOnce(ctx: HrContext, name: string): Promise<ApproveLe
       error: "Only the assigned leave approver or HR-privileged user can approve",
     };
   }
+  const maxDays = config.LEAVE_MANAGER_APPROVE_MAX_DAYS;
+  if (maxDays != null && !ctx.canSubmitOnBehalf) {
+    const days = Number(cur.total_leave_days ?? 0);
+    if (Number.isFinite(days) && days > maxDays) {
+      return {
+        ok: false,
+        status: 403,
+        error: `Only HR may approve leave longer than ${maxDays} day(s) (configure LEAVE_MANAGER_APPROVE_MAX_DAYS)`,
+      };
+    }
+  }
   await erp.callMethod(ctx.creds, "frappe.client.set_value", {
     doctype: "Leave Application",
     name,
@@ -253,14 +265,19 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         ["company", "=", ctx.company],
         ...pendingFilters(),
       ];
+      let or_filters: [string, string, string][] | undefined;
       if (!ctx.canSubmitOnBehalf) {
         const selfId = await resolveSelfEmployee(ctx);
         if (!selfId)
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
-        filters.push(["employee", "=", selfId]);
+        or_filters = [
+          ["employee", "=", selfId],
+          ["leave_approver", "=", ctx.userEmail],
+        ];
       }
       const rows = await erp.getList(ctx.creds, "Leave Application", {
         filters,
+        or_filters,
         fields: ["name"],
         limit_page_length: CAP + 1,
       });
@@ -288,6 +305,7 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
     const qEmp = String((req.query as { employee?: string })?.employee ?? "").trim();
     const qStatus = String((req.query as { status?: string })?.status ?? "all").trim();
     try {
+      let or_filters: [string, string, string][] | undefined;
       let hrEmployeeFilter = "";
       if (!ctx.canSubmitOnBehalf) {
         const selfId = await resolveSelfEmployee(ctx);
@@ -296,7 +314,10 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         if (qEmp && qEmp !== selfId) {
           return reply.status(403).send({ error: "Cannot filter by another employee" });
         }
-        hrEmployeeFilter = selfId;
+        or_filters = [
+          ["employee", "=", selfId],
+          ["leave_approver", "=", ctx.userEmail],
+        ];
       } else if (qEmp) {
         const other = await erp.getDoc(ctx.creds, "Employee", qEmp);
         if (String(other.company) !== ctx.company) {
@@ -309,6 +330,7 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const take = pageSize + 1;
       const rowObjs = await erp.getList(ctx.creds, "Leave Application", {
         filters,
+        or_filters,
         fields: [
           "name",
           "employee",
