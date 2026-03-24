@@ -33,10 +33,16 @@ export const hrApprovalMetaRoutes: FastifyPluginAsync = async (app) => {
         ],
         leave: {
           manager_approve_max_days: config.LEAVE_MANAGER_APPROVE_MAX_DAYS,
+          two_stage_custom_field: config.LEAVE_TWO_STAGE_APPROVAL,
+          first_approver_field: config.LEAVE_TWO_STAGE_APPROVAL ? config.LEAVE_FIRST_APPROVER_FIELD : null,
+          hr_bypass_first_approver: config.LEAVE_HR_BYPASS_FIRST_APPROVER,
         },
         expense: {
           approve_ceiling_for_non_finance_note:
             "Per-company in Supabase expense_hub_company_rules.workflow.approve_ceiling_for_non_finance",
+          two_stage_custom_field: config.EXPENSE_TWO_STAGE_APPROVAL,
+          first_approver_field: config.EXPENSE_TWO_STAGE_APPROVAL ? config.EXPENSE_FIRST_APPROVER_FIELD : null,
+          hr_bypass_first_approver: config.EXPENSE_HR_BYPASS_FIRST_APPROVER,
         },
       },
     };

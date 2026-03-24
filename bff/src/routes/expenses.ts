@@ -18,6 +18,7 @@ import {
   type PolicyWarningPublic,
 } from "../lib/expenseRules.js";
 import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
+import { attachCentyTwoStageExpenseRow, isFirstApproverFlagSet } from "../lib/twoStageCustomFields.js";
 
 const erp = defaultClient();
 
@@ -69,8 +70,98 @@ async function approveExpenseClaimOnce(
       error: "Only the assigned approver or finance-privileged user can approve this claim",
     };
   }
+  const isAssignee = approver === me;
+  const twoStage = config.EXPENSE_TWO_STAGE_APPROVAL;
+  const firstField = config.EXPENSE_FIRST_APPROVER_FIELD;
+
+  if (!twoStage) {
+    const wfBlock = evaluateApproveWorkflow(cur as Record<string, unknown>, pack, {
+      canSubmitOnBehalf: ctx.canSubmitOnBehalf,
+    });
+    if (wfBlock) {
+      if (wfBlock.code === "approve_ceiling") {
+        logHrPolicyDenial("expense_approve_amount_ceiling", {
+          company: ctx.company,
+          user_email: ctx.userEmail,
+          app_role: ctx.appRole ?? null,
+          expense_claim: claimName,
+          claim_total: cur.total_claimed_amount ?? cur.grand_total ?? null,
+          ceiling: pack.workflow.approve_ceiling_for_non_finance ?? null,
+        });
+      }
+      return { ok: false, status: 400, error: `Policy: ${wfBlock.message}` };
+    }
+    await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+      doctype: "Expense Claim",
+      name: claimName,
+      fieldname: "approval_status",
+      value: "Approved",
+    });
+    return { ok: true };
+  }
+
+  const firstDone = isFirstApproverFlagSet(cur as Record<string, unknown>, firstField);
+  const bypass = config.EXPENSE_HR_BYPASS_FIRST_APPROVER;
+  const needFirst = !firstDone && !bypass;
+
+  if (needFirst && canFinanceAct && !isAssignee) {
+    return {
+      ok: false,
+      status: 403,
+      error: "First approver must complete their step before finance can finalise this claim.",
+    };
+  }
+
+  if (needFirst && isAssignee) {
+    const wfBlock = evaluateApproveWorkflow(cur as Record<string, unknown>, pack, {
+      canSubmitOnBehalf: canFinanceAct,
+    });
+    if (wfBlock) {
+      if (wfBlock.code === "approve_ceiling") {
+        logHrPolicyDenial("expense_approve_amount_ceiling", {
+          company: ctx.company,
+          user_email: ctx.userEmail,
+          app_role: ctx.appRole ?? null,
+          expense_claim: claimName,
+          claim_total: cur.total_claimed_amount ?? cur.grand_total ?? null,
+          ceiling: pack.workflow.approve_ceiling_for_non_finance ?? null,
+        });
+      }
+      return { ok: false, status: 400, error: `Policy: ${wfBlock.message}` };
+    }
+    if (firstDone) {
+      return { ok: true };
+    }
+    await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+      doctype: "Expense Claim",
+      name: claimName,
+      fieldname: firstField,
+      value: 1,
+    });
+    return { ok: true };
+  }
+
+  if (needFirst && !isAssignee) {
+    return {
+      ok: false,
+      status: 403,
+      error: "Only the assigned expense approver can complete the first approval step.",
+    };
+  }
+
+  if (!canFinanceAct) {
+    if (firstDone) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      status: 403,
+      error: "Only finance / HR can finalise this claim after the first approver step.",
+    };
+  }
+
   const wfBlock = evaluateApproveWorkflow(cur as Record<string, unknown>, pack, {
-    canSubmitOnBehalf: ctx.canSubmitOnBehalf,
+    canSubmitOnBehalf: true,
   });
   if (wfBlock) {
     if (wfBlock.code === "approve_ceiling") {
@@ -160,7 +251,7 @@ async function mapRowsWithPolicy(rows: unknown[], companyKey: string): Promise<u
   return rows.map((r) => {
     const rec = asRecord(r);
     if (!rec) return r;
-    return mergeClaimPolicyWarnings(rec, pack);
+    return attachCentyTwoStageExpenseRow(mergeClaimPolicyWarnings(rec, pack) as Record<string, unknown>);
   });
 }
 
@@ -234,22 +325,26 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
 
       const { page, pageSize, limitStart } = parsePageParams(req);
       const take = pageSize + 1;
+      const expFields = [
+        "name",
+        "employee",
+        "employee_name",
+        "company",
+        "posting_date",
+        "approval_status",
+        "expense_approver",
+        "docstatus",
+        "grand_total",
+        "total_claimed_amount",
+        "total_sanctioned_amount",
+        "total_amount_reimbursed",
+      ];
+      if (config.EXPENSE_TWO_STAGE_APPROVAL) {
+        expFields.push(config.EXPENSE_FIRST_APPROVER_FIELD);
+      }
       const res = await erp.listDocs(ctx.creds, "Expense Claim", {
         filters,
-        fields: [
-          "name",
-          "employee",
-          "employee_name",
-          "company",
-          "posting_date",
-          "approval_status",
-          "expense_approver",
-          "docstatus",
-          "grand_total",
-          "total_claimed_amount",
-          "total_sanctioned_amount",
-          "total_amount_reimbursed",
-        ],
+        fields: expFields,
         order_by: "modified desc",
         limit_start: limitStart,
         limit_page_length: take,
@@ -578,22 +673,26 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     try {
       const { page, pageSize, limitStart } = parsePageParams(req);
       const take = pageSize + 1;
+      const pendFields = [
+        "name",
+        "employee",
+        "employee_name",
+        "company",
+        "posting_date",
+        "approval_status",
+        "expense_approver",
+        "docstatus",
+        "grand_total",
+        "total_claimed_amount",
+        "total_sanctioned_amount",
+        "total_amount_reimbursed",
+      ];
+      if (config.EXPENSE_TWO_STAGE_APPROVAL) {
+        pendFields.push(config.EXPENSE_FIRST_APPROVER_FIELD);
+      }
       const res = await erp.listDocs(ctx.creds, "Expense Claim", {
         filters: pendingClaimFilters(ctx),
-        fields: [
-          "name",
-          "employee",
-          "employee_name",
-          "company",
-          "posting_date",
-          "approval_status",
-          "expense_approver",
-          "docstatus",
-          "grand_total",
-          "total_claimed_amount",
-          "total_sanctioned_amount",
-          "total_amount_reimbursed",
-        ],
+        fields: pendFields,
         order_by: "modified desc",
         limit_start: limitStart,
         limit_page_length: take,
@@ -868,13 +967,13 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const pack = await loadCompanyRulesPack(ctx.company);
-      const merged = mergeClaimPolicyWarnings(cur, pack);
+      const merged = mergeClaimPolicyWarnings(cur, pack) as Record<string, unknown>;
       const wf = evaluateApproveWorkflow(cur, pack, { canSubmitOnBehalf: ctx.canSubmitOnBehalf });
       if (wf) {
         const pw = (merged.policy_warnings as PolicyWarningPublic[] | undefined) ?? [];
         merged.policy_warnings = [...pw, { code: wf.code, message: wf.message, severity: wf.severity }];
       }
-      return { data: merged };
+      return { data: attachCentyTwoStageExpenseRow(merged) };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;

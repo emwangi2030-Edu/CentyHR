@@ -53,3 +53,20 @@ export const LEAVE_MANAGER_APPROVE_MAX_DAYS: number | null = (() => {
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 })();
+
+/** When `1`, leave uses a custom Check field for the first approver, then HR finalises `status`. See docs/ERP_TWO_STAGE_CUSTOM_FIELDS.md */
+export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL === "1";
+
+/** Custom field on Leave Application (Allow on Submit = Yes). */
+export const LEAVE_FIRST_APPROVER_FIELD =
+  process.env.LEAVE_FIRST_APPROVER_FIELD?.trim() || "custom_centy_first_approver_done";
+
+/** HR may final-approve leave without first-approver flag (use sparingly). */
+export const LEAVE_HR_BYPASS_FIRST_APPROVER = process.env.LEAVE_HR_BYPASS_FIRST_APPROVER === "1";
+
+export const EXPENSE_TWO_STAGE_APPROVAL = process.env.EXPENSE_TWO_STAGE_APPROVAL === "1";
+
+export const EXPENSE_FIRST_APPROVER_FIELD =
+  process.env.EXPENSE_FIRST_APPROVER_FIELD?.trim() || "custom_centy_first_approver_done";
+
+export const EXPENSE_HR_BYPASS_FIRST_APPROVER = process.env.EXPENSE_HR_BYPASS_FIRST_APPROVER === "1";

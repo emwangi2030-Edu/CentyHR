@@ -11,6 +11,7 @@ import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 import * as config from "../config.js";
 import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
 import { leaveManagerBlockedByDayCeiling, leaveManagerDayCeilingMessage } from "../lib/leaveManagerApprovePolicy.js";
+import { attachCentyTwoStageLeaveRow, isFirstApproverFlagSet } from "../lib/twoStageCustomFields.js";
 
 const erp = defaultClient();
 
@@ -134,25 +135,98 @@ async function approveLeaveOnce(ctx: HrContext, name: string): Promise<ApproveLe
       error: "Only the assigned leave approver or HR-privileged user can approve",
     };
   }
-  const maxDays = config.LEAVE_MANAGER_APPROVE_MAX_DAYS;
-  if (
-    maxDays != null &&
-    leaveManagerBlockedByDayCeiling(cur.total_leave_days, maxDays, ctx.canSubmitOnBehalf)
-  ) {
-    logHrPolicyDenial("leave_approve_day_ceiling", {
-      company: ctx.company,
-      user_email: ctx.userEmail,
-      app_role: ctx.appRole ?? null,
-      leave_application: name,
-      total_leave_days: cur.total_leave_days ?? null,
-      leave_manager_max_days: maxDays,
+  const isAssignee = approver === me;
+  const twoStage = config.LEAVE_TWO_STAGE_APPROVAL;
+  const firstField = config.LEAVE_FIRST_APPROVER_FIELD;
+
+  if (!twoStage) {
+    const maxDays = config.LEAVE_MANAGER_APPROVE_MAX_DAYS;
+    if (
+      maxDays != null &&
+      leaveManagerBlockedByDayCeiling(cur.total_leave_days, maxDays, ctx.canSubmitOnBehalf)
+    ) {
+      logHrPolicyDenial("leave_approve_day_ceiling", {
+        company: ctx.company,
+        user_email: ctx.userEmail,
+        app_role: ctx.appRole ?? null,
+        leave_application: name,
+        total_leave_days: cur.total_leave_days ?? null,
+        leave_manager_max_days: maxDays,
+      });
+      return {
+        ok: false,
+        status: 403,
+        error: leaveManagerDayCeilingMessage(maxDays),
+      };
+    }
+    await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+      doctype: "Leave Application",
+      name,
+      fieldname: "status",
+      value: "Approved",
     });
+    return { ok: true };
+  }
+
+  const firstDone = isFirstApproverFlagSet(cur as Record<string, unknown>, firstField);
+  const bypass = config.LEAVE_HR_BYPASS_FIRST_APPROVER;
+  const isHr = ctx.canSubmitOnBehalf;
+  const needFirst = !firstDone && !bypass;
+
+  if (needFirst && isHr && !isAssignee) {
     return {
       ok: false,
       status: 403,
-      error: leaveManagerDayCeilingMessage(maxDays),
+      error: "First approver (line manager) must complete their step before HR can finalise this leave.",
     };
   }
+
+  const canDoFirst = isAssignee;
+
+  if (needFirst && canDoFirst) {
+    const maxDays = config.LEAVE_MANAGER_APPROVE_MAX_DAYS;
+    if (
+      !isHr &&
+      maxDays != null &&
+      leaveManagerBlockedByDayCeiling(cur.total_leave_days, maxDays, false)
+    ) {
+      logHrPolicyDenial("leave_approve_day_ceiling", {
+        company: ctx.company,
+        user_email: ctx.userEmail,
+        app_role: ctx.appRole ?? null,
+        leave_application: name,
+        total_leave_days: cur.total_leave_days ?? null,
+        leave_manager_max_days: maxDays,
+      });
+      return {
+        ok: false,
+        status: 403,
+        error: leaveManagerDayCeilingMessage(maxDays),
+      };
+    }
+    if (firstDone) {
+      return { ok: true };
+    }
+    await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+      doctype: "Leave Application",
+      name,
+      fieldname: firstField,
+      value: 1,
+    });
+    return { ok: true };
+  }
+
+  if (!isHr) {
+    if (firstDone) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      status: 403,
+      error: "Only HR / finance can finalise this leave after the first approver step.",
+    };
+  }
+
   await erp.callMethod(ctx.creds, "frappe.client.set_value", {
     doctype: "Leave Application",
     name,
@@ -338,27 +412,31 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const filters = buildListFilters(ctx, qStatus === "all" ? "" : qStatus, hrEmployeeFilter);
       const { page, pageSize, limitStart } = parsePageParams(req);
       const take = pageSize + 1;
+      const leaveListFields = [
+        "name",
+        "employee",
+        "employee_name",
+        "department",
+        "leave_type",
+        "from_date",
+        "to_date",
+        "half_day",
+        "total_leave_days",
+        "status",
+        "docstatus",
+        "leave_approver",
+        "posting_date",
+        "creation",
+        "description",
+        "company",
+      ];
+      if (config.LEAVE_TWO_STAGE_APPROVAL) {
+        leaveListFields.push(config.LEAVE_FIRST_APPROVER_FIELD);
+      }
       const rowObjs = await erp.getList(ctx.creds, "Leave Application", {
         filters,
         or_filters,
-        fields: [
-          "name",
-          "employee",
-          "employee_name",
-          "department",
-          "leave_type",
-          "from_date",
-          "to_date",
-          "half_day",
-          "total_leave_days",
-          "status",
-          "docstatus",
-          "leave_approver",
-          "posting_date",
-          "creation",
-          "description",
-          "company",
-        ],
+        fields: leaveListFields,
         order_by: "modified desc",
         limit_start: limitStart,
         limit_page_length: take,
@@ -366,10 +444,12 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const rows = rowObjs.map(asRecord).filter(Boolean) as Record<string, unknown>[];
       const slice = rows.slice(0, pageSize);
       const hasMore = rows.length > pageSize;
-      const data = slice.map((r) => ({
-        ...r,
-        ui_status: leaveUiStatus(r),
-      }));
+      const data = slice.map((r) =>
+        attachCentyTwoStageLeaveRow({
+          ...r,
+          ui_status: leaveUiStatus(r),
+        } as Record<string, unknown>)
+      );
       return {
         data,
         meta: { page, page_size: pageSize, has_more: hasMore },
@@ -393,7 +473,8 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const doc = await erp.getDoc(ctx.creds, "Leave Application", name);
       const gate = await ensureLeaveReadAccess(ctx, doc);
       if (!gate.ok) return reply.status(gate.status).send({ error: gate.error });
-      return { data: { ...doc, ui_status: leaveUiStatus(doc) } };
+      const withUi = { ...doc, ui_status: leaveUiStatus(doc) };
+      return { data: attachCentyTwoStageLeaveRow(withUi as Record<string, unknown>) };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
