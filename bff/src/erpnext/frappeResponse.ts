@@ -36,15 +36,19 @@ export function parseFrappeErrorBody(body: unknown): string | null {
 /** Map upstream ERP failures to safe JSON for the Pay Hub UI (no vendor names). */
 export function publicErpFailure(e: ErpError, dev = process.env.NODE_ENV === "development"): Record<string, unknown> {
   const hint = parseFrappeErrorBody(e.body);
+  // Frappe sometimes returns full tracebacks in 4xx/5xx bodies.
+  // Never leak those to tenants; fall back to generic error copy.
+  const looksLikeTrace = typeof hint === "string" && (/Traceback \\(most recent call last\\)/.test(hint) || hint.includes("apps/frappe/"));
+  const safeHint = looksLikeTrace ? null : hint;
   if (e.status >= 500) {
     return {
       error: "Your company HR directory is temporarily unavailable. Please try again shortly.",
       code: "HR_UPSTREAM",
-      ...(dev && hint ? { hint } : {}),
+      ...(dev && safeHint ? { hint: safeHint } : {}),
     };
   }
   return {
-    error: hint || "We couldn't complete this HR request. Check your account or try again.",
+    error: safeHint || "We couldn't complete this HR request. Check your account or try again.",
     code: "HR_REQUEST_FAILED",
     ...(dev && e.body ? { detail: e.body } : {}),
   };
