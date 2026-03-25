@@ -78,6 +78,62 @@ function normalizeTime(v: unknown): string {
   return "";
 }
 
+function parseFrappeDateTime(s: string): Date | null {
+  const str = String(s ?? "").trim();
+  if (!str) return null;
+  // Frappe typically stores as `YYYY-MM-DD HH:MM:SS` (timezone-naive). Treat as UTC.
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(str)) {
+    return new Date(str.replace(" ", "T") + "Z");
+  }
+  // Allow ISO strings too.
+  const d = new Date(str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function toFrappeDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function toFrappeDateTime(d: Date): string {
+  // ISO `YYYY-MM-DDTHH:MM:SS.sssZ` -> `YYYY-MM-DD HH:MM:SS`
+  return d.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function parseTimeHHMMSS(t: string): { hh: number; mm: number; ss: number } | null {
+  const s = String(t ?? "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+  return { hh: Number(m[1]), mm: Number(m[2]), ss: Number(m[3] ?? "00") };
+}
+
+function timeToSeconds(t: { hh: number; mm: number; ss: number }): number {
+  return t.hh * 3600 + t.mm * 60 + t.ss;
+}
+
+function shiftWindowToMs(params: {
+  shift_start_date: string;
+  start_time: string;
+  end_time: string;
+}): { startMs: number; endMs: number } | null {
+  const { shift_start_date, start_time, end_time } = params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(shift_start_date ?? ""))) return null;
+  const startT = parseTimeHHMMSS(start_time);
+  const endT = parseTimeHHMMSS(end_time);
+  if (!startT || !endT) return null;
+
+  const base = new Date(shift_start_date + "T00:00:00.000Z");
+  const baseMs = base.getTime();
+  const startSeconds = timeToSeconds(startT);
+  const endSeconds = timeToSeconds(endT);
+  const startMs = baseMs + startSeconds * 1000;
+
+  // Overnight shift: end happens next day.
+  const endDayMs = endSeconds < startSeconds ? baseMs + 24 * 3600 * 1000 : baseMs;
+  const endMs = endDayMs + endSeconds * 1000;
+
+  return { startMs, endMs };
+}
+
 export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   async function submitShiftAssignmentWithRetry(
     creds: HrContext["creds"],
@@ -777,6 +833,415 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         }
       }
       return { data: created, meta: { submitSkipped: false } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Employee clock in/out (wire Timesheets into Time & Attendance).
+   *
+   * Rules:
+   * - Attendance is created for the shift-start calendar day.
+   * - Time inside the scheduled shift window -> Regular/Night activity.
+   * - Time outside the scheduled shift window -> Overtime activity.
+   * - One Timesheet per employee per day: append time_logs to existing Draft.
+   * - is_billable is always 0 for payroll-only time logs.
+   */
+
+  async function resolveEmployeeIdForRequest(ctx: HrContext, qEmp: string): Promise<string | null> {
+    if (ctx.canSubmitOnBehalf) {
+      if (!qEmp) return null;
+      const empDoc = await erp.getDoc(ctx.creds, "Employee", qEmp);
+      if (String(empDoc.company) !== ctx.company) return null;
+      return qEmp;
+    }
+    return await resolveSelfEmployee(ctx);
+  }
+
+  async function resolveActiveShiftForTimestamp(params: {
+    ctx: HrContext;
+    employeeId: string;
+    at: Date;
+  }): Promise<{
+    shift_assignment_name: string;
+    shift_type_name: string;
+    shift_start_date: string; // shift-start calendar day (YYYY-MM-DD)
+    shift_window: { startMs: number; endMs: number };
+  }> {
+    const { ctx, employeeId, at } = params;
+    const atMs = at.getTime();
+    const ddNow = toFrappeDate(at);
+    const ddPrev = toFrappeDate(new Date(atMs - 24 * 3600 * 1000));
+
+    const assignments = (await erp.getList(ctx.creds, "Shift Assignment", {
+      fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
+      filters: [
+        ["company", "=", ctx.company],
+        ["employee", "=", employeeId],
+        ["docstatus", "!=", 2],
+        ["start_date", ">=", ddPrev],
+        ["start_date", "<=", ddNow],
+      ],
+      order_by: "start_date desc",
+      limit_page_length: 50,
+    })) as any[];
+
+    const shiftTypeNames = Array.from(new Set(assignments.map((s) => String(s.shift_type ?? "")).filter(Boolean)));
+    const shiftTypes = shiftTypeNames.length
+      ? ((await erp.getList(ctx.creds, "Shift Type", {
+          fields: ["name", "start_time", "end_time"],
+          filters: [["name", "IN", shiftTypeNames]],
+          limit_page_length: 200,
+        })) as any[])
+      : [];
+    const stByName = new Map<string, { start_time: string; end_time: string }>();
+    for (const st of shiftTypes) {
+      stByName.set(String(st.name), { start_time: String(st.start_time ?? ""), end_time: String(st.end_time ?? "") });
+    }
+
+    // 1) Prefer assignments whose shift window covers the timestamp.
+    for (const sa of assignments) {
+      const shiftStartDate = String(sa.start_date ?? "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(shiftStartDate)) continue;
+      const shiftTypeName = String(sa.shift_type ?? "");
+      const timings = stByName.get(shiftTypeName);
+      if (!timings) continue;
+
+      const win = shiftWindowToMs({
+        shift_start_date: shiftStartDate,
+        start_time: timings.start_time,
+        end_time: timings.end_time,
+      });
+      if (!win) continue;
+      if (atMs >= win.startMs && atMs <= win.endMs) {
+        return {
+          shift_assignment_name: String(sa.name),
+          shift_type_name: shiftTypeName,
+          shift_start_date: shiftStartDate,
+          shift_window: win,
+        };
+      }
+    }
+
+    // 2) Fallback: pick latest assignment active on ddNow.
+    for (const sa of assignments) {
+      const shiftStartDate = String(sa.start_date ?? "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(shiftStartDate)) continue;
+      const shiftTypeName = String(sa.shift_type ?? "");
+      const timings = stByName.get(shiftTypeName);
+      if (!timings) continue;
+
+      const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
+      const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : shiftStartDate;
+      if (ddNow >= shiftStartDate && ddNow <= saEnd) {
+        const win = shiftWindowToMs({
+          shift_start_date: shiftStartDate,
+          start_time: timings.start_time,
+          end_time: timings.end_time,
+        });
+        if (!win) continue;
+        return {
+          shift_assignment_name: String(sa.name),
+          shift_type_name: shiftTypeName,
+          shift_start_date: shiftStartDate,
+          shift_window: win,
+        };
+      }
+    }
+
+    throw new ErpError("No active shift assignment found for this timestamp", 404, {
+      error: "No active shift assignment found",
+    });
+  }
+
+  async function ensureAttendancePresent(params: {
+    ctx: HrContext;
+    employeeId: string;
+    attendance_date: string; // shift-start calendar day
+    shift_type_name: string;
+  }): Promise<string> {
+    const { ctx, employeeId, attendance_date, shift_type_name } = params;
+    const existing = (await erp.getList(ctx.creds, "Attendance", {
+      fields: ["name", "docstatus"],
+      filters: [
+        ["employee", "=", employeeId],
+        ["attendance_date", "=", attendance_date],
+      ],
+      limit_page_length: 1,
+    })) as any[];
+    if (existing.length) {
+      const name = String(existing[0].name);
+      await erp.updateDoc(ctx.creds, "Attendance", name, {
+        status: "Present",
+        shift: shift_type_name,
+      });
+      return name;
+    }
+
+    const created = await erp.createDoc(ctx.creds, "Attendance", {
+      employee: employeeId,
+      company: ctx.company,
+      attendance_date,
+      status: "Present",
+      shift: shift_type_name,
+    });
+    return String((created as any)?.name ?? "");
+  }
+
+  async function resolveActivityTypeMap(creds: HrContext["creds"]): Promise<{
+    regular: string | null;
+    night: string | null;
+    overtime: string | null;
+  }> {
+    const required = ["Regular Hours", "Night Shift", "Overtime"];
+    const rows = (await erp.getList(creds, "Activity Type", {
+      fields: ["name"],
+      filters: [["name", "IN", required]],
+      limit_page_length: 20,
+    })) as any[];
+    const set = new Set(rows.map((r) => String(r.name)));
+    return {
+      regular: set.has("Regular Hours") ? "Regular Hours" : null,
+      night: set.has("Night Shift") ? "Night Shift" : null,
+      overtime: set.has("Overtime") ? "Overtime" : null,
+    };
+  }
+
+  async function getOrCreateDraftTimesheet(params: {
+    ctx: HrContext;
+    employeeId: string;
+    shift_start_date: string; // YYYY-MM-DD
+    project?: string | null;
+    shift_location?: unknown;
+    time_logsToAppend: Record<string, unknown>[];
+  }): Promise<string> {
+    const { ctx, employeeId, shift_start_date, project, shift_location, time_logsToAppend } = params;
+
+    const existing = (await erp.getList(ctx.creds, "Timesheet", {
+      fields: ["name"],
+      filters: [
+        ["employee", "=", employeeId],
+        ["company", "=", ctx.company],
+        ["start_date", "=", shift_start_date],
+        ["status", "=", "Draft"],
+        ["docstatus", "!=", 2],
+      ],
+      order_by: "modified desc",
+      limit_page_length: 1,
+    })) as any[];
+
+    if (existing.length) {
+      const name = String(existing[0].name);
+      const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
+      const existingRows = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as Record<string, unknown>[]) : [];
+      const next = [...existingRows, ...time_logsToAppend];
+
+      try {
+        await erp.updateDoc(ctx.creds, "Timesheet", name, {
+          ...(project ? { project } : {}),
+          ...(shift_location !== undefined ? { shift_location } : {}),
+          time_logs: next,
+        });
+      } catch (e) {
+        const msg = e instanceof ErpError ? String((e as any).body ?? (e as any).message ?? "") : String(e);
+        const mentionsShiftLocation = msg.toLowerCase().includes("shift_location") || msg.toLowerCase().includes("shift location");
+        if (mentionsShiftLocation) {
+          await erp.updateDoc(ctx.creds, "Timesheet", name, {
+            ...(project ? { project } : {}),
+            time_logs: next,
+          });
+        } else {
+          throw e;
+        }
+      }
+      return name;
+    }
+
+    const baseDoc: Record<string, unknown> = {
+      employee: employeeId,
+      company: ctx.company,
+      start_date: shift_start_date,
+      end_date: shift_start_date,
+      time_logs: time_logsToAppend,
+      ...(project ? { project } : {}),
+    };
+
+    try {
+      if (shift_location !== undefined) (baseDoc as any).shift_location = shift_location;
+      const created = await erp.createDoc(ctx.creds, "Timesheet", baseDoc);
+      return String((created as any)?.name ?? "");
+    } catch (e) {
+      const msg = e instanceof ErpError ? String((e as any).body ?? (e as any).message ?? "") : String(e);
+      const mentionsShiftLocation = msg.toLowerCase().includes("shift_location") || msg.toLowerCase().includes("shift location");
+      if (mentionsShiftLocation) {
+        delete (baseDoc as any).shift_location;
+        const created = await erp.createDoc(ctx.creds, "Timesheet", baseDoc);
+        return String((created as any)?.name ?? "");
+      }
+      throw e;
+    }
+  }
+
+  app.post("/v1/attendance/clock-in", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const qEmp = String(q.employee ?? "").trim();
+    const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
+    if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+
+    try {
+      const now = new Date();
+      const active = await resolveActiveShiftForTimestamp({ ctx, employeeId, at: now });
+
+      const attendanceName = await ensureAttendancePresent({
+        ctx,
+        employeeId,
+        attendance_date: active.shift_start_date,
+        shift_type_name: active.shift_type_name,
+      });
+
+      const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", active.shift_assignment_name);
+
+      return {
+        data: {
+          from_time: toFrappeDateTime(now),
+          attendance: attendanceName,
+          attendance_date: active.shift_start_date,
+          shift_assignment: active.shift_assignment_name,
+          shift_type: active.shift_type_name,
+          project: (shiftAssignmentDoc as any)?.project ?? null,
+          shift_location: (shiftAssignmentDoc as any)?.shift_location ?? null,
+        },
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  app.post("/v1/attendance/clock-out", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const qEmp = String(q.employee ?? "").trim();
+    const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
+    if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+
+    const from_time = String(body.from_time ?? "").trim();
+    const to_time = String(body.to_time ?? "").trim();
+    const shift_assignment_name = String(body.shift_assignment_name ?? "").trim();
+    if (!from_time || !shift_assignment_name) {
+      return reply.status(400).send({ error: "from_time and shift_assignment_name are required" });
+    }
+
+    try {
+      const from = parseFrappeDateTime(from_time);
+      const to = to_time ? parseFrappeDateTime(to_time) : new Date();
+      if (!from || !to) return reply.status(400).send({ error: "Invalid from_time/to_time format" });
+      const fromMs = from.getTime();
+      const toMs = to.getTime();
+      if (toMs <= fromMs) return reply.status(400).send({ error: "to_time must be after from_time" });
+
+      const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", shift_assignment_name);
+      const shiftStartDate = String(shiftAssignmentDoc?.start_date ?? "").slice(0, 10);
+      const shiftTypeName = String(shiftAssignmentDoc?.shift_type ?? "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(shiftStartDate) || !shiftTypeName) {
+        return reply.status(400).send({ error: "Invalid shift assignment (missing start_date/shift_type)" });
+      }
+
+      const shiftTypeDoc = await erp.getDoc(ctx.creds, "Shift Type", shiftTypeName);
+      const win = shiftWindowToMs({
+        shift_start_date: shiftStartDate,
+        start_time: String(shiftTypeDoc?.start_time ?? ""),
+        end_time: String(shiftTypeDoc?.end_time ?? ""),
+      });
+      if (!win) return reply.status(400).send({ error: "Invalid shift type timing" });
+
+      const regularStartMs = Math.max(fromMs, win.startMs);
+      const regularEndMs = Math.min(toMs, win.endMs);
+      const regularMs = Math.max(0, regularEndMs - regularStartMs);
+
+      const overtimeEarlyMs = fromMs < win.startMs ? Math.max(0, Math.min(toMs, win.startMs) - fromMs) : 0;
+      const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
+
+      const activityMap = await resolveActivityTypeMap(ctx.creds);
+      if (!activityMap.overtime) return reply.status(400).send({ error: "Activity Type 'Overtime' is not configured in ERPNext." });
+
+      const regularActivity =
+        String(shiftTypeName ?? "").toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
+      if (regularMs > 0 && !regularActivity) {
+        return reply.status(400).send({ error: "Activity Type 'Regular Hours'/'Night Shift' is not configured in ERPNext." });
+      }
+
+      const time_logs: Record<string, unknown>[] = [];
+      if (regularMs > 0 && regularActivity) {
+        time_logs.push({
+          activity_type: regularActivity,
+          from_time: toFrappeDateTime(new Date(regularStartMs)),
+          to_time: toFrappeDateTime(new Date(regularEndMs)),
+          hours: Number((regularMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+      if (overtimeEarlyMs > 0) {
+        time_logs.push({
+          activity_type: activityMap.overtime,
+          from_time: toFrappeDateTime(new Date(fromMs)),
+          to_time: toFrappeDateTime(new Date(win.startMs)),
+          hours: Number((overtimeEarlyMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+      if (overtimeLateMs > 0) {
+        time_logs.push({
+          activity_type: activityMap.overtime,
+          from_time: toFrappeDateTime(new Date(win.endMs)),
+          to_time: toFrappeDateTime(new Date(toMs)),
+          hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+
+      if (time_logs.length === 0) {
+        return reply.status(400).send({ error: "No time logs generated (clock times didn't overlap shift window)." });
+      }
+
+      const projectName = (shiftAssignmentDoc as any)?.project ?? null;
+      const shift_location = (shiftAssignmentDoc as any)?.shift_location ?? null;
+      const timesheetName = await getOrCreateDraftTimesheet({
+        ctx,
+        employeeId,
+        shift_start_date: shiftStartDate,
+        project: projectName,
+        shift_location,
+        time_logsToAppend: time_logs,
+      });
+
+      return {
+        data: {
+          timesheet: timesheetName,
+          attendance_date: shiftStartDate,
+          shift_assignment: shift_assignment_name,
+          regular_hours: Number((regularMs / 3600000).toFixed(2)),
+          overtime_hours: Number(((overtimeEarlyMs + overtimeLateMs) / 3600000).toFixed(2)),
+        },
+      };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
