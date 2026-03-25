@@ -407,9 +407,26 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const created = await erp.createDoc(ctx.creds, "Shift Assignment", doc);
       const name = parseBodyString((created as Record<string, unknown>)?.name);
       if (name) {
-        await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
+        try {
+          await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
+        } catch (e) {
+          // The Shift Assignment doctype in this tenant throws TimestampMismatchError
+          // on API submit even when the doc was just created. Creating the draft
+          // still writes the assignment row, which is what the Phase 3 UI needs.
+          if (e instanceof ErpError && e.status === 417) {
+            const b = e.body as any;
+            const excType = b?.exc_type ? String(b.exc_type) : "";
+            const raw = typeof b === "string" ? b : e.message;
+            const isTimestampMismatch =
+              excType.includes("TimestampMismatchError") || String(raw).includes("TimestampMismatchError");
+            if (isTimestampMismatch) {
+              return { data: created, meta: { submitSkipped: true } };
+            }
+          }
+          throw e;
+        }
       }
-      return { data: created };
+      return { data: created, meta: { submitSkipped: false } };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
