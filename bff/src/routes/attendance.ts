@@ -360,6 +360,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         }
 
         const out: Record<string, unknown>[] = [];
+        const seen = new Set<string>();
         for (const sa of shiftAssignments) {
           const saStart = String(sa.start_date ?? "").slice(0, 10);
           const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
@@ -398,24 +399,32 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             const outTime = combine(outDateIso, endT);
 
             if (withinRange(inTime)) {
-              out.push({
+              const key = `${employeeId}|${inTime}|IN|${shiftType}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                out.push({
                 name: `scheduled-checkin-${employeeId}-${dd}-${shiftType}-IN`.replace(/[^a-zA-Z0-9_-]/g, "_"),
                 employee: employeeId,
                 time: inTime,
                 log_type: "IN",
                 device_id: null,
                 shift: shiftType,
-              });
+                });
+              }
             }
             if (withinRange(outTime)) {
-              out.push({
+              const key = `${employeeId}|${outTime}|OUT|${shiftType}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                out.push({
                 name: `scheduled-checkin-${employeeId}-${outDateIso}-${shiftType}-OUT`.replace(/[^a-zA-Z0-9_-]/g, "_"),
                 employee: employeeId,
                 time: outTime,
                 log_type: "OUT",
                 device_id: null,
                 shift: shiftType,
-              });
+                });
+              }
             }
           }
         }
