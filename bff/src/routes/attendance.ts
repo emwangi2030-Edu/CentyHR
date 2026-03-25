@@ -1293,5 +1293,116 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
   });
+
+  /**
+   * Manager time logs (Timesheet drafts + submitted).
+   *
+   * Notes:
+   * - We keep this thin: list Timesheets, then compute total hours from `time_logs`.
+   * - UI uses `status` + `docstatus` to decide whether submit is allowed.
+   */
+  app.get("/v1/attendance/time-logs", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const qEmp = String(q.employee ?? "").trim();
+    const from = parseDate(q.from_date ?? q.from);
+    const to = parseDate(q.to_date ?? q.to);
+    const status = String(q.status ?? "").trim();
+
+    try {
+      const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
+      if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+
+      const filters: unknown[] = [
+        ["company", "=", ctx.company],
+        ["employee", "=", employeeId],
+        ["docstatus", "!=", 2],
+      ];
+
+      // Timesheets are typically per-day, but support overlaps.
+      if (from && to) {
+        filters.push(["start_date", "<=", to]);
+        filters.push(["end_date", ">=", from]);
+      } else if (from) {
+        filters.push(["end_date", ">=", from]);
+      } else if (to) {
+        filters.push(["start_date", "<=", to]);
+      }
+
+      if (status) filters.push(["status", "=", status]);
+
+      const rows = (await erp.getList(ctx.creds, "Timesheet", {
+        fields: ["name", "employee", "employee_name", "start_date", "end_date", "status", "docstatus"],
+        filters,
+        order_by: "start_date desc",
+        limit_page_length: 100,
+      })) as any[];
+
+      const out = [];
+      for (const r of rows) {
+        const doc = await erp.getDoc(ctx.creds, "Timesheet", String(r.name));
+        const logs = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as any[]) : [];
+        const totalHours = logs.reduce((acc, l) => acc + Number(l?.hours ?? 0), 0);
+        const activityTypes = Array.from(new Set(logs.map((l) => String(l?.activity_type ?? "")).filter(Boolean)));
+        const activity_type = activityTypes.length === 1 ? activityTypes[0] : activityTypes.length > 1 ? "Mixed" : null;
+
+        out.push({
+          name: String(r.name),
+          employee: r.employee,
+          employee_name: r.employee_name,
+          start_date: r.start_date,
+          end_date: r.end_date,
+          status: r.status,
+          docstatus: r.docstatus,
+          activity_type,
+          total_hours: Number(totalHours.toFixed(2)),
+        });
+      }
+
+      return { data: out };
+    } catch (e) {
+      const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+      if (st != null && st >= 500) return { data: [] };
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Submit a draft timesheet so payroll/Sallary Slip can read it.
+   */
+  app.post("/v1/attendance/time-logs/:name/submit", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can submit timesheets." });
+
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    const name = String(params.name ?? "").trim();
+    if (!name) return reply.status(400).send({ error: "Timesheet name is required" });
+
+    try {
+      const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
+      if (Number((doc as any).docstatus ?? 0) === 1) {
+        return { data: { name, submitted: false, alreadySubmitted: true } };
+      }
+      await erp.submitDoc(ctx.creds, "Timesheet", name);
+      return { data: { name, submitted: true } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
 };
 
