@@ -20,6 +20,9 @@ export const BASE_PATH = (process.env.BASE_PATH ?? "").replace(/\/+$/, "");
 /** Bind address: use 127.0.0.1 so the BFF is not reachable from the public network. */
 export const HR_BFF_HOST = process.env.HR_BFF_HOST ?? "127.0.0.1";
 
+/** Optional partial JSON to override HR module capabilities (used by Pay Hub). */
+export const HR_CAPABILITIES_JSON = process.env.HR_CAPABILITIES_JSON ?? "";
+
 /**
  * Shared secret with Pay Hub proxy. When set, `X-Bridge-Auth` (HMAC) is required — do not use dev headers in production.
  */
