@@ -1412,7 +1412,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           lastErr = e;
           // Frappe uses HTTP 417 for several optimistic-lock/timestamp-related errors.
           // Since this is a "submit" action, we retry on 417 a few times.
-          if (e instanceof ErpError && e.status === 417) continue;
+          if (e instanceof ErpError && e.status === 417) {
+            console.error("[time-logs submit] upstream 417", {
+              name,
+              attempt,
+              body: typeof e.body === "string" ? e.body.slice(0, 800) : e.body,
+            });
+            continue;
+          }
           throw e;
         }
       }
