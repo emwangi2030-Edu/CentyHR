@@ -1227,12 +1227,17 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
 
       const activityMap = await resolveActivityTypeMap(ctx.creds);
-      if (!activityMap.overtime) return reply.status(400).send({ error: "Activity Type 'Overtime' is not configured in ERPNext." });
+      if (!activityMap.overtime)
+        return reply
+          .status(400)
+          .send({ error: "Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup." });
 
       const regularActivity =
         String(shiftTypeName ?? "").toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
       if (regularMs > 0 && !regularActivity) {
-        return reply.status(400).send({ error: "Activity Type 'Regular Hours'/'Night Shift' is not configured in ERPNext." });
+        return reply.status(400).send({
+          error: "Regular or night-shift hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
+        });
       }
 
       const time_logs: Record<string, unknown>[] = [];

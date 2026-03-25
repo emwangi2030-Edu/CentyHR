@@ -16,7 +16,7 @@ function integrationCreds(): { apiKey: string; apiSecret: string } {
   const k = config.ERP_API_KEY?.trim();
   const s = config.ERP_API_SECRET?.trim();
   if (!k || !s) {
-    throw new Error("ERP_API_KEY and ERP_API_SECRET must be set on the BFF for public onboarding");
+    throw new Error("HR integration keys are not configured on this service");
   }
   return { apiKey: k, apiSecret: s };
 }

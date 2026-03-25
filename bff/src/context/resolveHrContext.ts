@@ -42,10 +42,7 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
     } else if (config.ERP_API_KEY && config.ERP_API_SECRET) {
       creds = { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET };
     } else {
-      throw new HttpError(
-        "Configure HR API credentials on the BFF (ERP_API_KEY / ERP_API_SECRET) or per-user keys from Pay Hub.",
-        500
-      );
+      throw new HttpError("The HR service is missing connection settings. Your administrator needs to finish HR integration setup.", 500);
     }
 
     const appRoleRaw = verified.appRole != null ? String(verified.appRole).trim() : "";
@@ -67,7 +64,7 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
       throw new HttpError("Missing X-Dev-User-Email or X-Dev-Company", 401);
     }
     if (!config.ERP_API_KEY || !config.ERP_API_SECRET) {
-      throw new HttpError("DEV_INSECURE_HEADERS requires ERP_API_KEY and ERP_API_SECRET on the BFF", 500);
+      throw new HttpError("Local development mode requires HR integration keys on the HR service.", 500);
     }
     return {
       userEmail,
@@ -78,8 +75,5 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
     };
   }
 
-  throw new HttpError(
-    "HR auth not configured: set HR_BRIDGE_SECRET (and proxy) or DEV_INSECURE_HEADERS=1 for local dev",
-    501
-  );
+  throw new HttpError("HR sign-in isn’t configured on this server. Your administrator needs to enable the HR bridge.", 501);
 }
