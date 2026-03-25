@@ -289,12 +289,141 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (from) filters.push(["time", ">=", from]);
       if (to) filters.push(["time", "<=", to]);
 
-      const rows = await erp.getList(ctx.creds, "Employee Checkin", {
-        fields: ["name", "employee", "time", "log_type", "device_id", "shift", "skip_auto_attendance"],
-        filters,
-        order_by: "time desc",
-        limit_page_length: 500,
-      });
+      let rows: Record<string, unknown>[] = [];
+      try {
+        rows = (await erp.getList(ctx.creeds, "Employee Checkin", {
+          fields: ["name", "employee", "time", "log_type", "device_id", "shift", "skip_auto_attendance"],
+          filters,
+          order_by: "time desc",
+          limit_page_length: 500,
+        })) as Record<string, unknown>[];
+      } catch (e) {
+        const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+        if (st != null && st >= 500) rows = [];
+        else throw e;
+      }
+
+      // If ERP has no check-ins yet (e.g. Shift Assignment submit is skipped due to ERP timing issues),
+      // synthesize IN/OUT events from Shift Assignments + Shift Type timings.
+      if (!rows || rows.length === 0) {
+        const fromDay = String(q.from_datetime ?? q.from ?? "").slice(0, 10);
+        const toDay = String(q.to_datetime ?? q.to ?? "").slice(0, 10);
+
+        const canBound = /^\d{4}-\d{2}-\d{2}$/.test(fromDay) && /^\d{4}-\d{2}-\d{2}$/.test(toDay);
+        const dayStart = canBound ? new Date(fromDay + "T00:00:00.000Z") : null;
+        const dayEnd = canBound ? new Date(toDay + "T23:59:59.999Z") : null;
+
+        const shiftAssignments = (await erp.getList(ctx.creds, "Shift Assignment", {
+          fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
+          filters: [
+            ["company", "=", ctx.company],
+            ["employee", "=", employeeId],
+            ["docstatus", "!=", 2],
+          ],
+          limit_page_length: 500,
+        })) as any[];
+
+        const shiftTypeNames = Array.from(new Set(shiftAssignments.map((s) => String(s.shift_type ?? "")).filter(Boolean)));
+        const shiftTypes = shiftTypeNames.length
+          ? ((await erp.getList(ctx.creds, "Shift Type", {
+              fields: ["name", "start_time", "end_time"],
+              filters: [["name", "IN", shiftTypeNames]],
+              limit_page_length: 200,
+            })) as any[])
+          : [];
+        const stByName = new Map<string, { start_time: string; end_time: string }>();
+        for (const st of shiftTypes) {
+          stByName.set(String(st.name), { start_time: String(st.start_time ?? ""), end_time: String(st.end_time ?? "") });
+        }
+
+        function parseTimeHHMMSS(t: string): { hh: number; mm: number; ss: number } | null {
+          const s = String(t ?? "").trim();
+          const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+          if (!m) return null;
+          return { hh: Number(m[1]), mm: Number(m[2]), ss: Number(m[3] ?? "00") };
+        }
+
+        function combine(dateIso: string, time: { hh: number; mm: number; ss: number }): string {
+          // Return something human-friendly (UI just displays it).
+          const dd = dateIso;
+          const hh = String(time.hh).padStart(2, "0");
+          const mm = String(time.mm).padStart(2, "0");
+          const ss = String(time.ss).padStart(2, "0");
+          return `${dd} ${hh}:${mm}:${ss}`;
+        }
+
+        function withinRange(dtIso: string): boolean {
+          if (!dayStart || !dayEnd) return true;
+          // dtIso is "YYYY-MM-DD HH:MM:SS" — treat as UTC.
+          const d = new Date(dtIso.replace(" ", "T") + "Z");
+          return d >= dayStart && d <= dayEnd;
+        }
+
+        const out: Record<string, unknown>[] = [];
+        for (const sa of shiftAssignments) {
+          const saStart = String(sa.start_date ?? "").slice(0, 10);
+          const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
+          if (!saStart || !/^\d{4}-\d{2}-\d{2}$/.test(saStart)) continue;
+          const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : (canBound ? toDay : saStart);
+
+          const shiftType = String(sa.shift_type ?? "");
+          const timings = stByName.get(shiftType);
+          if (!timings) continue;
+
+          const startT = parseTimeHHMMSS(timings.start_time);
+          const endT = parseTimeHHMMSS(timings.end_time);
+          if (!startT || !endT) continue;
+
+          const saStartD = new Date(saStart + "T00:00:00.000Z");
+          const saEndD = new Date(saEnd + "T00:00:00.000Z");
+
+          let iterStart = saStartD;
+          let iterEnd = saEndD;
+          if (dayStart && dayStart > iterStart) iterStart = dayStart;
+          if (dayEnd) {
+            // dayEnd includes time; normalize to date end for iteration
+            const endDateOnly = new Date(toDay + "T00:00:00.000Z");
+            if (endDateOnly < iterEnd) iterEnd = endDateOnly;
+          }
+
+          for (let d = new Date(iterStart); d <= iterEnd; d = new Date(d.getTime() + 24 * 3600 * 1000)) {
+            const dd = d.toISOString().slice(0, 10);
+            const inTime = combine(dd, startT);
+
+            const startSeconds = startT.hh * 3600 + startT.mm * 60 + startT.ss;
+            const endSeconds = endT.hh * 3600 + endT.mm * 60 + endT.ss;
+            const overnight = endSeconds < startSeconds;
+            const outDate = overnight ? new Date(d.getTime() + 24 * 3600 * 1000) : d;
+            const outDateIso = outDate.toISOString().slice(0, 10);
+            const outTime = combine(outDateIso, endT);
+
+            if (withinRange(inTime)) {
+              out.push({
+                name: `scheduled-checkin-${employeeId}-${dd}-${shiftType}-IN`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                employee: employeeId,
+                time: inTime,
+                log_type: "IN",
+                device_id: null,
+                shift: shiftType,
+              });
+            }
+            if (withinRange(outTime)) {
+              out.push({
+                name: `scheduled-checkin-${employeeId}-${outDateIso}-${shiftType}-OUT`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                employee: employeeId,
+                time: outTime,
+                log_type: "OUT",
+                device_id: null,
+                shift: shiftType,
+              });
+            }
+          }
+        }
+
+        out.sort((a, b) => String((b as any).time ?? "").localeCompare(String((a as any).time ?? "")));
+        return { data: out };
+      }
+
       return { data: rows };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
