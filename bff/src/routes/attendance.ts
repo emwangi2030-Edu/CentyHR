@@ -55,6 +55,10 @@ function parseDateTime(v: unknown): string {
   return "";
 }
 
+function parseBodyString(v: unknown): string {
+  return String(v ?? "").trim();
+}
+
 export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   /**
    * Shift types (read-only metadata).
@@ -229,6 +233,67 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         limit_page_length: 200,
       });
       return { data: rows };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Phase 3: HR creates shift assignments (write route).
+   *
+   * Request:
+   * - employee: ERP employee name (required)
+   * - shift_type: Shift Type name (required)
+   * - start_date: YYYY-MM-DD (required)
+   * - end_date: YYYY-MM-DD (optional)
+   */
+  app.post("/v1/attendance/shift-assignments", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can create shift assignments." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const employee = parseBodyString(body.employee);
+    const shift_type = parseBodyString(body.shift_type);
+    const start_date = parseBodyString(body.start_date);
+    const end_date = parseBodyString(body.end_date);
+
+    if (!employee || !shift_type || !start_date) {
+      return reply.status(400).send({ error: "employee, shift_type, and start_date are required" });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
+      return reply.status(400).send({ error: "start_date must be YYYY-MM-DD" });
+    }
+    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+      return reply.status(400).send({ error: "end_date must be YYYY-MM-DD when provided" });
+    }
+
+    try {
+      const empDoc = await erp.getDoc(ctx.creds, "Employee", employee);
+      if (String(empDoc.company) !== ctx.company) return reply.status(403).send({ error: "Employee not in your Company" });
+
+      const doc: Record<string, unknown> = {
+        employee,
+        shift_type,
+        start_date,
+        ...(end_date ? { end_date } : {}),
+      };
+
+      const created = await erp.createDoc(ctx.creds, "Shift Assignment", doc);
+      const name = parseBodyString((created as Record<string, unknown>)?.name);
+      if (name) {
+        await erp.submitDoc(ctx.creds, "Shift Assignment", name);
+      }
+      return { data: created };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
