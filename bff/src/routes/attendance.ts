@@ -140,6 +140,11 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const data = rows.map((r) => asRecord(r)).filter(Boolean);
       return { data };
     } catch (e) {
+      // Best-effort UX: when ERPNext is temporarily unavailable, keep the UI stable.
+      const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+      if (st != null && st >= 500) {
+        return { data: [] };
+      }
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
