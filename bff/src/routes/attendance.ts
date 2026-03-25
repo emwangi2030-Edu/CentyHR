@@ -291,7 +291,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
       let rows: Record<string, unknown>[] = [];
       try {
-        rows = (await erp.getList(ctx.creeds, "Employee Checkin", {
+        rows = (await erp.getList(ctx.creds, "Employee Checkin", {
           fields: ["name", "employee", "time", "log_type", "device_id", "shift", "skip_auto_attendance"],
           filters,
           order_by: "time desc",
