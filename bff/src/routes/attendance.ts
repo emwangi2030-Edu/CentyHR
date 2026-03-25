@@ -375,41 +375,69 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
         const out: Record<string, unknown>[] = [];
         const seen = new Set<string>();
-        for (const sa of shiftAssignments) {
+
+        // Requirement: only synthesize the shift that is "active" for each date.
+        // When multiple Shift Assignments overlap, we choose the one with the latest start_date.
+        function isActiveOnDate(sa: any, dd: string): boolean {
           const saStart = String(sa.start_date ?? "").slice(0, 10);
           const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
-          if (!saStart || !/^\d{4}-\d{2}-\d{2}$/.test(saStart)) continue;
-          const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : (canBound ? toDay : saStart);
+          if (!saStart || !/^\d{4}-\d{2}-\d{2}$/.test(saStart)) return false;
+          const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : saStart;
+          return dd >= saStart && dd <= saEnd;
+        }
 
-          const shiftType = String(sa.shift_type ?? "");
-          const timings = stByName.get(shiftType);
-          if (!timings) continue;
+        function pickBestAssignmentForDate(dd: string): any | null {
+          const active = shiftAssignments.filter((sa) => {
+            const shiftType = String(sa.shift_type ?? "");
+            return shiftType && stByName.has(shiftType) && isActiveOnDate(sa, dd);
+          });
+          if (active.length === 0) return null;
 
-          const startT = parseTimeHHMMSS(timings.start_time);
-          const endT = parseTimeHHMMSS(timings.end_time);
-          if (!startT || !endT) continue;
+          // Sort by latest start_date, then latest end_date, then name (deterministic).
+          active.sort((a, b) => {
+            const aStart = String(a.start_date ?? "").slice(0, 10);
+            const bStart = String(b.start_date ?? "").slice(0, 10);
+            if (aStart !== bStart) return bStart.localeCompare(aStart);
 
-          const saStartD = new Date(saStart + "T00:00:00.000Z");
-          const saEndD = new Date(saEnd + "T00:00:00.000Z");
+            const aEndRaw = a.end_date == null ? "" : String(a.end_date).slice(0, 10);
+            const bEndRaw = b.end_date == null ? "" : String(b.end_date).slice(0, 10);
+            const aEnd = aEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(aEndRaw) ? aEndRaw : aStart;
+            const bEnd = bEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(bEndRaw) ? bEndRaw : bStart;
+            if (aEnd !== bEnd) return bEnd.localeCompare(aEnd);
 
-          let iterStart = saStartD;
-          let iterEnd = saEndD;
-          if (dayStart && dayStart > iterStart) iterStart = dayStart;
-          if (dayEnd) {
-            // dayEnd includes time; normalize to date end for iteration
-            const endDateOnly = new Date(toDay + "T00:00:00.000Z");
-            if (endDateOnly < iterEnd) iterEnd = endDateOnly;
+            return String(b.name ?? "").localeCompare(String(a.name ?? ""));
+          });
+          return active[0];
+        }
+
+        const dayStrings: string[] = [];
+        if (canBound && dayStart && dayEnd) {
+          const startDOnly = new Date(fromDay + "T00:00:00.000Z");
+          const endDOnly = new Date(toDay + "T00:00:00.000Z");
+          for (let d = new Date(startDOnly); d <= endDOnly; d = new Date(d.getTime() + 24 * 3600 * 1000)) {
+            dayStrings.push(d.toISOString().slice(0, 10));
           }
+        }
 
-          for (let d = new Date(iterStart); d <= iterEnd; d = new Date(d.getTime() + 24 * 3600 * 1000)) {
-            const dd = d.toISOString().slice(0, 10);
+        if (dayStrings.length > 0) {
+          for (const dd of dayStrings) {
+            const best = pickBestAssignmentForDate(dd);
+            if (!best) continue;
+
+            const shiftType = String(best.shift_type ?? "");
+            const timings = stByName.get(shiftType);
+            if (!timings) continue;
+
+            const startT = parseTimeHHMMSS(timings.start_time);
+            const endT = parseTimeHHMMSS(timings.end_time);
+            if (!startT || !endT) continue;
+
             const inTime = combine(dd, startT);
 
             const startSeconds = startT.hh * 3600 + startT.mm * 60 + startT.ss;
             const endSeconds = endT.hh * 3600 + endT.mm * 60 + endT.ss;
             const overnight = endSeconds < startSeconds;
-            const outDate = overnight ? new Date(d.getTime() + 24 * 3600 * 1000) : d;
-            const outDateIso = outDate.toISOString().slice(0, 10);
+            const outDateIso = overnight ? new Date(new Date(dd + "T00:00:00.000Z").getTime() + 24 * 3600 * 1000).toISOString().slice(0, 10) : dd;
             const outTime = combine(outDateIso, endT);
 
             if (withinRange(inTime)) {
@@ -417,27 +445,86 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
               if (!seen.has(key)) {
                 seen.add(key);
                 out.push({
-                name: `scheduled-checkin-${employeeId}-${dd}-${shiftType}-IN`.replace(/[^a-zA-Z0-9_-]/g, "_"),
-                employee: employeeId,
-                time: inTime,
-                log_type: "IN",
-                device_id: null,
-                shift: shiftType,
+                  name: `scheduled-checkin-${employeeId}-${dd}-${shiftType}-IN`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                  employee: employeeId,
+                  time: inTime,
+                  log_type: "IN",
+                  device_id: null,
+                  shift: shiftType,
                 });
               }
             }
+
             if (withinRange(outTime)) {
               const key = `${employeeId}|${outTime}|OUT|${shiftType}`;
               if (!seen.has(key)) {
                 seen.add(key);
                 out.push({
-                name: `scheduled-checkin-${employeeId}-${outDateIso}-${shiftType}-OUT`.replace(/[^a-zA-Z0-9_-]/g, "_"),
-                employee: employeeId,
-                time: outTime,
-                log_type: "OUT",
-                device_id: null,
-                shift: shiftType,
+                  name: `scheduled-checkin-${employeeId}-${outDateIso}-${shiftType}-OUT`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                  employee: employeeId,
+                  time: outTime,
+                  log_type: "OUT",
+                  device_id: null,
+                  shift: shiftType,
                 });
+              }
+            }
+          }
+        } else {
+          // If query is not bounded by valid dates, fall back to the previous
+          // "generate from all overlapping assignments" behavior.
+          for (const sa of shiftAssignments) {
+            const saStart = String(sa.start_date ?? "").slice(0, 10);
+            const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
+            if (!saStart || !/^\d{4}-\d{2}-\d{2}$/.test(saStart)) continue;
+            const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : saStart;
+
+            const shiftType = String(sa.shift_type ?? "");
+            const timings = stByName.get(shiftType);
+            if (!timings) continue;
+
+            const startT = parseTimeHHMMSS(timings.start_time);
+            const endT = parseTimeHHMMSS(timings.end_time);
+            if (!startT || !endT) continue;
+
+            const startSeconds = startT.hh * 3600 + startT.mm * 60 + startT.ss;
+            const endSeconds = endT.hh * 3600 + endT.mm * 60 + endT.ss;
+            const overnight = endSeconds < startSeconds;
+
+            for (let d = new Date(saStart + "T00:00:00.000Z"); d <= new Date(saEnd + "T00:00:00.000Z"); d = new Date(d.getTime() + 24 * 3600 * 1000)) {
+              const dd = d.toISOString().slice(0, 10);
+              const inTime = combine(dd, startT);
+              const outDateIso = overnight ? new Date(d.getTime() + 24 * 3600 * 1000).toISOString().slice(0, 10) : dd;
+              const outTime = combine(outDateIso, endT);
+
+              if (withinRange(inTime)) {
+                const key = `${employeeId}|${inTime}|IN|${shiftType}`;
+                if (!seen.has(key)) {
+                  seen.add(key);
+                  out.push({
+                    name: `scheduled-checkin-${employeeId}-${dd}-${shiftType}-IN`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                    employee: employeeId,
+                    time: inTime,
+                    log_type: "IN",
+                    device_id: null,
+                    shift: shiftType,
+                  });
+                }
+              }
+
+              if (withinRange(outTime)) {
+                const key = `${employeeId}|${outTime}|OUT|${shiftType}`;
+                if (!seen.has(key)) {
+                  seen.add(key);
+                  out.push({
+                    name: `scheduled-checkin-${employeeId}-${outDateIso}-${shiftType}-OUT`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                    employee: employeeId,
+                    time: outTime,
+                    log_type: "OUT",
+                    device_id: null,
+                    shift: shiftType,
+                  });
+                }
               }
             }
           }
