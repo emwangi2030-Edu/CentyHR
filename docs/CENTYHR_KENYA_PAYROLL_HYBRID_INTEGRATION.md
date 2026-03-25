@@ -70,6 +70,7 @@ flowchart LR
 
 ### On Linode / `bench` (your compliance spec)
 
+- **Step-by-step operator guide:** [`CENTYHR_BENCH_INSTALL_RUNBOOK.md`](./CENTYHR_BENCH_INSTALL_RUNBOOK.md) (§3-style server install + §4 component formulas + verification). **Bootstrap packages:** `scripts/centyhr-frappe-payroll-prereqs.sh`.
 - Provision **separate** VPS; install Frappe v15 → ERPNext → **hrms** → **navari_csf_ke** in that order.
 - Create Company (KES), fiscal year, salary components in **mandatory order** (Basic → … → NSSF Employee → SHIF → AHL Employee → PAYE using **taxable income** = gross − NSSF − SHIF − AHL employee, etc.).
 - Post-install verification: Examples A/B/C PAYE amounts, P9A / NSSF / SHIF reports, wkhtmltopdf payslips, backups, SSL.
