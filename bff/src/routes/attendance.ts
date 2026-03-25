@@ -147,11 +147,6 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       };
 
       const created = await erp.createDoc(ctx.creds, "Shift Type", doc);
-      const docstatus = Number((created as Record<string, unknown>)?.docstatus ?? 0);
-      const createdName = parseBodyString((created as Record<string, unknown>)?.name ?? name);
-      if (createdName && docstatus === 0) {
-        await erp.submitDoc(ctx.creds, "Shift Type", createdName);
-      }
       return { data: created };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
