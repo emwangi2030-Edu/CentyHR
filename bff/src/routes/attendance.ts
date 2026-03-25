@@ -59,6 +59,25 @@ function parseBodyString(v: unknown): string {
   return String(v ?? "").trim();
 }
 
+function parseBoolish(v: unknown): boolean | null {
+  if (v === true || v === 1 || v === "1") return true;
+  if (v === false || v === 0 || v === "0") return false;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "yes") return true;
+    if (s === "false" || s === "no") return false;
+  }
+  return null;
+}
+
+function normalizeTime(v: unknown): string {
+  const s = parseBodyString(v);
+  // Allow "HH:MM" and "HH:MM:SS"
+  if (/^\d{2}:\d{2}:\d{2}$/.test(s)) return s;
+  if (/^\d{2}:\d{2}$/.test(s)) return `${s}:00`;
+  return "";
+}
+
 export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   /**
    * Shift types (read-only metadata).
@@ -81,6 +100,59 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       });
       const data = rows.map((r) => asRecord(r)).filter(Boolean);
       return { data };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Phase 3a: HR creates Shift Types (master data).
+   *
+   * This prevents the tenant from needing to manually configure ERP behind the scenes.
+   */
+  app.post("/v1/attendance/shift-types", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can create shift types." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name = parseBodyString(body.name);
+    const start_time = normalizeTime(body.start_time);
+    const end_time = normalizeTime(body.end_time);
+    const working_hours_calculation_based_on = parseBodyString(body.working_hours_calculation_based_on);
+    const enable_auto_attendance = parseBoolish(body.enable_auto_attendance);
+
+    if (!name || !start_time || !end_time) {
+      return reply.status(400).send({
+        error: "name, start_time (HH:MM or HH:MM:SS), and end_time are required",
+      });
+    }
+
+    try {
+      const doc: Record<string, unknown> = {
+        name,
+        start_time,
+        end_time,
+        ...(working_hours_calculation_based_on ? { working_hours_calculation_based_on } : {}),
+        ...(enable_auto_attendance == null ? {} : { enable_auto_attendance: enable_auto_attendance ? 1 : 0 }),
+      };
+
+      const created = await erp.createDoc(ctx.creds, "Shift Type", doc);
+      const docstatus = Number((created as Record<string, unknown>)?.docstatus ?? 0);
+      const createdName = parseBodyString((created as Record<string, unknown>)?.name ?? name);
+      if (createdName && docstatus === 0) {
+        await erp.submitDoc(ctx.creds, "Shift Type", createdName);
+      }
+      return { data: created };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
