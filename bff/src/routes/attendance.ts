@@ -79,6 +79,45 @@ function normalizeTime(v: unknown): string {
 }
 
 export const attendanceRoutes: FastifyPluginAsync = async (app) => {
+  async function submitShiftAssignmentWithRetry(
+    creds: HrContext["creds"],
+    name: string,
+    maxAttempts = 3
+  ): Promise<unknown> {
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Ensure docstatus hasn't already changed between create and submit attempts.
+        try {
+          const cur = await erp.getDoc(creds, "Shift Assignment", name);
+          if (Number(cur.docstatus) === 1) return { alreadySubmitted: true };
+        } catch {
+          /* ignore refresh failures; submit attempt will surface the issue */
+        }
+
+        // Small delay reduces likelihood of optimistic-lock clashes with ERP background hooks.
+        if (attempt > 1) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
+        return await erp.submitDoc(creds, "Shift Assignment", name);
+      } catch (e) {
+        lastErr = e;
+        if (e instanceof ErpError && e.status === 417) {
+          // Frappe returns TimestampMismatchError when doc changes between open/save.
+          const b = e.body as any;
+          const excType = b?.exc_type ? String(b.exc_type) : "";
+          const raw = typeof b === "string" ? b : e.message;
+          if (excType.includes("TimestampMismatchError") || String(raw).includes("TimestampMismatchError")) {
+            // retry
+            continue;
+          }
+        }
+        throw e;
+      }
+    }
+    throw lastErr;
+  }
+
   /**
    * Shift types (read-only metadata).
    * Intended for showing a configuration summary; not all sites expose the same fields.
@@ -368,7 +407,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const created = await erp.createDoc(ctx.creds, "Shift Assignment", doc);
       const name = parseBodyString((created as Record<string, unknown>)?.name);
       if (name) {
-        await erp.submitDoc(ctx.creds, "Shift Assignment", name);
+        await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
       }
       return { data: created };
     } catch (e) {
