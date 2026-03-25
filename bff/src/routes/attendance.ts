@@ -313,24 +313,38 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         const dayStart = canBound ? new Date(fromDay + "T00:00:00.000Z") : null;
         const dayEnd = canBound ? new Date(toDay + "T23:59:59.999Z") : null;
 
-        const shiftAssignments = (await erp.getList(ctx.creds, "Shift Assignment", {
-          fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
-          filters: [
-            ["company", "=", ctx.company],
-            ["employee", "=", employeeId],
-            ["docstatus", "!=", 2],
-          ],
-          limit_page_length: 500,
-        })) as any[];
+        let shiftAssignments: any[] = [];
+        try {
+          shiftAssignments = (await erp.getList(ctx.creds, "Shift Assignment", {
+            fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
+            filters: [
+              ["company", "=", ctx.company],
+              ["employee", "=", employeeId],
+              ["docstatus", "!=", 2],
+            ],
+            limit_page_length: 500,
+          })) as any[];
+        } catch (e) {
+          const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+          if (st != null && st >= 500) shiftAssignments = [];
+          else throw e;
+        }
 
         const shiftTypeNames = Array.from(new Set(shiftAssignments.map((s) => String(s.shift_type ?? "")).filter(Boolean)));
-        const shiftTypes = shiftTypeNames.length
-          ? ((await erp.getList(ctx.creds, "Shift Type", {
+        let shiftTypes: any[] = [];
+        if (shiftTypeNames.length) {
+          try {
+            shiftTypes = (await erp.getList(ctx.creds, "Shift Type", {
               fields: ["name", "start_time", "end_time"],
               filters: [["name", "IN", shiftTypeNames]],
               limit_page_length: 200,
-            })) as any[])
-          : [];
+            })) as any[];
+          } catch (e) {
+            const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+            if (st != null && st >= 500) shiftTypes = [];
+            else throw e;
+          }
+        }
         const stByName = new Map<string, { start_time: string; end_time: string }>();
         for (const st of shiftTypes) {
           stByName.set(String(st.name), { start_time: String(st.start_time ?? ""), end_time: String(st.end_time ?? "") });
