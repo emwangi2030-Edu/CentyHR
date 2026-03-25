@@ -1406,7 +1406,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             await new Promise((r) => setTimeout(r, 2000 * attempt));
           }
 
-          await erp.submitDoc(ctx.creds, "Timesheet", name);
+          // `frappe.client.submit` supports `ignore_version` to bypass TimestampMismatchError
+          // (doc was modified after it was opened on the client-side).
+          await erp.callMethod(ctx.creds, "frappe.client.submit", {
+            doc: { doctype: "Timesheet", name },
+            ignore_version: true,
+          });
           return { data: { name, submitted: true } };
         } catch (e) {
           lastErr = e;
