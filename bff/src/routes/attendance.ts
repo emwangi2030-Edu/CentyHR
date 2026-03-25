@@ -1410,13 +1410,9 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           return { data: { name, submitted: true } };
         } catch (e) {
           lastErr = e;
-          if (e instanceof ErpError && e.status === 417) {
-            const b = e.body as any;
-            const excType = b?.exc_type ? String(b.exc_type) : "";
-            const raw = typeof b === "string" ? b : (e as any).message;
-            const isTimestampMismatch = excType.includes("TimestampMismatchError") || String(raw).includes("TimestampMismatchError");
-            if (isTimestampMismatch) continue;
-          }
+          // Frappe uses HTTP 417 for several optimistic-lock/timestamp-related errors.
+          // Since this is a "submit" action, we retry on 417 a few times.
+          if (e instanceof ErpError && e.status === 417) continue;
           throw e;
         }
       }
