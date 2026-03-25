@@ -134,6 +134,35 @@ function shiftWindowToMs(params: {
   return { startMs, endMs };
 }
 
+function csvEscapeCell(v: string): string {
+  const s = String(v ?? "");
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+/** Lowercased workflow labels treated as “no further action” for the approval queue. Override with TIMESHEET_WORKFLOW_TERMINAL_STATES (comma-separated). */
+function timesheetWorkflowTerminalStates(): Set<string> {
+  const fromEnv = String(process.env.TIMESHEET_WORKFLOW_TERMINAL_STATES ?? "")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+  const set = new Set<string>(["approved", "rejected", "cancelled", "complete", "completed"]);
+  for (const x of fromEnv) set.add(x);
+  return set;
+}
+
+function isActivityOvertimeLabel(activityType: string): boolean {
+  return String(activityType ?? "")
+    .toLowerCase()
+    .includes("overtime");
+}
+
+function timesheetWorkflowPending(workflowState: unknown, terminal: Set<string>): boolean {
+  const s = String(workflowState ?? "").trim();
+  if (!s) return false;
+  return !terminal.has(s.toLowerCase());
+}
+
 export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   async function submitShiftAssignmentWithRetry(
     creds: HrContext["creds"],
@@ -1572,9 +1601,16 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         if (needsSubmit) needsSubmitCount++;
         totalHoursSum += totalHours;
 
+        const workflowStateRaw = (doc as any).workflow_state;
+        const workflow_state =
+          workflowStateRaw != null && String(workflowStateRaw).trim() !== "" ? String(workflowStateRaw) : null;
+
         const warnings: string[] = [];
         if (isDraft && totalHours === 0) warnings.push("Draft with no hours logged");
         if (needsSubmit) warnings.push("Ready to finalize for payroll");
+        if (workflow_state && timesheetWorkflowPending(workflow_state, timesheetWorkflowTerminalStates())) {
+          warnings.push(`Workflow: ${workflow_state} (pending action)`);
+        }
 
         items.push({
           name: String(r.name),
@@ -1584,6 +1620,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           project: (doc as any).project ?? r.project ?? null,
           status: st,
           docstatus: ds,
+          workflow_state,
           total_hours: totalHours,
           needs_submit: needsSubmit,
           warnings,
@@ -1678,6 +1715,278 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         },
       };
     } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Payroll file: one row per time log line (submitted timesheets by default).
+   * format=json | csv — CSV is returned as raw text with Content-Disposition attachment.
+   */
+  app.get("/v1/attendance/timesheets/payroll-export", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can export payroll timesheets." });
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const qEmp = String(q.employee ?? "").trim();
+    const from = parseDate(q.from_date ?? q.from);
+    const to = parseDate(q.to_date ?? q.to);
+    const format = String(q.format ?? "json").trim().toLowerCase();
+    const submittedOnly = !["0", "false", "no"].includes(String(q.submitted_only ?? "1").trim().toLowerCase());
+
+    if (!from || !to) return reply.status(400).send({ error: "from_date and to_date are required (YYYY-MM-DD)" });
+    if (format !== "json" && format !== "csv") {
+      return reply.status(400).send({ error: "format must be json or csv" });
+    }
+
+    try {
+      const employeeId = qEmp ? await resolveEmployeeIdForRequest(ctx, qEmp) : null;
+      if (qEmp && !employeeId) return reply.status(403).send({ error: "Employee not in your Company" });
+
+      const filters: unknown[] = [["company", "=", ctx.company], ["docstatus", "!=", 2]];
+      if (employeeId) filters.push(["employee", "=", employeeId]);
+      filters.push(["start_date", "<=", to]);
+      filters.push(["end_date", ">=", from]);
+      if (submittedOnly) filters.push(["docstatus", "=", 1]);
+
+      const rows = (await erp.getList(ctx.creds, "Timesheet", {
+        fields: ["name", "employee", "employee_name", "start_date", "end_date", "status", "docstatus"],
+        filters,
+        order_by: "employee asc, start_date asc",
+        limit_page_length: 500,
+      })) as any[];
+
+      type ExportRow = Record<string, string | number | null | boolean>;
+      const exportRows: ExportRow[] = [];
+
+      for (const r of rows) {
+        const doc = await erp.getDoc(ctx.creds, "Timesheet", String(r.name));
+        const logs = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as any[]) : [];
+        const tsStart = String((doc as any).start_date ?? r.start_date ?? "").slice(0, 10);
+        const tsEnd = String((doc as any).end_date ?? r.end_date ?? "").slice(0, 10);
+        const project = (doc as any).project != null ? String((doc as any).project) : "";
+        const wf =
+          (doc as any).workflow_state != null && String((doc as any).workflow_state).trim() !== ""
+            ? String((doc as any).workflow_state)
+            : null;
+        const emp = String((doc as any).employee ?? r.employee ?? "");
+        const empName = String((doc as any).employee_name ?? r.employee_name ?? "");
+        const ds = Number((doc as any).docstatus ?? r.docstatus ?? 0);
+
+        for (let i = 0; i < logs.length; i++) {
+          const log = logs[i];
+          const activity = String(log?.activity_type ?? "").trim() || "(unspecified)";
+          const fromTime = log?.from_time != null ? String(log.from_time) : "";
+          const toTime = log?.to_time != null ? String(log.to_time) : "";
+          const hours = Number(log?.hours ?? 0);
+          exportRows.push({
+            company: ctx.company,
+            employee: emp,
+            employee_name: empName,
+            timesheet: String(r.name),
+            timesheet_start_date: tsStart,
+            timesheet_end_date: tsEnd,
+            project,
+            activity_type: activity,
+            from_time: fromTime,
+            to_time: toTime,
+            hours: Number(hours.toFixed(2)),
+            is_overtime: isActivityOvertimeLabel(activity),
+            docstatus: ds,
+            workflow_state: wf,
+            time_log_row: i,
+          });
+        }
+      }
+
+      const meta = {
+        generated_at: new Date().toISOString(),
+        from_date: from,
+        to_date: to,
+        submitted_only: submittedOnly,
+        row_count: exportRows.length,
+      };
+
+      if (format === "json") {
+        return { data: { ...meta, rows: exportRows } };
+      }
+
+      const header = [
+        "company",
+        "employee",
+        "employee_name",
+        "timesheet",
+        "timesheet_start_date",
+        "timesheet_end_date",
+        "project",
+        "activity_type",
+        "from_time",
+        "to_time",
+        "hours",
+        "is_overtime",
+        "docstatus",
+        "workflow_state",
+        "time_log_row",
+      ];
+      const lines = [
+        header.map((h) => csvEscapeCell(h)).join(","),
+        ...exportRows.map((row) =>
+          header
+            .map((h) => {
+              const v = row[h];
+              if (typeof v === "boolean") return csvEscapeCell(v ? "true" : "false");
+              if (v == null) return "";
+              return csvEscapeCell(String(v));
+            })
+            .join(",")
+        ),
+      ];
+      const csv = lines.join("\r\n") + "\r\n";
+      const filename = `payroll-timesheets-${from}-${to}.csv`;
+      reply.header("Content-Type", "text/csv; charset=utf-8");
+      reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+      return reply.send(csv);
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Timesheets in range that are submitted but still in a non-terminal workflow state (when ERP uses Workflow on Timesheet).
+   */
+  app.get("/v1/attendance/timesheets/approval-queue", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can view the approval queue." });
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const qEmp = String(q.employee ?? "").trim();
+    const from = parseDate(q.from_date ?? q.from);
+    const to = parseDate(q.to_date ?? q.to);
+    if (!from || !to) return reply.status(400).send({ error: "from_date and to_date are required (YYYY-MM-DD)" });
+
+    const terminal = timesheetWorkflowTerminalStates();
+
+    try {
+      const employeeId = qEmp ? await resolveEmployeeIdForRequest(ctx, qEmp) : null;
+      if (qEmp && !employeeId) return reply.status(403).send({ error: "Employee not in your Company" });
+
+      const filters: unknown[] = [
+        ["company", "=", ctx.company],
+        ["docstatus", "=", 1],
+        ["start_date", "<=", to],
+        ["end_date", ">=", from],
+      ];
+      if (employeeId) filters.push(["employee", "=", employeeId]);
+
+      const rows = (await erp.getList(ctx.creds, "Timesheet", {
+        fields: ["name", "employee", "employee_name", "start_date", "end_date", "status", "docstatus"],
+        filters,
+        order_by: "start_date asc, employee asc",
+        limit_page_length: 500,
+      })) as any[];
+
+      const items: Record<string, unknown>[] = [];
+
+      for (const r of rows) {
+        const doc = await erp.getDoc(ctx.creds, "Timesheet", String(r.name));
+        const wfRaw = (doc as any).workflow_state;
+        const workflow_state =
+          wfRaw != null && String(wfRaw).trim() !== "" ? String(wfRaw) : null;
+        if (!timesheetWorkflowPending(workflow_state, terminal)) continue;
+
+        const logs = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as any[]) : [];
+        const totalHours = Number(logs.reduce((acc, l) => acc + Number(l?.hours ?? 0), 0).toFixed(2));
+
+        items.push({
+          name: String(r.name),
+          employee: r.employee,
+          employee_name: r.employee_name,
+          start_date: r.start_date,
+          end_date: r.end_date,
+          status: String((doc as any).status ?? r.status ?? ""),
+          docstatus: Number((doc as any).docstatus ?? 1),
+          workflow_state,
+          total_hours: totalHours,
+        });
+      }
+
+      return {
+        data: {
+          items,
+          summary: {
+            pending_count: items.length,
+            terminal_states_hint: [...terminal].sort(),
+          },
+        },
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Apply an ERP Workflow transition (e.g. Approve / Reject). Action names must match the workflow configured on Timesheet.
+   */
+  app.post("/v1/attendance/timesheets/:name/workflow-action", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can apply timesheet workflow actions." });
+
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    const name = String(params.name ?? "").trim();
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const action = String(body.action ?? "").trim();
+    if (!name) return reply.status(400).send({ error: "Timesheet name is required" });
+    if (!action) return reply.status(400).send({ error: "action is required (e.g. Approve or Reject)" });
+
+    try {
+      const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
+      if (String((doc as any)?.company ?? "") !== ctx.company) {
+        return reply.status(403).send({ error: "Timesheet not in your Company" });
+      }
+
+      const frappeDoc = { ...doc, doctype: "Timesheet", name };
+      await erp.callMethod(ctx.creds, "frappe.model.workflow.apply_workflow", {
+        doc: frappeDoc,
+        action,
+      });
+
+      const after = await erp.getDoc(ctx.creds, "Timesheet", name);
+      const workflow_state =
+        (after as any).workflow_state != null && String((after as any).workflow_state).trim() !== ""
+          ? String((after as any).workflow_state)
+          : null;
+
+      return {
+        data: {
+          name,
+          action,
+          workflow_state,
+          docstatus: Number((after as any).docstatus ?? 0),
+        },
+      };
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
