@@ -1128,6 +1128,52 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
+  /**
+   * HR-only helper: ensure required Activity Types exist for time log creation.
+   * This keeps the clock-in/out flow working even if ERPNext is missing config.
+   */
+  app.post("/v1/attendance/seed-activity-types", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can seed activity types." });
+
+    const activityTypes = [
+      { activity_type: "Regular Hours", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Overtime", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Night Shift", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Public Holiday", costing_rate: 0, billing_rate: 0 },
+    ];
+
+    try {
+      const names = activityTypes.map((a) => a.activity_type);
+      const existing = (await erp.getList(ctx.creds, "Activity Type", {
+        fields: ["name"],
+        filters: [["name", "IN", names]],
+        limit_page_length: 50,
+      })) as any[];
+
+      const existingNames = new Set(existing.map((r) => String(r.name)));
+      const created: string[] = [];
+
+      for (const at of activityTypes) {
+        if (existingNames.has(at.activity_type)) continue;
+        const createdDoc = await erp.createDoc(ctx.creds, "Activity Type", at);
+        const nm = String((createdDoc as any)?.name ?? at.activity_type);
+        created.push(nm);
+      }
+
+      return { data: { created, alreadyExisted: activityTypes.length - created.length } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
   app.post("/v1/attendance/clock-out", async (req, reply) => {
     let ctx: HrContext;
     try {
