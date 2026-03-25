@@ -146,6 +146,16 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         ...(enable_auto_attendance == null ? {} : { enable_auto_attendance: enable_auto_attendance ? 1 : 0 }),
       };
 
+      // Idempotency: if the shift type already exists, return it (avoid upstream 409
+      // and tracebacks leaking into the UI).
+      const existingRows = await erp.getList(ctx.creds, "Shift Type", {
+        fields: ["name", "start_time", "end_time", "enable_auto_attendance"],
+        filters: [["name", "=", name]],
+        limit_page_length: 1,
+      });
+      const existing = existingRows.map(asRecord).filter(Boolean)[0];
+      if (existing) return { data: existing, meta: { alreadyExists: true } };
+
       const created = await erp.createDoc(ctx.creds, "Shift Type", doc);
       return { data: created };
     } catch (e) {
