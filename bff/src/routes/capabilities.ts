@@ -20,7 +20,7 @@ export const capabilitiesRoutes: FastifyPluginAsync = async (app) => {
       data,
       meta: {
         bff: "centy-hr-bff",
-        routes: ["employees", "employee-invites", "assets", "leaves", "attendance", "expenses", "meta", "health"],
+        routes: ["employees", "employee-invites", "assets", "leaves", "attendance", "payroll", "expenses", "meta", "health"],
       },
     });
   });
