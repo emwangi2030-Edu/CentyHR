@@ -17,7 +17,6 @@ import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
 import { publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
-import * as config from "../config.js";
 
 const erp = defaultClient();
 
@@ -82,34 +81,6 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
-  });
-
-  /**
-   * Read-only deep links to ERP Next "Shift & Attendance" screens.
-   * (For setup review by HR/admin.)
-   */
-  app.get("/v1/attendance/meta/erp-links", async (req, reply) => {
-    let ctx: HrContext;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-    // `ctx` is only used to enforce auth + Company scoping for this endpoint.
-    void ctx;
-
-    const base = config.ERP_BASE_URL;
-    return {
-      data: {
-        erp_base_url: base,
-        shift_and_attendance_workspace: `${base}/app/shift-%26-attendance`,
-        shift_type_list: `${base}/app/shift-type`,
-        shift_assignment_list: `${base}/app/shift-assignment`,
-        employee_checkin_list: `${base}/app/employee-checkin`,
-        attendance_list: `${base}/app/attendance`,
-      },
-    };
   });
 
   /**
