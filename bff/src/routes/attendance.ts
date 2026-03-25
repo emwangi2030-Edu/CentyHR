@@ -1394,7 +1394,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
     try {
       let lastErr: unknown = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let attempt = 1; attempt <= 5; attempt++) {
         try {
           const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
           if (Number((doc as any).docstatus ?? 0) === 1) {
@@ -1403,7 +1403,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
           if (attempt > 1) {
             // Helps reduce optimistic-lock clashes with ERP background hooks.
-            await new Promise((r) => setTimeout(r, 1000 * attempt));
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
           }
 
           await erp.submitDoc(ctx.creds, "Timesheet", name);
