@@ -352,7 +352,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           limit_page_length: 200,
         })) as Record<string, unknown>[];
       } catch (e) {
-        if (e instanceof ErpError && e.status >= 500) {
+        const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+        if (st != null && st >= 500) {
           attendanceRows = [];
         } else {
           throw e;
@@ -378,7 +379,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           limit_page_length: 400,
         })) as Record<string, unknown>[];
       } catch (e) {
-        if (e instanceof ErpError && e.status >= 500) {
+        const st = e && typeof (e as any).status === "number" ? (e as any).status : undefined;
+        if (st != null && st >= 500) {
           shiftRows = [];
         } else {
           throw e;
