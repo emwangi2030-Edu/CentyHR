@@ -330,7 +330,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (from) filters.push(["attendance_date", ">=", from]);
       if (to) filters.push(["attendance_date", "<=", to]);
 
-      const rows = await erp.getList(ctx.creds, "Attendance", {
+      // 1) Real attendance rows.
+      const attendanceRows = await erp.getList(ctx.creds, "Attendance", {
         fields: [
           "name",
           "employee",
@@ -348,7 +349,90 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         order_by: "attendance_date desc",
         limit_page_length: 200,
       });
-      return { data: rows };
+
+      // 2) Fallback: if ERP attendance generation is delayed/unavailable,
+      // populate the Daily tab from Shift Assignments (including drafts).
+      // This keeps the UI responsive even when Shift Assignment submit fails.
+      const shiftRows = await erp.getList(ctx.creds, "Shift Assignment", {
+        fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
+        filters: [
+          ["company", "=", ctx.company],
+          ["employee", "=", employeeId],
+          ["docstatus", "!=", 2],
+        ],
+        // Use server-side bounds loosely; we further bound dates client-side.
+        order_by: "start_date asc",
+        limit_page_length: 400,
+      });
+
+      const byDate = new Map<string, Record<string, unknown>>();
+      for (const r of attendanceRows as Record<string, unknown>[]) {
+        const d = String((r as any).attendance_date ?? "").slice(0, 10);
+        if (!d) continue;
+        byDate.set(d, r);
+      }
+
+      function isoToDate(iso: string): Date {
+        return new Date(iso + "T00:00:00.000Z");
+      }
+      function dateToIso(d: Date): string {
+        return d.toISOString().slice(0, 10);
+      }
+
+      const fromBound = from ?? "";
+      const toBound = to ?? fromBound;
+      const canBound = fromBound && toBound && /^\d{4}-\d{2}-\d{2}$/.test(fromBound) && /^\d{4}-\d{2}-\d{2}$/.test(toBound);
+
+      if (canBound) {
+        const startD = isoToDate(fromBound);
+        const endD = isoToDate(toBound);
+        const iterStart = startD <= endD ? startD : endD;
+        const iterEnd = startD <= endD ? endD : startD;
+
+        for (const sa of shiftRows as any[]) {
+          const saStart = String(sa.start_date ?? "").slice(0, 10);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(saStart)) continue;
+          const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
+          const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : toBound;
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(saEnd)) continue;
+
+          const shiftType = String(sa.shift_type ?? "");
+          if (!shiftType) continue;
+
+          const saStartD = isoToDate(saStart);
+          const saEndD = isoToDate(saEnd);
+
+          let d = iterStart > saStartD ? iterStart : saStartD;
+          const last = iterEnd < saEndD ? iterEnd : saEndD;
+
+          while (d <= last) {
+            const dd = dateToIso(d);
+            if (!byDate.has(dd)) {
+              byDate.set(dd, {
+                name: `scheduled-${employeeId}-${dd}-${shiftType}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+                employee: employeeId,
+                attendance_date: dd,
+                status: "Scheduled",
+                shift: shiftType,
+                in_time: null,
+                out_time: null,
+                working_hours: null,
+                late_entry: null,
+                early_exit: null,
+              });
+            }
+            d = new Date(d.getTime() + 24 * 3600 * 1000);
+          }
+        }
+      }
+
+      const merged = Array.from(byDate.values()).sort((a, b) => {
+        const da = String((a as any).attendance_date ?? "");
+        const db = String((b as any).attendance_date ?? "");
+        return db.localeCompare(da);
+      });
+
+      return { data: merged };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
