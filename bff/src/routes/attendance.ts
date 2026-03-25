@@ -330,40 +330,60 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (from) filters.push(["attendance_date", ">=", from]);
       if (to) filters.push(["attendance_date", "<=", to]);
 
-      // 1) Real attendance rows.
-      const attendanceRows = await erp.getList(ctx.creds, "Attendance", {
-        fields: [
-          "name",
-          "employee",
-          "employee_name",
-          "attendance_date",
-          "status",
-          "shift",
-          "in_time",
-          "out_time",
-          "working_hours",
-          "late_entry",
-          "early_exit",
-        ],
-        filters,
-        order_by: "attendance_date desc",
-        limit_page_length: 200,
-      });
+      let attendanceRows: Record<string, unknown>[] = [];
+      try {
+        // 1) Real attendance rows.
+        attendanceRows = (await erp.getList(ctx.creds, "Attendance", {
+          fields: [
+            "name",
+            "employee",
+            "employee_name",
+            "attendance_date",
+            "status",
+            "shift",
+            "in_time",
+            "out_time",
+            "working_hours",
+            "late_entry",
+            "early_exit",
+          ],
+          filters,
+          order_by: "attendance_date desc",
+          limit_page_length: 200,
+        })) as Record<string, unknown>[];
+      } catch (e) {
+        if (e instanceof ErpError && e.status >= 500) {
+          attendanceRows = [];
+        } else {
+          throw e;
+        }
+      }
 
       // 2) Fallback: if ERP attendance generation is delayed/unavailable,
       // populate the Daily tab from Shift Assignments (including drafts).
       // This keeps the UI responsive even when Shift Assignment submit fails.
-      const shiftRows = await erp.getList(ctx.creds, "Shift Assignment", {
-        fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
-        filters: [
-          ["company", "=", ctx.company],
-          ["employee", "=", employeeId],
-          ["docstatus", "!=", 2],
-        ],
-        // Use server-side bounds loosely; we further bound dates client-side.
-        order_by: "start_date asc",
-        limit_page_length: 400,
-      });
+      let shiftRows: Record<string, unknown>[] = [];
+      try {
+        // 2) Fallback: if ERP attendance generation is delayed/unavailable,
+        // populate the Daily tab from Shift Assignments (including drafts).
+        shiftRows = (await erp.getList(ctx.creds, "Shift Assignment", {
+          fields: ["name", "shift_type", "start_date", "end_date", "docstatus"],
+          filters: [
+            ["company", "=", ctx.company],
+            ["employee", "=", employeeId],
+            ["docstatus", "!=", 2],
+          ],
+          // Use server-side bounds loosely; we further bound dates client-side.
+          order_by: "start_date asc",
+          limit_page_length: 400,
+        })) as Record<string, unknown>[];
+      } catch (e) {
+        if (e instanceof ErpError && e.status >= 500) {
+          shiftRows = [];
+        } else {
+          throw e;
+        }
+      }
 
       const byDate = new Map<string, Record<string, unknown>>();
       for (const r of attendanceRows as Record<string, unknown>[]) {
@@ -389,7 +409,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         const iterStart = startD <= endD ? startD : endD;
         const iterEnd = startD <= endD ? endD : startD;
 
-        for (const sa of shiftRows as any[]) {
+      for (const sa of shiftRows as any[]) {
           const saStart = String(sa.start_date ?? "").slice(0, 10);
           if (!/^\d{4}-\d{2}-\d{2}$/.test(saStart)) continue;
           const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
