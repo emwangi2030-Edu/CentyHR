@@ -1393,12 +1393,34 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     if (!name) return reply.status(400).send({ error: "Timesheet name is required" });
 
     try {
-      const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
-      if (Number((doc as any).docstatus ?? 0) === 1) {
-        return { data: { name, submitted: false, alreadySubmitted: true } };
+      let lastErr: unknown = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const doc = await erp.getDoc(ctx.creds, "Timesheet", name);
+          if (Number((doc as any).docstatus ?? 0) === 1) {
+            return { data: { name, submitted: false, alreadySubmitted: true } };
+          }
+
+          if (attempt > 1) {
+            // Helps reduce optimistic-lock clashes with ERP background hooks.
+            await new Promise((r) => setTimeout(r, 1000 * attempt));
+          }
+
+          await erp.submitDoc(ctx.creds, "Timesheet", name);
+          return { data: { name, submitted: true } };
+        } catch (e) {
+          lastErr = e;
+          if (e instanceof ErpError && e.status === 417) {
+            const b = e.body as any;
+            const excType = b?.exc_type ? String(b.exc_type) : "";
+            const raw = typeof b === "string" ? b : (e as any).message;
+            const isTimestampMismatch = excType.includes("TimestampMismatchError") || String(raw).includes("TimestampMismatchError");
+            if (isTimestampMismatch) continue;
+          }
+          throw e;
+        }
       }
-      await erp.submitDoc(ctx.creds, "Timesheet", name);
-      return { data: { name, submitted: true } };
+      throw lastErr;
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
