@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
-import { publicErpFailure } from "../erpnext/frappeResponse.js";
+import { parseFrappeErrorBody, publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 import { insertEmployeeInvite, invitesAvailable } from "../lib/employeeInvites.js";
 import type { HrContext } from "../types.js";
@@ -181,8 +181,37 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
 
+    async function resolveCompanyDocName(): Promise<string> {
+      const raw = String(ctx!.company ?? "").trim();
+      if (!raw) return raw;
+
+      // Fast path: company is already the ERP docname
+      try {
+        await erp.getDoc(ctx!.creds, "Company", raw);
+        return raw;
+      } catch (e) {
+        if (!(e instanceof ErpError)) throw e;
+      }
+
+      // Fallback: look up by the `company_name` field (docname may differ)
+      try {
+        const rows = await erp.getList(ctx!.creds, "Company", {
+          filters: [["company_name", "=", raw]],
+          fields: ["name", "company_name"],
+          limit_page_length: 1,
+        });
+        const found = rows?.[0] as any;
+        const name = String(found?.name ?? "").trim();
+        return name || raw;
+      } catch {
+        return raw;
+      }
+    }
+
+    const companyDocName = await resolveCompanyDocName();
+
     // Cache per user+company (30 s) — avoids hitting ERPNext on every page load
-    const cacheKey = `${ctx.company}:me:${ctx.userEmail}`;
+    const cacheKey = `${companyDocName}:me:${ctx.userEmail}`;
     const cached = erpCacheGet<{ data: unknown }>(cacheKey);
     if (cached) return cached;
 
@@ -191,14 +220,14 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       async function fetchEmployeeRows(field: "user_id" | "personal_email"): Promise<unknown[]> {
         try {
           return await erp.getList(ctx!.creds, "Employee", {
-            filters: [[field, "=", ctx!.userEmail], ["company", "=", ctx!.company]],
+            filters: [[field, "=", ctx!.userEmail], ["company", "=", companyDocName]],
             fields: EMPLOYEE_FIELDS,
             limit_page_length: 1,
           });
         } catch (e) {
           if (e instanceof ErpError && e.status >= 500) {
             const res = await erp.listDocs(ctx!.creds, "Employee", {
-              filters: [[field, "=", ctx!.userEmail], ["company", "=", ctx!.company]],
+              filters: [[field, "=", ctx!.userEmail], ["company", "=", companyDocName]],
               fields: EMPLOYEE_FIELDS,
               limit_page_length: 1,
             });
@@ -221,7 +250,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(404).send({
           error: "No employee record for your account in this company.",
           code: "HR_NO_EMPLOYEE",
-          company: ctx.company,
+          company: companyDocName,
         });
       }
       const rec = row as Record<string, unknown>;
@@ -236,6 +265,126 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
           return { status: e.status >= 500 ? 502 : e.status, payload: p };
         })();
         return reply.status(status).send(payload);
+      }
+      throw e;
+    }
+  });
+
+  /**
+   * Admin helper: ensure an Employee exists for the caller's email (in this Company).
+   * This is used by Pay Hub to "auto-link" the admin to an Employee record without ERP UI access.
+   */
+  app.post("/v1/me/employee/ensure", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "HR admin privileges required" });
+    }
+
+    async function resolveCompanyDocName(): Promise<string> {
+      const raw = String(ctx!.company ?? "").trim();
+      if (!raw) return raw;
+      try {
+        await erp.getDoc(ctx!.creds, "Company", raw);
+        return raw;
+      } catch (e) {
+        if (!(e instanceof ErpError)) throw e;
+      }
+      try {
+        const rows = await erp.getList(ctx!.creds, "Company", {
+          filters: [["company_name", "=", raw]],
+          fields: ["name", "company_name"],
+          limit_page_length: 1,
+        });
+        const found = rows?.[0] as any;
+        const name = String(found?.name ?? "").trim();
+        return name || raw;
+      } catch {
+        return raw;
+      }
+    }
+
+    const companyDocName = await resolveCompanyDocName();
+    const email = String(ctx.userEmail || "").trim();
+    if (!email) return reply.status(400).send({ error: "Missing email context" });
+
+    const fetchExisting = async (): Promise<Record<string, unknown> | null> => {
+      for (const field of ["user_id", "personal_email"] as const) {
+        try {
+          const rows = await erp.getList(ctx!.creds, "Employee", {
+            filters: [[field, "=", email], ["company", "=", companyDocName]],
+            fields: EMPLOYEE_FIELDS,
+            limit_page_length: 1,
+          });
+          const row = rows?.[0];
+          if (row && typeof row === "object") return row as Record<string, unknown>;
+        } catch (e) {
+          if (!(e instanceof ErpError)) throw e;
+        }
+      }
+      return null;
+    };
+
+    // If already exists, return it (idempotent)
+    const existing = await fetchExisting();
+    if (existing) {
+      return { data: existing };
+    }
+
+    const localPart = email.split("@")[0] || email;
+    const firstName = localPart.replace(/[._-]+/g, " ").trim().slice(0, 140) || "Admin";
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const baseDoc = {
+      company: companyDocName,
+      first_name: firstName,
+      last_name: "",
+      employee_name: firstName,
+      date_of_joining: todayIso,
+      status: "Active",
+      personal_email: email,
+    };
+
+    const isMissingUserIdLink = (e: ErpError): boolean => {
+      const hint = parseFrappeErrorBody(e.body);
+      const h = String(hint ?? "").toLowerCase();
+      return h.includes("could not find user id");
+    };
+
+    try {
+      let created: unknown;
+      try {
+        // Preferred: attach `user_id` when ERP User exists.
+        created = await erp.createDoc(ctx.creds, "Employee", {
+          ...baseDoc,
+          user_id: email,
+        });
+      } catch (inner) {
+        if (!(inner instanceof ErpError)) throw inner;
+        if (isMissingUserIdLink(inner)) {
+          // Fallback for tenants where ERP User isn't provisioned for the login email yet.
+          created = await erp.createDoc(ctx.creds, "Employee", baseDoc);
+        } else {
+          throw inner;
+        }
+      }
+      const createdName = String((created as any)?.name ?? "").trim();
+      if (!createdName) return { data: { created: true } };
+      const doc = await erp.getDoc(ctx.creds, "Employee", createdName);
+      return { data: doc };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        // If another concurrent request created/updated the employee, return the now-existing row.
+        if (e.status === 409 || e.status === 417) {
+          const row = await fetchExisting();
+          if (row) return { data: row };
+        }
+        const status = e.status >= 500 ? 502 : e.status;
+        return reply.status(status).send(publicErpFailure(e));
       }
       throw e;
     }

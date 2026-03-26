@@ -95,7 +95,6 @@ export function publicErpFailure(e: ErpError, dev = process.env.NODE_ENV === "de
   );
 
   const recordStale =
-    e.status === 417 ||
     bodyIndicatesRecordStale(e.body) ||
     (typeof safeHint === "string" && (/document has been modified/i.test(safeHint) || /timestamp\s*mismatch/i.test(safeHint)));
   if (e.status >= 500) {
