@@ -8,6 +8,25 @@ import type { HrContext } from "../types.js";
 
 const erp = defaultClient();
 
+// ── Simple in-process cache for expensive ERPNext list/summary calls ─────────
+// Key: `${company}:${cacheKey}`, Value: { data: unknown; exp: number }
+const ERP_CACHE_TTL_MS = Number(process.env.ERP_CACHE_TTL_MS ?? 30_000); // 30 s default
+const _erpCache = new Map<string, { data: unknown; exp: number }>();
+function erpCacheGet<T>(key: string): T | null {
+  const entry = _erpCache.get(key);
+  if (!entry || entry.exp < Date.now()) { _erpCache.delete(key); return null; }
+  return entry.data as T;
+}
+function erpCacheSet(key: string, data: unknown): void {
+  _erpCache.set(key, { data, exp: Date.now() + ERP_CACHE_TTL_MS });
+}
+/** Bust all cache entries for a company (call after create/update/delete). */
+function erpCacheBust(company: string): void {
+  for (const k of _erpCache.keys()) {
+    if (k.startsWith(`${company}:`)) _erpCache.delete(k);
+  }
+}
+
 function replyErp(reply: FastifyReply, e: ErpError) {
   const status = e.status >= 500 ? 502 : e.status;
   return reply.status(status).send(publicErpFailure(e));
@@ -162,31 +181,39 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
 
+    // Cache per user+company (30 s) — avoids hitting ERPNext on every page load
+    const cacheKey = `${ctx.company}:me:${ctx.userEmail}`;
+    const cached = erpCacheGet<{ data: unknown }>(cacheKey);
+    if (cached) return cached;
+
     try {
-      let rows: unknown[];
-      try {
-        rows = await erp.getList(ctx.creds, "Employee", {
-          filters: [
-            ["user_id", "=", ctx.userEmail],
-            ["company", "=", ctx.company],
-          ],
-          fields: EMPLOYEE_FIELDS,
-          limit_page_length: 1,
-        });
-      } catch (first) {
-        if (first instanceof ErpError && first.status >= 500) {
-          const res = await erp.listDocs(ctx.creds, "Employee", {
-            filters: [
-              ["user_id", "=", ctx.userEmail],
-              ["company", "=", ctx.company],
-            ],
+      /** Try a single filter variant against the ERP; falls back to listDocs on 5xx. */
+      async function fetchEmployeeRows(field: "user_id" | "personal_email"): Promise<unknown[]> {
+        try {
+          return await erp.getList(ctx!.creds, "Employee", {
+            filters: [[field, "=", ctx!.userEmail], ["company", "=", ctx!.company]],
             fields: EMPLOYEE_FIELDS,
             limit_page_length: 1,
           });
-          rows = res.data ?? [];
-        } else {
-          throw first;
+        } catch (e) {
+          if (e instanceof ErpError && e.status >= 500) {
+            const res = await erp.listDocs(ctx!.creds, "Employee", {
+              filters: [[field, "=", ctx!.userEmail], ["company", "=", ctx!.company]],
+              fields: EMPLOYEE_FIELDS,
+              limit_page_length: 1,
+            });
+            return res.data ?? [];
+          }
+          throw e;
         }
+      }
+
+      // Primary: look up by user_id (linked Frappe user)
+      let rows = await fetchEmployeeRows("user_id");
+
+      // Fallback: look up by personal_email (employee created without a Frappe user account)
+      if (!rows[0]) {
+        rows = await fetchEmployeeRows("personal_email");
       }
 
       const row = rows[0];
@@ -199,7 +226,9 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       }
       const rec = row as Record<string, unknown>;
       const { company: _c, ...data } = rec;
-      return { data };
+      const result = { data };
+      erpCacheSet(cacheKey, result);
+      return result;
     } catch (e) {
       if (e instanceof ErpError) {
         const { status, payload } = (() => {
@@ -291,6 +320,10 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
 
+    const summaryKey = `${ctx.company}:summary`;
+    const cachedSummary = erpCacheGet<unknown>(summaryKey);
+    if (cachedSummary) return cachedSummary;
+
     try {
       const res = await erp.listDocs(ctx.creds, "Employee", {
         filters: [["company", "=", ctx.company]],
@@ -312,7 +345,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         else if (st === "left") left++;
         else inactive++;
       }
-      return {
+      const result = {
         data: {
           total,
           active,
@@ -321,6 +354,8 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
           scan_capped: rows.length >= SUMMARY_SCAN_CAP,
         },
       };
+      erpCacheSet(summaryKey, result);
+      return result;
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
@@ -363,6 +398,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const rawGender = String(doc.gender ?? "").trim().toLowerCase();
     if (rawGender === "m" || rawGender === "male") doc.gender = "Male";
     else if (rawGender === "f" || rawGender === "female") doc.gender = "Female";
+    else if (!rawGender) doc.gender = "Male"; // ERPNext mandatory field — default when not supplied
 
     const doj = String(doc.date_of_joining ?? "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(doj)) {
@@ -371,15 +407,23 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const dob = String(doc.date_of_birth ?? "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
-      doc.date_of_birth = String(doc.date_of_joining ?? "").slice(0, 10);
+      // Default DOB to 25 years before date_of_joining — same-day DOB fails ERPNext age validation
+      const dobDefault = new Date(doc.date_of_joining as string);
+      dobDefault.setFullYear(dobDefault.getFullYear() - 25);
+      doc.date_of_birth = dobDefault.toISOString().slice(0, 10);
     }
 
+    console.log("[employee] createDoc payload:", JSON.stringify(doc));
     try {
       const created = await erp.createDoc(ctx.creds, "Employee", doc);
+      erpCacheBust(ctx.company); // invalidate list/summary caches
       const { company: _drop, ...data } = created as Record<string, unknown>;
       return { data };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
+      if (e instanceof ErpError) {
+        console.error(`[employee] createDoc failed HTTP ${e.status} body:`, JSON.stringify(e.body ?? null).slice(0, 2000));
+        return replyErp(reply, e);
+      }
       throw e;
     }
   });
@@ -441,8 +485,11 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     try {
       const { page, pageSize, limitStart } = parsePageParams(req);
-      const take = pageSize + 1;
       const q = parseSearchQuery(req);
+      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}`;
+      const cachedList = erpCacheGet<unknown>(listCacheKey);
+      if (cachedList) return cachedList;
+      const take = pageSize + 1;
       const esc = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%");
       const like = esc ? `%${esc}%` : "";
 
@@ -491,10 +538,12 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       const raw = res.data ?? [];
       const hasMore = raw.length > pageSize;
       const data = hasMore ? raw.slice(0, pageSize) : raw;
-      return {
+      const listResult = {
         data,
         meta: { page, page_size: pageSize, has_more: hasMore, q: q || undefined },
       };
+      erpCacheSet(listCacheKey, listResult);
+      return listResult;
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;

@@ -10,6 +10,7 @@ import { attendanceRoutes } from "./routes/attendance.js";
 import { payrollRoutes } from "./routes/payroll.js";
 import { hrApprovalMetaRoutes } from "./routes/hrApprovalMeta.js";
 import { capabilitiesRoutes } from "./routes/capabilities.js";
+import { orgUnitRoutes } from "./routes/orgUnits.js";
 
 async function main() {
   const prefix = config.BASE_PATH;
@@ -27,6 +28,7 @@ async function main() {
   await app.register(payrollRoutes, { prefix });
   await app.register(hrApprovalMetaRoutes, { prefix });
   await app.register(capabilitiesRoutes, { prefix });
+  await app.register(orgUnitRoutes, { prefix });
   await app.listen({ port: config.PORT, host: config.HR_BFF_HOST });
 }
 

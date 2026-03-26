@@ -17,15 +17,6 @@ function authHeader(c: ErpCredentials): string {
   return `token ${c.apiKey}:${c.apiSecret}`;
 }
 
-async function parseJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (!text) return undefined;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
-}
 
 export class ErpNextClient {
   constructor(private readonly baseUrl: string) {}
@@ -56,10 +47,20 @@ export class ErpNextClient {
       headers,
       body: opts?.form ?? (opts?.body !== undefined ? JSON.stringify(opts.body) : undefined),
     });
-    const data = await parseJson(res);
+    const rawText = await res.text();
     if (!res.ok) {
-      throw new ErpError(`Upstream HTTP ${res.status}`, res.status, data);
+      // Always log the raw response text so BFF server logs capture the real ERPNext error
+      console.error(
+        `[erp:client] ${method} ${path} → HTTP ${res.status}`,
+        `raw(${rawText.length}):`,
+        rawText.slice(0, 1500)
+      );
+      let parsed: unknown;
+      try { parsed = rawText ? JSON.parse(rawText) : undefined; } catch { parsed = rawText || undefined; }
+      throw new ErpError(`Upstream HTTP ${res.status}`, res.status, parsed);
     }
+    let data: unknown;
+    try { data = rawText ? JSON.parse(rawText) : undefined; } catch { data = rawText || undefined; }
     return data;
   }
 
