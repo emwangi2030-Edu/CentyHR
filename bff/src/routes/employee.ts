@@ -127,6 +127,8 @@ const EMPLOYEE_LIST_FIELDS = [
   "department",
   "designation",
   "branch",
+  "employment_type",
+  "grade",
   "status",
   "user_id",
   "date_of_joining",
@@ -460,6 +462,135 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       return { data };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Colleagues with a Frappe `user_id` in this Company — suitable values for `Employee.expense_approver` (User link).
+   * Scoped to ERP; Pay Hub does not maintain a parallel user list.
+   */
+  app.get("/v1/meta/expense-approver-users", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const q = String(raw.q ?? "").trim().slice(0, 120);
+    const limitRaw = parseInt(String(raw.limit ?? "30"), 10) || 30;
+    const limit = Math.min(50, Math.max(5, limitRaw));
+    const esc = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%");
+    const like = esc ? `%${esc}%` : "";
+
+    try {
+      let filters: unknown[] = [
+        ["company", "=", ctx.company],
+        ["user_id", "!=", ""],
+      ];
+      if (like) {
+        filters = [
+          "and",
+          filters,
+          [
+            "or",
+            [
+              ["employee_name", "like", like],
+              ["user_id", "like", like],
+              ["name", "like", like],
+            ],
+          ],
+        ];
+      }
+
+      const res = await erp.listDocs(ctx.creds, "Employee", {
+        filters,
+        fields: ["name", "employee_name", "user_id", "status"],
+        order_by: "employee_name asc",
+        limit_page_length: limit + 5,
+      });
+      const rows = res.data ?? [];
+      const seen = new Set<string>();
+      const data: { value: string; label: string; employee_id: string }[] = [];
+      for (const r of rows) {
+        const rec = asRecord(r);
+        if (!rec) continue;
+        const uid = String(rec.user_id ?? "").trim();
+        if (!uid || seen.has(uid)) continue;
+        seen.add(uid);
+        const label = String(rec.employee_name ?? "").trim() || uid;
+        data.push({
+          value: uid,
+          label,
+          employee_id: String(rec.name ?? ""),
+        });
+        if (data.length >= limit) break;
+      }
+      return { data };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/expense-approver-users ERP error:", e.status, e.body);
+        return { data: [] as { value: string; label: string; employee_id: string }[] };
+      }
+      throw e;
+    }
+  });
+
+  /** Names from ERP `Employment Type` (Link target for `Employee.employment_type` on standard HR sites). */
+  app.get("/v1/meta/employment-types", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const rows = await erp.getList(ctx.creds, "Employment Type", {
+        fields: ["name"],
+        limit_page_length: 100,
+      });
+      const names = (rows as { name?: string }[])
+        .map((r) => String(r.name ?? "").trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+      return { data: names.map((name) => ({ name })) };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/employment-types:", e.status, e.body);
+        return { data: [] as { name: string }[] };
+      }
+      throw e;
+    }
+  });
+
+  /** Names from ERP `Employee Grade` (common Link target for `Employee.grade` in HR). */
+  app.get("/v1/meta/employee-grades", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const rows = await erp.getList(ctx.creds, "Employee Grade", {
+        fields: ["name"],
+        limit_page_length: 100,
+      });
+      const names = (rows as { name?: string }[])
+        .map((r) => String(r.name ?? "").trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+      return { data: names.map((name) => ({ name })) };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/employee-grades:", e.status, e.body);
+        return { data: [] as { name: string }[] };
+      }
       throw e;
     }
   });

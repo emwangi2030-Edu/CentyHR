@@ -9,6 +9,7 @@ import { leaveRoutes } from "./routes/leaves.js";
 import { attendanceRoutes } from "./routes/attendance.js";
 import { payrollRoutes } from "./routes/payroll.js";
 import { hrApprovalMetaRoutes } from "./routes/hrApprovalMeta.js";
+import { loanRoutes } from "./routes/loans.js";
 import { capabilitiesRoutes } from "./routes/capabilities.js";
 import { orgUnitRoutes } from "./routes/orgUnits.js";
 import { companyRoutes } from "./routes/company.js";
@@ -28,6 +29,7 @@ async function main() {
   await app.register(attendanceRoutes, { prefix });
   await app.register(payrollRoutes, { prefix });
   await app.register(hrApprovalMetaRoutes, { prefix });
+  await app.register(loanRoutes, { prefix });
   await app.register(capabilitiesRoutes, { prefix });
   await app.register(orgUnitRoutes, { prefix });
   await app.register(companyRoutes, { prefix });

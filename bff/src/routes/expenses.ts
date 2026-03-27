@@ -283,6 +283,78 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
+  /** Cost Center names for this Company (typing aid; ERP remains source of truth). */
+  app.get("/v1/meta/cost-centers", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const q = String(raw.q ?? "").trim().slice(0, 120);
+    const limit = Math.min(80, Math.max(10, parseInt(String(raw.limit ?? "40"), 10) || 40));
+    const esc = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%");
+    const like = esc ? `%${esc}%` : "";
+    try {
+      let filters: unknown[] = [["company", "=", ctx.company]];
+      if (like) filters = ["and", filters, ["name", "like", like]];
+      const res = await erp.listDocs(ctx.creds, "Cost Center", {
+        filters,
+        fields: ["name"],
+        order_by: "name asc",
+        limit_page_length: limit,
+      });
+      const names = (res.data ?? [])
+        .map((r) => String(asRecord(r)?.name ?? "").trim())
+        .filter(Boolean);
+      return { data: names.map((name) => ({ name })) };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/cost-centers:", e.status, e.body);
+        return { data: [] as { name: string }[] };
+      }
+      throw e;
+    }
+  });
+
+  /** Project names for this Company (typing aid). */
+  app.get("/v1/meta/projects", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const q = String(raw.q ?? "").trim().slice(0, 120);
+    const limit = Math.min(80, Math.max(10, parseInt(String(raw.limit ?? "40"), 10) || 40));
+    const esc = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%");
+    const like = esc ? `%${esc}%` : "";
+    try {
+      let filters: unknown[] = [["company", "=", ctx.company]];
+      if (like) filters = ["and", filters, ["name", "like", like]];
+      const res = await erp.listDocs(ctx.creds, "Project", {
+        filters,
+        fields: ["name"],
+        order_by: "name asc",
+        limit_page_length: limit,
+      });
+      const names = (res.data ?? [])
+        .map((r) => String(asRecord(r)?.name ?? "").trim())
+        .filter(Boolean);
+      return { data: names.map((name) => ({ name })) };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/projects:", e.status, e.body);
+        return { data: [] as { name: string }[] };
+      }
+      throw e;
+    }
+  });
+
   app.get("/v1/expenses", async (req, reply) => {
     let ctx;
     try {

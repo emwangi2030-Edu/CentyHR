@@ -72,10 +72,17 @@ function hintLooksLikeVendorNoise(hint: string): boolean {
   return (
     h.includes("traceback") ||
     h.includes("apps/frappe") ||
-    h.includes("frappe.") ||
     h.includes("erpnext") ||
     h.includes("/frappe/")
   );
+}
+
+function stripVendorPrefix(hint: string): string {
+  const clean = hint.replace(/<[^>]*>/g, "").trim();
+  // Example: "frappe.exceptions.LinkValidationError: Could not find Designation: IT Officer"
+  const m = clean.match(/^[a-z0-9_.]+:\s*(.+)$/i);
+  if (m?.[1]) return m[1].trim();
+  return clean;
 }
 
 /** Map upstream HR system failures to safe JSON for clients (no backend product names). */
@@ -86,6 +93,7 @@ export function publicErpFailure(e: ErpError, dev = process.env.NODE_ENV === "de
   const looksLikeTrace =
     typeof hint === "string" && (/Traceback \(most recent call last\)/.test(hint) || hint.includes("apps/frappe/"));
   let safeHint: string | null = looksLikeTrace ? null : hint;
+  if (typeof safeHint === "string") safeHint = stripVendorPrefix(safeHint);
   if (typeof safeHint === "string" && hintLooksLikeVendorNoise(safeHint)) safeHint = null;
   // Log the extracted message so server logs surface the real ERPNext error without full tracebacks
   console.error(`[erp] HTTP ${e.status} — ${safeHint ?? hint ?? JSON.stringify(e.body ?? null).slice(0, 300)}`);
