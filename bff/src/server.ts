@@ -16,7 +16,7 @@ import { companyRoutes } from "./routes/company.js";
 async function main() {
   const prefix = config.BASE_PATH;
   const app = Fastify({
-    logger: true,
+    logger: { level: "warn" }, // only log warnings + errors; suppress per-request info noise
     trustProxy: true,
   });
   await app.register(healthRoutes, { prefix });

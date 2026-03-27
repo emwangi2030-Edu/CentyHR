@@ -77,32 +77,60 @@ export const employeePublicRoutes: FastifyPluginAsync = async (app) => {
     const body = (req.body ?? {}) as {
       first_name?: string;
       last_name?: string;
+      salutation?: string;
       gender?: string;
+      date_of_birth?: string;
       date_of_joining?: string;
+      cell_number?: string;
+      department?: string;
+      designation?: string;
+      branch?: string;
     };
     const first_name = String(body.first_name ?? "").trim();
     const last_name = String(body.last_name ?? "").trim();
-    if (!first_name || !last_name) {
-      return reply.status(400).send({ error: "first_name and last_name are required" });
+    if (!first_name) {
+      return reply.status(400).send({ error: "first_name is required" });
     }
 
     const dateRaw = String(body.date_of_joining ?? "").trim();
     const date_of_joining = /^\d{4}-\d{2}-\d{2}$/.test(dateRaw)
       ? dateRaw
       : new Date().toISOString().slice(0, 10);
-    const gender = String(body.gender ?? "").trim() || undefined;
+
+    // Normalize gender to ERPNext expected values
+    const rawGender = String(body.gender ?? "").trim().toLowerCase();
+    const gender =
+      rawGender === "male" || rawGender === "m" ? "Male" :
+      rawGender === "female" || rawGender === "f" ? "Female" :
+      rawGender === "other" ? "Other" : "Male"; // ERPNext requires gender; default Male
+
+    // Default DOB to 25 years before DOJ (ERPNext mandatory field)
+    const dobRaw = String(body.date_of_birth ?? "").trim();
+    const dobDefault = new Date(date_of_joining);
+    dobDefault.setFullYear(dobDefault.getFullYear() - 25);
+    const date_of_birth = /^\d{4}-\d{2}-\d{2}$/.test(dobRaw)
+      ? dobRaw
+      : dobDefault.toISOString().slice(0, 10);
 
     const doc: Record<string, unknown> = {
       company: invite.company_key,
       first_name,
-      last_name,
-      employee_name: `${first_name} ${last_name}`.trim(),
+      last_name: last_name || "",
+      employee_name: last_name ? `${first_name} ${last_name}`.trim() : first_name,
       date_of_joining,
+      date_of_birth,
+      gender,
       status: "Active",
       prefered_email: invite.email,
-      company_email: invite.email,
+      personal_email: invite.email,
     };
-    if (gender) doc.gender = gender;
+
+    const str = (v: unknown) => String(v ?? "").trim();
+    if (str(body.salutation)) doc.salutation = str(body.salutation);
+    if (str(body.cell_number)) doc.cell_number = str(body.cell_number);
+    if (str(body.department)) doc.department = str(body.department);
+    if (str(body.designation)) doc.designation = str(body.designation);
+    if (str(body.branch)) doc.branch = str(body.branch);
 
     try {
       const created = await erp.createDoc(creds, "Employee", doc);

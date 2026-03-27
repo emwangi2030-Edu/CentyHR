@@ -81,18 +81,14 @@ function hintLooksLikeVendorNoise(hint: string): boolean {
 /** Map upstream HR system failures to safe JSON for clients (no backend product names). */
 export function publicErpFailure(e: ErpError, dev = process.env.NODE_ENV === "development"): Record<string, unknown> {
   const hint = parseFrappeErrorBody(e.body);
-  // Always log full body + extracted hint so BFF logs show the real ERPNext error
-  console.error(`[erp] ${e.status} error body:`, JSON.stringify(e.body ?? null).slice(0, 800));
-  console.error(`[erp:parse] extracted hint: ${hint == null ? "(null)" : JSON.stringify(hint).slice(0, 400)}`);
 
   // Upstream sometimes returns full tracebacks in 4xx/5xx bodies — never show those to users.
   const looksLikeTrace =
     typeof hint === "string" && (/Traceback \(most recent call last\)/.test(hint) || hint.includes("apps/frappe/"));
   let safeHint: string | null = looksLikeTrace ? null : hint;
   if (typeof safeHint === "string" && hintLooksLikeVendorNoise(safeHint)) safeHint = null;
-  console.error(
-    `[erp:parse] looksLikeTrace=${looksLikeTrace} safeHint=${safeHint == null ? "(null)" : JSON.stringify(safeHint).slice(0, 200)}`
-  );
+  // Log the extracted message so server logs surface the real ERPNext error without full tracebacks
+  console.error(`[erp] HTTP ${e.status} — ${safeHint ?? hint ?? JSON.stringify(e.body ?? null).slice(0, 300)}`);
 
   const recordStale =
     bodyIndicatesRecordStale(e.body) ||

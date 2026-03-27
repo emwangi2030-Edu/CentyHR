@@ -16,6 +16,8 @@ export const capabilitiesRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
     const data = buildCapabilitiesForResponse(HR_CAPABILITIES_JSON);
+    // sendInvite stays true even when Supabase isn't configured — the button is always shown
+    // and the error is surfaced at invite-creation time with a clear message instead of hiding the feature.
     return reply.send({
       data,
       meta: {

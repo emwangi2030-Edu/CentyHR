@@ -339,12 +339,17 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const localPart = email.split("@")[0] || email;
     const firstName = localPart.replace(/[._-]+/g, " ").trim().slice(0, 140) || "Admin";
     const todayIso = new Date().toISOString().slice(0, 10);
+    // Default DOB to 25 years before DOJ — ERPNext requires both gender and date_of_birth
+    const dobDefault = new Date(todayIso);
+    dobDefault.setFullYear(dobDefault.getFullYear() - 25);
     const baseDoc = {
       company: companyDocName,
       first_name: firstName,
       last_name: "",
       employee_name: firstName,
       date_of_joining: todayIso,
+      date_of_birth: dobDefault.toISOString().slice(0, 10),
+      gender: "Male",
       status: "Active",
       personal_email: email,
     };
@@ -536,13 +541,13 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const first = String(doc.first_name ?? "").trim();
-    const last = String(doc.last_name ?? "").trim();
-    if (!first || !last) {
-      return reply.status(400).send({ error: "first_name and last_name are required" });
+    if (!first) {
+      return reply.status(400).send({ error: "first_name is required" });
     }
+    const last = String(doc.last_name ?? "").trim();
     doc.first_name = first;
     doc.last_name = last;
-    doc.employee_name = `${first} ${last}`.trim();
+    doc.employee_name = last ? `${first} ${last}`.trim() : first;
 
     const rawGender = String(doc.gender ?? "").trim().toLowerCase();
     if (rawGender === "m" || rawGender === "male") doc.gender = "Male";
@@ -562,7 +567,6 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       doc.date_of_birth = dobDefault.toISOString().slice(0, 10);
     }
 
-    console.log("[employee] createDoc payload:", JSON.stringify(doc));
     try {
       const created = await erp.createDoc(ctx.creds, "Employee", doc);
       erpCacheBust(ctx.company); // invalidate list/summary caches
@@ -570,7 +574,6 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       return { data };
     } catch (e) {
       if (e instanceof ErpError) {
-        console.error(`[employee] createDoc failed HTTP ${e.status} body:`, JSON.stringify(e.body ?? null).slice(0, 2000));
         return replyErp(reply, e);
       }
       throw e;

@@ -49,12 +49,6 @@ export class ErpNextClient {
     });
     const rawText = await res.text();
     if (!res.ok) {
-      // Always log the raw response text so BFF server logs capture the real ERPNext error
-      console.error(
-        `[erp:client] ${method} ${path} → HTTP ${res.status}`,
-        `raw(${rawText.length}):`,
-        rawText.slice(0, 1500)
-      );
       let parsed: unknown;
       try { parsed = rawText ? JSON.parse(rawText) : undefined; } catch { parsed = rawText || undefined; }
       throw new ErpError(`Upstream HTTP ${res.status}`, res.status, parsed);
