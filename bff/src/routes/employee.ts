@@ -143,34 +143,38 @@ function normalizeStatus(s: unknown): string {
 
 /** Fields Pay Hub may PATCH on Employee (ERPNext); avoids arbitrary writes. */
 const EMPLOYEE_PATCH_WHITELIST = new Set([
-  "cell_number",
-  "prefered_email",
-  "personal_email",
-  "company_email",
-  "expense_approver",
+  // Contact
+  "cell_number", "prefered_email", "personal_email", "company_email",
+  "expense_approver", "current_address", "permanent_address",
+  // Employment
+  "department", "designation", "branch", "reports_to", "employment_type", "grade",
+  "gender", "date_of_birth", "date_of_joining", "marital_status", "blood_group",
+  "nationality", "notice_number_of_days",
+  // Joining
+  "job_applicant", "scheduled_confirmation_date", "final_confirmation_date",
+  "contract_end_date", "date_of_retirement",
+  // Personal
+  "family_background", "health_details", "health_insurance_provider",
+  "passport_number", "valid_upto", "date_of_issue", "place_of_issue", "bio",
+  // Attendance & Leaves
+  "attendance_device_id", "holiday_list", "default_shift",
+  "leave_approver", "shift_request_approver",
+  // Payroll & Banking
+  "ctc", "payroll_cost_center", "salary_mode", "salary_currency",
+  "bank_name", "bank_ac_no", "iban",
+  // Exit
+  "resignation_letter_date", "relieving_date", "held_on", "new_workplace",
+  "leave_encashed", "reason_for_leaving", "feedback",
+  // Statutory / Tax compliance
+  "tax_id",                                          // KRA PIN (standard ERPNext field)
+  // Common custom field name variants for Kenya statutory numbers:
+  "nssf_no", "custom_nssf_no", "nssf_number", "custom_nssf_number",
+  "nhif_no", "custom_nhif_no", "nhif_number", "custom_nhif_number",
+  "shif_no", "custom_shif_no", "shif_number", "custom_shif_number",
+  "nita_no", "custom_nita_no", "nita_number", "custom_nita_number",
+  "kra_pin", "custom_kra_pin",
 ]);
 
-const EMPLOYEE_FIELDS = [
-  "name",
-  "employee_name",
-  "first_name",
-  "last_name",
-  "company",
-  "department",
-  "designation",
-  "branch",
-  "reports_to",
-  "gender",
-  "date_of_birth",
-  "date_of_joining",
-  "cell_number",
-  "prefered_email",
-  "company_email",
-  "personal_email",
-  "user_id",
-  "expense_approver",
-  "status",
-];
 
 export const employeeRoutes: FastifyPluginAsync = async (app) => {
   /** Bio / master data for the logged-in user's Employee row (same Company). */
@@ -218,45 +222,48 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     if (cached) return cached;
 
     try {
-      /** Try a single filter variant against the ERP; falls back to listDocs on 5xx. */
-      async function fetchEmployeeRows(field: "user_id" | "personal_email"): Promise<unknown[]> {
+      /**
+       * Resolve the employee docname for this user.
+       * Uses ["name"] only — avoids 417s from fields that don't exist in the installation.
+       */
+      async function resolveEmployeeName(field: "user_id" | "personal_email"): Promise<string | null> {
         try {
-          return await erp.getList(ctx!.creds, "Employee", {
+          const rows = await erp.getList(ctx!.creds, "Employee", {
             filters: [[field, "=", ctx!.userEmail], ["company", "=", companyDocName]],
-            fields: EMPLOYEE_FIELDS,
+            fields: ["name"],
             limit_page_length: 1,
           });
+          const row = rows?.[0] as { name?: string } | undefined;
+          return row?.name ? String(row.name) : null;
         } catch (e) {
           if (e instanceof ErpError && e.status >= 500) {
             const res = await erp.listDocs(ctx!.creds, "Employee", {
               filters: [[field, "=", ctx!.userEmail], ["company", "=", companyDocName]],
-              fields: EMPLOYEE_FIELDS,
+              fields: ["name"],
               limit_page_length: 1,
             });
-            return res.data ?? [];
+            const row = res.data?.[0] as { name?: string } | undefined;
+            return row?.name ? String(row.name) : null;
           }
           throw e;
         }
       }
 
-      // Primary: look up by user_id (linked Frappe user)
-      let rows = await fetchEmployeeRows("user_id");
+      // Primary: look up by user_id; fallback: personal_email
+      let empName = await resolveEmployeeName("user_id");
+      if (!empName) empName = await resolveEmployeeName("personal_email");
 
-      // Fallback: look up by personal_email (employee created without a Frappe user account)
-      if (!rows[0]) {
-        rows = await fetchEmployeeRows("personal_email");
-      }
-
-      const row = rows[0];
-      if (!row || typeof row !== "object") {
+      if (!empName) {
         return reply.status(404).send({
           error: "No employee record for your account in this company.",
           code: "HR_NO_EMPLOYEE",
           company: companyDocName,
         });
       }
-      const rec = row as Record<string, unknown>;
-      const { company: _c, ...data } = rec;
+
+      // getDoc returns all fields the doctype has — no field whitelist, never throws "Field not permitted"
+      const doc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
+      const { company: _c, ...data } = doc;
       const result = { data };
       erpCacheSet(cacheKey, result);
       return result;
@@ -318,13 +325,17 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const fetchExisting = async (): Promise<Record<string, unknown> | null> => {
       for (const field of ["user_id", "personal_email"] as const) {
         try {
+          // Fetch only name to avoid "Field not permitted" errors from non-standard fields
           const rows = await erp.getList(ctx!.creds, "Employee", {
             filters: [[field, "=", email], ["company", "=", companyDocName]],
-            fields: EMPLOYEE_FIELDS,
+            fields: ["name"],
             limit_page_length: 1,
           });
-          const row = rows?.[0];
-          if (row && typeof row === "object") return row as Record<string, unknown>;
+          const row = rows?.[0] as { name?: string } | undefined;
+          if (row?.name) {
+            // getDoc returns all fields the doctype has without a whitelist
+            return (await erp.getDoc(ctx!.creds, "Employee", String(row.name))) as Record<string, unknown>;
+          }
         } catch (e) {
           if (!(e instanceof ErpError)) throw e;
         }
@@ -487,35 +498,31 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const like = esc ? `%${esc}%` : "";
 
     try {
-      let filters: unknown[] = [
+      // Base AND filters always applied
+      const filters: unknown[] = [
         ["company", "=", ctx.company],
         ["user_id", "!=", ""],
       ];
-      if (like) {
-        filters = [
-          "and",
-          filters,
-          [
-            "or",
-            [
-              ["employee_name", "like", like],
-              ["user_id", "like", like],
-              ["name", "like", like],
-            ],
-          ],
-        ];
-      }
+      // OR filters for search — frappe.client.get_list combines these as
+      // WHERE (base filters AND) AND (or1 OR or2 OR or3)
+      const or_filters: unknown[] = like
+        ? [
+            ["employee_name", "like", like],
+            ["user_id", "like", like],
+            ["name", "like", like],
+          ]
+        : [];
 
-      const res = await erp.listDocs(ctx.creds, "Employee", {
+      const rows = await erp.getList(ctx.creds, "Employee", {
         filters,
+        or_filters: or_filters.length ? or_filters : undefined,
         fields: ["name", "employee_name", "user_id", "status"],
         order_by: "employee_name asc",
         limit_page_length: limit + 5,
       });
-      const rows = res.data ?? [];
       const seen = new Set<string>();
       const data: { value: string; label: string; employee_id: string }[] = [];
-      for (const r of rows) {
+      for (const r of (rows as unknown[])) {
         const rec = asRecord(r);
         if (!rec) continue;
         const uid = String(rec.user_id ?? "").trim();
@@ -590,6 +597,69 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof ErpError) {
         console.warn("[hr] meta/employee-grades:", e.status, e.body);
         return { data: [] as { name: string }[] };
+      }
+      throw e;
+    }
+  });
+
+  /** Enabled currencies from the HR directory (for salary_currency picker). */
+  app.get("/v1/meta/currencies", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const rows = await erp.getList(ctx.creds, "Currency", {
+        filters: [["enabled", "=", 1]],
+        fields: ["name", "currency_name"],
+        order_by: "name asc",
+        limit_page_length: 300,
+      });
+      const data = (rows as { name?: string; currency_name?: string }[])
+        .map((r) => ({
+          code: String(r.name ?? "").trim(),
+          label: String(r.currency_name ?? "").trim(),
+        }))
+        .filter((r) => r.code);
+      return { data };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        console.warn("[hr] meta/currencies:", e.status, e.body);
+        return { data: [] as { code: string; label: string }[] };
+      }
+      throw e;
+    }
+  });
+
+  /**
+   * Custom fields defined on the Employee doctype.
+   * Lets the UI discover what statutory fields (NSSF, NHIF, SHIF, NITA …) are installed
+   * without hard-coding field names that differ between ERPNext deployments.
+   */
+  app.get("/v1/meta/employee-custom-fields", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const rows = await erp.getList(ctx.creds, "Custom Field", {
+        filters: [["dt", "=", "Employee"]],
+        fields: ["fieldname", "label", "fieldtype", "options", "insert_after"],
+        order_by: "idx asc",
+        limit_page_length: 300,
+      });
+      return { data: rows as { fieldname: string; label: string; fieldtype: string; options?: string; insert_after?: string }[] };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        // Custom Field may not be accessible with some permission sets — return empty gracefully
+        console.warn("[hr] meta/employee-custom-fields:", e.status, e.body);
+        return { data: [] as { fieldname: string; label: string; fieldtype: string }[] };
       }
       throw e;
     }
@@ -1066,12 +1136,13 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const cur = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-      if (String(cur.company) !== ctx.company) {
+      const updated = await erp.updateDoc(ctx.creds, "Employee", name, patch);
+      const record = updated as Record<string, unknown>;
+      // Post-update company guard — one round-trip instead of two
+      if (String(record.company) !== ctx.company) {
         return reply.status(403).send({ error: "Employee not in your Company" });
       }
-      const updated = await erp.updateDoc(ctx.creds, "Employee", name, patch);
-      const { company: _drop, ...data } = updated as Record<string, unknown>;
+      const { company: _drop, ...data } = record;
       return { data };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -1130,6 +1201,28 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       }
       const { company: _drop, ...data } = updated;
       return { data };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** HR admin: permanently delete an Employee from ERP. Irreversible — caller must confirm. */
+  app.delete("/v1/employees/:id", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "HR admin privileges required to delete employee records" });
+    }
+    const name = (req.params as { id: string }).id;
+    try {
+      await erp.deleteDoc(ctx.creds, "Employee", name);
+      return reply.status(200).send({ data: { deleted: name } });
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;

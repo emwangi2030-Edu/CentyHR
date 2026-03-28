@@ -13,6 +13,9 @@ import { loanRoutes } from "./routes/loans.js";
 import { capabilitiesRoutes } from "./routes/capabilities.js";
 import { orgUnitRoutes } from "./routes/orgUnits.js";
 import { companyRoutes } from "./routes/company.js";
+import { lifecycleRoutes } from "./routes/lifecycle.js";
+import { onboardingRoutes } from "./routes/onboarding.js";
+import { documentsRoutes } from "./routes/documents.js";
 
 async function main() {
   const prefix = config.BASE_PATH;
@@ -33,6 +36,9 @@ async function main() {
   await app.register(capabilitiesRoutes, { prefix });
   await app.register(orgUnitRoutes, { prefix });
   await app.register(companyRoutes, { prefix });
+  await app.register(lifecycleRoutes, { prefix });
+  await app.register(onboardingRoutes, { prefix });
+  await app.register(documentsRoutes, { prefix });
   await app.listen({ port: config.PORT, host: config.HR_BFF_HOST });
 }
 

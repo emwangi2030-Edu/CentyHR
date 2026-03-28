@@ -58,6 +58,13 @@ export class ErpNextClient {
     return data;
   }
 
+  /** DELETE /api/resource/:doctype/:name */
+  async deleteDoc(creds: ErpCredentials, doctype: string, name: string): Promise<void> {
+    const enc = encodeURIComponent;
+    const path = `/api/resource/${enc(doctype)}/${enc(name)}`;
+    await this.request("DELETE", path, creds);
+  }
+
   /** GET /api/resource/:doctype/:name */
   async getDoc(creds: ErpCredentials, doctype: string, name: string): Promise<Record<string, unknown>> {
     const enc = encodeURIComponent;
