@@ -1219,8 +1219,14 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     if (!ctx.canSubmitOnBehalf) {
       return reply.status(403).send({ error: "HR admin privileges required to delete employee records" });
     }
+
     const name = (req.params as { id: string }).id;
     try {
+      // Verify the employee belongs to the caller's company before deleting.
+      const cur = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
+      if (String(cur.company) !== ctx.company) {
+        return reply.status(403).send({ error: "Employee not in your Company" });
+      }
       await erp.deleteDoc(ctx.creds, "Employee", name);
       return reply.status(200).send({ data: { deleted: name } });
     } catch (e) {
