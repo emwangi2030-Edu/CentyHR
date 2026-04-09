@@ -35,8 +35,8 @@ export const HR_BRIDGE_SECRET = process.env.HR_BRIDGE_SECRET ?? "";
 export const DEV_INSECURE_HEADERS = process.env.DEV_INSECURE_HEADERS === "1";
 
 /** Fallback when per-user keys are not passed from the proxy */
-export const ERP_API_KEY = process.env.ERP_API_KEY ?? "";
-export const ERP_API_SECRET = process.env.ERP_API_SECRET ?? "";
+export const ERP_API_KEY = process.env.HR_ERP_API_KEY ?? "";
+export const ERP_API_SECRET = process.env.HR_ERP_API_SECRET ?? "";
 
 /**
  * Optional: Supabase (service role) for expense policy / workflow config tables.

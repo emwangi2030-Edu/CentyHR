@@ -16,8 +16,10 @@
   "dependencies": {
     "@fastify/multipart": "^8.3.0",
     "@supabase/supabase-js": "^2.99.3",
+    "@types/pg": "^8.20.0",
     "dotenv": "^16.4.5",
-    "fastify": "^4.28.1"
+    "fastify": "^4.28.1",
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
