@@ -2,9 +2,9 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import type { HrContext } from "../types.js";
 import multipart from "@fastify/multipart";
 import * as config from "../config.js";
-import { defaultClient } from "../erpnext/client.js";
+import { defaultClient, ErpNextClient, ErpCredentials } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
-import { publicErpFailure } from "../erpnext/frappeResponse.js";
+import { publicErpFailure, parseFrappeErrorBody } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 import {
   evaluateApproveWorkflow,
@@ -237,6 +237,210 @@ function isPaidClaim(doc: Record<string, unknown>): boolean {
   return Number.isFinite(reimb) && reimb > 0;
 }
 
+/**
+ * Resolve the canonical ERPNext Department name for a given department label.
+ * ERPNext auto-names departments as "Finance - ABBR" (department_name + company abbreviation).
+ * Pay Hub may store them as plain "Finance".
+ * - Tries exact name match first.
+ * - Falls back to searching by `department_name` field.
+ * - Creates the department in ERPNext if not found.
+ * Returns the canonical ERPNext name (e.g. "Finance - ABC"), or the original value if
+ * creation fails (so the caller can decide whether to abort).
+ */
+async function resolveErpDeptName(
+  erpClient: ErpNextClient,
+  creds: ErpCredentials,
+  company: string,
+  rawDeptName: string,
+): Promise<string> {
+  if (!rawDeptName.trim()) return rawDeptName;
+  console.warn(`[dept-ensure] resolving "${rawDeptName}" for company="${company}"`);
+
+  // 1. Exact name match (already canonical, e.g. "Finance - ABC")
+  try {
+    const existing = (await erpClient.getDoc(creds, "Department", rawDeptName)) as Record<string, unknown>;
+    const name = String(existing.name ?? rawDeptName);
+    console.warn(`[dept-ensure] exact match: "${name}"`);
+    return name;
+  } catch {
+    console.warn(`[dept-ensure] no exact match — searching by department_name`);
+  }
+
+  // 2. Search by department_name field (finds "Finance - ABC" when we have "Finance")
+  try {
+    const searchResult = await erpClient.listDocs(creds, "Department", {
+      filters: [["department_name", "=", rawDeptName]],
+      fields: ["name", "department_name"],
+      limit_page_length: 10,
+    });
+    const matches = (searchResult.data ?? []) as { name?: string; department_name?: string }[];
+    console.warn(`[dept-ensure] department_name search:`, JSON.stringify(matches).slice(0, 300));
+    if (matches.length > 0) {
+      const companyMatch = matches.find((m) =>
+        String(m.name ?? "").toLowerCase().includes(company.slice(0, 4).toLowerCase()),
+      );
+      const resolved = String((companyMatch ?? matches[0]).name ?? rawDeptName);
+      console.warn(`[dept-ensure] resolved via search: "${resolved}"`);
+      return resolved;
+    }
+  } catch (searchErr) {
+    console.warn(`[dept-ensure] department_name search failed:`, String(searchErr).slice(0, 200));
+  }
+
+  // 3. Not in ERPNext — create it
+  let parentDept = "All Departments";
+  try {
+    await erpClient.getDoc(creds, "Department", "All Departments");
+  } catch {
+    try {
+      const rootsResult = await erpClient.listDocs(creds, "Department", {
+        filters: [["is_group", "=", 1]],
+        fields: ["name"],
+        limit_page_length: 5,
+      });
+      const roots = (rootsResult.data ?? []) as { name?: string }[];
+      if (roots[0]?.name) parentDept = roots[0].name;
+    } catch {
+      /* keep default */
+    }
+  }
+
+  console.warn(`[dept-ensure] creating Department "${rawDeptName}" parent="${parentDept}"`);
+  try {
+    const created = (await erpClient.createDoc(creds, "Department", {
+      department_name: rawDeptName,
+      company,
+      parent_department: parentDept,
+      is_group: 0,
+    })) as Record<string, unknown>;
+    const createdName = String(created.name ?? rawDeptName);
+    console.warn(`[dept-ensure] created: "${createdName}"`);
+    return createdName;
+  } catch (createErr) {
+    console.warn(`[dept-ensure] CREATE FAILED:`, String(createErr).slice(0, 400));
+    return rawDeptName; // return original; caller will get ERPNext validation error
+  }
+}
+
+/**
+ * Before submitting a saved claim, ensure its department exists in ERPNext and
+ * patch the claim to use the canonical name if they differ.
+ */
+async function ensureDepartmentExists(
+  erpClient: ErpNextClient,
+  creds: ErpCredentials,
+  company: string,
+  claimName: string,
+): Promise<void> {
+  try {
+    const claimDoc = (await erpClient.getDoc(creds, "Expense Claim", claimName)) as Record<string, unknown>;
+    const rawDept = String(claimDoc.department ?? "").trim();
+    console.warn(`[dept-ensure] claim "${claimName}" department="${rawDept}"`);
+    if (!rawDept) return;
+
+    const canonical = await resolveErpDeptName(erpClient, creds, company, rawDept);
+
+    if (canonical !== rawDept) {
+      console.warn(`[dept-ensure] patching claim "${claimName}": "${rawDept}" → "${canonical}"`);
+      try {
+        await erpClient.updateDoc(creds, "Expense Claim", claimName, { department: canonical });
+        console.warn(`[dept-ensure] patch OK`);
+      } catch (patchErr) {
+        console.warn(`[dept-ensure] PATCH FAILED:`, String(patchErr).slice(0, 400));
+      }
+    }
+  } catch (err) {
+    console.warn(`[dept-ensure] ERROR:`, String(err).slice(0, 400));
+  }
+}
+
+/**
+ * ERPNext requires each Expense Claim Type to have a default account per company
+ * before a claim can be created. This helper auto-sets a default account when missing,
+ * using the company's default payable account (falls back to any payable/expense account).
+ * Returns true if the account was already set or was successfully added.
+ */
+async function ensureExpenseClaimTypeAccount(
+  erpClient: ErpNextClient,
+  creds: ErpCredentials,
+  company: string,
+  claimTypeName: string,
+): Promise<boolean> {
+  console.warn(`[claim-type] ensuring account for type="${claimTypeName}" company="${company}"`);
+  try {
+    // Fetch the Expense Claim Type doc
+    const typeDoc = (await erpClient.getDoc(creds, "Expense Claim Type", claimTypeName)) as Record<string, unknown>;
+    const accounts = Array.isArray(typeDoc.accounts) ? typeDoc.accounts as Record<string, unknown>[] : [];
+
+    // Check if an account is already configured for this company
+    const existing = accounts.find(
+      (a) => String(a.company ?? "").toLowerCase() === company.toLowerCase(),
+    );
+    if (existing?.default_account) {
+      console.warn(`[claim-type] account already set: "${existing.default_account}"`);
+      return true;
+    }
+
+    // Find a suitable default account — prefer company's default payable account
+    let defaultAccount: string | null = null;
+
+    // Try company doc for default_payable_account
+    try {
+      const companyDoc = (await erpClient.getDoc(creds, "Company", company)) as Record<string, unknown>;
+      const payable = String(companyDoc.default_payable_account ?? "").trim();
+      if (payable) {
+        defaultAccount = payable;
+        console.warn(`[claim-type] using company default_payable_account: "${defaultAccount}"`);
+      }
+    } catch (compErr) {
+      console.warn(`[claim-type] could not fetch Company doc:`, String(compErr).slice(0, 200));
+    }
+
+    // Fallback: search for any Payable or Expense account for this company
+    if (!defaultAccount) {
+      try {
+        const accResult = await erpClient.listDocs(creds, "Account", {
+          filters: [
+            ["company", "=", company],
+            ["account_type", "in", ["Payable", "Expense Account"]],
+            ["is_group", "=", 0],
+          ],
+          fields: ["name", "account_type"],
+          limit_page_length: 5,
+        });
+        const accs = (accResult.data ?? []) as { name?: string; account_type?: string }[];
+        console.warn(`[claim-type] fallback account search:`, JSON.stringify(accs).slice(0, 300));
+        // Prefer Payable type
+        const payableAcc = accs.find((a) => a.account_type === "Payable");
+        const chosen = payableAcc ?? accs[0];
+        if (chosen?.name) defaultAccount = chosen.name;
+      } catch (accErr) {
+        console.warn(`[claim-type] account search failed:`, String(accErr).slice(0, 200));
+      }
+    }
+
+    if (!defaultAccount) {
+      console.warn(`[claim-type] no suitable account found — cannot auto-configure`);
+      return false;
+    }
+
+    // Patch the Expense Claim Type to add this company's account
+    const updatedAccounts = [
+      ...accounts,
+      { company, default_account: defaultAccount },
+    ];
+    console.warn(`[claim-type] patching type "${claimTypeName}" with account "${defaultAccount}"`);
+    await erpClient.updateDoc(creds, "Expense Claim Type", claimTypeName, {
+      accounts: updatedAccounts,
+    });
+    console.warn(`[claim-type] patch OK`);
+    return true;
+  } catch (err) {
+    console.warn(`[claim-type] ERROR:`, String(err).slice(0, 400));
+    return false;
+  }
+}
+
 function syntheticClaimFromCreateBody(body: Record<string, unknown>): Record<string, unknown> {
   const expenses = Array.isArray(body.expenses) ? body.expenses : [];
   let total = 0;
@@ -365,22 +569,10 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const mine = await erp.listDocs(ctx.creds, "Employee", {
-        filters: [
-          ["user_id", "=", ctx.userEmail],
-          ["company", "=", ctx.company],
-        ],
-        fields: ["name"],
-        limit_page_length: 1,
-      });
-      const empName = asRecord(mine.data?.[0])?.name;
-      if (!empName || typeof empName !== "string") {
-        return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
-      }
-
       const filters: unknown[] = [["company", "=", ctx.company]];
       const qEmp = String((req.query as Record<string, unknown>)?.employee ?? "").trim();
       if (ctx.canSubmitOnBehalf) {
+        // Finance/HR admin: can see all company claims; optionally filter by a specific employee
         if (qEmp) {
           const other = (await erp.getDoc(ctx.creds, "Employee", qEmp)) as Record<string, unknown>;
           if (String(other.company) !== ctx.company) {
@@ -389,6 +581,19 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
           filters.push(["employee", "=", qEmp]);
         }
       } else {
+        // Regular employee: must have a linked employee record; can only see their own claims
+        const mine = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [
+            ["user_id", "=", ctx.userEmail],
+            ["company", "=", ctx.company],
+          ],
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        const empName = asRecord(mine.data?.[0])?.name;
+        if (!empName || typeof empName !== "string") {
+          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        }
         filters.push(["employee", "=", empName]);
         if (qEmp && qEmp !== empName) {
           return reply.status(403).send({ error: "Cannot filter by another employee" });
@@ -446,21 +651,21 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const mine = await erp.listDocs(ctx.creds, "Employee", {
-        filters: [
-          ["user_id", "=", ctx.userEmail],
-          ["company", "=", ctx.company],
-        ],
-        fields: ["name"],
-        limit_page_length: 1,
-      });
-      const empName = asRecord(mine.data?.[0])?.name;
-      if (!empName || typeof empName !== "string") {
-        return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
-      }
-
       const filters: unknown[] = [["company", "=", ctx.company]];
       if (!ctx.canSubmitOnBehalf) {
+        // Regular employee: restrict to their own claims
+        const mine = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [
+            ["user_id", "=", ctx.userEmail],
+            ["company", "=", ctx.company],
+          ],
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        const empName = asRecord(mine.data?.[0])?.name;
+        if (!empName || typeof empName !== "string") {
+          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        }
         filters.push(["employee", "=", empName]);
       }
 
@@ -590,29 +795,45 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(400).send({ error: `Policy: ${blockCreate.message}` });
       }
 
-      const mine = await erp.listDocs(ctx.creds, "Employee", {
-        filters: [
-          ["user_id", "=", ctx.userEmail],
-          ["company", "=", ctx.company],
-        ],
-        fields: ["name", "company", "expense_approver"],
-        limit_page_length: 1,
-      });
-      const selfEmp = asRecord(mine.data?.[0]);
-      if (!selfEmp?.name) {
-        return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
-      }
+      let employee: string;
+      let employeeDept: string | undefined;
 
-      let employee = String(selfEmp.name);
       if (body.employee != null && body.employee !== "") {
+        // Submitting on behalf of a specific employee (finance/HR only)
         if (!ctx.canSubmitOnBehalf) {
           return reply.status(403).send({ error: "Only HR may set employee (submit on behalf)" });
         }
         employee = String(body.employee);
-        const other = await erp.getDoc(ctx.creds, "Employee", employee);
+        const other = (await erp.getDoc(ctx.creds, "Employee", employee)) as Record<string, unknown>;
         if (String(other.company) !== ctx.company) {
           return reply.status(403).send({ error: "Employee is not in your Company" });
         }
+        employeeDept = String(other.department ?? "").trim() || undefined;
+      } else {
+        // Creating own claim — must have a linked employee record
+        const mine = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [
+            ["user_id", "=", ctx.userEmail],
+            ["company", "=", ctx.company],
+          ],
+          fields: ["name", "company", "department", "expense_approver"],
+          limit_page_length: 1,
+        });
+        const selfEmp = asRecord(mine.data?.[0]);
+        if (!selfEmp?.name) {
+          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        }
+        employee = String(selfEmp.name);
+        employeeDept = String(selfEmp.department ?? "").trim() || undefined;
+      }
+
+      // Frappe will copy employee.department onto the claim via fetch_from on every save.
+      // Ensure the department exists in ERPNext (with canonical name) before creating the claim,
+      // otherwise ERPNext 417s with "Could not find Department: <name>".
+      let resolvedDept: string | undefined;
+      if (employeeDept) {
+        resolvedDept = await resolveErpDeptName(erp, ctx.creds, ctx.company, employeeDept);
+        console.warn(`[dept-ensure] create: employee dept "${employeeDept}" → resolved "${resolvedDept}"`);
       }
 
       const doc: Record<string, unknown> = {
@@ -621,9 +842,42 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         employee,
         posting_date: postingDate,
         expenses: body.expenses ?? [],
+        ...(resolvedDept ? { department: resolvedDept } : {}),
       };
 
-      const created = await erp.createDoc(ctx.creds, "Expense Claim", doc);
+      let created: Record<string, unknown>;
+      try {
+        created = await erp.createDoc(ctx.creds, "Expense Claim", doc);
+      } catch (e) {
+        // ERPNext 417: "Set the default account for the Expense Claim Type <Name>"
+        // The real message is in e.body (not e.message which is always "Upstream HTTP 417").
+        // Auto-configure the missing account and retry once.
+        if (e instanceof ErpError) {
+          const erpMsg = parseFrappeErrorBody(e.body) ?? "";
+          // Strip HTML tags and frappe exception prefix so the regex can match cleanly
+          const plainMsg = erpMsg
+            .replace(/<[^>]*>/g, "")                       // remove all HTML tags
+            .replace(/^frappe\.[^:]+:\s*/i, "")            // remove "frappe.exceptions.Xxx: "
+            .trim();
+          console.warn(`[claim-type] createDoc failed (plain): "${plainMsg}"`);
+          const missingTypeMatch = plainMsg.match(/Set the default account for the Expense Claim Type\s+(.+)/i);
+          if (missingTypeMatch) {
+            const claimTypeName = missingTypeMatch[1].trim();
+            console.warn(`[claim-type] auto-fix triggered for type="${claimTypeName}"`);
+            const fixed = await ensureExpenseClaimTypeAccount(erp, ctx.creds, ctx.company, claimTypeName);
+            if (fixed) {
+              console.warn(`[claim-type] retrying createDoc after account fix`);
+              created = await erp.createDoc(ctx.creds, "Expense Claim", doc);
+            } else {
+              return replyErp(reply, e);
+            }
+          } else {
+            return replyErp(reply, e);
+          }
+        } else {
+          throw e;
+        }
+      }
       return { data: created };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -671,6 +925,13 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         req.log.warn({ company: ctx.company, claim: name, code: blockSubmit.code }, "expense policy blocked submit");
         return reply.status(400).send({ error: `Policy: ${blockSubmit.message}` });
       }
+
+      // Frappe unconditionally copies employee.department onto the claim via fetch_from
+      // on every save/submit. If that department name doesn't exist in the ERPNext
+      // Department doctype, submission fails with a LinkValidationError.
+      // Company departments are defined in Pay Hub settings but may not yet exist in ERPNext.
+      // We auto-create any missing Department record before submitting.
+      await ensureDepartmentExists(erp, ctx.creds, ctx.company, name);
 
       const result = await erp.submitDoc(ctx.creds, "Expense Claim", name);
       return { data: result };

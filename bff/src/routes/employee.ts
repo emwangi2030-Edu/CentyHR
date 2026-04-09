@@ -132,6 +132,7 @@ const EMPLOYEE_LIST_FIELDS = [
   "status",
   "user_id",
   "date_of_joining",
+  "creation",
   "cell_number",
   "company_email",
   "prefered_email",
@@ -143,6 +144,8 @@ function normalizeStatus(s: unknown): string {
 
 /** Fields Pay Hub may PATCH on Employee (ERPNext); avoids arbitrary writes. */
 const EMPLOYEE_PATCH_WHITELIST = new Set([
+  // Identity
+  "salutation", "first_name", "last_name",
   // Contact
   "cell_number", "prefered_email", "personal_email", "company_email",
   "expense_approver", "current_address", "permanent_address",
@@ -839,7 +842,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     try {
       const { page, pageSize, limitStart } = parsePageParams(req);
       const q = parseSearchQuery(req);
-      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}`;
+      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}:creation_desc`;
       const cachedList = erpCacheGet<unknown>(listCacheKey);
       if (cachedList) return cachedList;
       const take = pageSize + 1;
@@ -868,7 +871,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         res = await erp.listDocs(ctx.creds, "Employee", {
           filters,
           fields: EMPLOYEE_LIST_FIELDS,
-          order_by: "employee_name asc",
+          order_by: "creation desc",
           limit_start: limitStart,
           limit_page_length: take,
         });
@@ -880,7 +883,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
               ["employee_name", "like", like],
             ],
             fields: EMPLOYEE_LIST_FIELDS,
-            order_by: "employee_name asc",
+            order_by: "creation desc",
             limit_start: limitStart,
             limit_page_length: take,
           });
@@ -1125,12 +1128,16 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const name = (req.params as { id: string }).id;
     const rawBody = (req.body ?? {}) as Record<string, unknown>;
+    const STATUTORY_CUSTOM_RE = /nssf|nhif|shif|nita|kra/i;
     const patch: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(rawBody)) {
-      if (!EMPLOYEE_PATCH_WHITELIST.has(k)) continue;
+      // Accept whitelisted standard fields OR any custom_ statutory field dynamically
+      const allowed = EMPLOYEE_PATCH_WHITELIST.has(k) || (k.startsWith("custom_") && STATUTORY_CUSTOM_RE.test(k));
+      if (!allowed) continue;
       if (v === null || v === undefined) continue;
       patch[k] = typeof v === "string" ? v.trim() : v;
     }
+    console.log("[hr:patch-allowed] keys being sent to ERPNext:", Object.keys(patch).join(", "));
     if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: "No allowed fields to update" });
     }

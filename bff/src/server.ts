@@ -20,7 +20,7 @@ import { documentsRoutes } from "./routes/documents.js";
 async function main() {
   const prefix = config.BASE_PATH;
   const app = Fastify({
-    logger: { level: "warn" }, // only log warnings + errors; suppress per-request info noise
+    logger: { level: "warn" }, // only log warnings + errors; suppress per-request info noise (bump this to "info" to debug)
     trustProxy: true,
   });
   await app.register(healthRoutes, { prefix });
