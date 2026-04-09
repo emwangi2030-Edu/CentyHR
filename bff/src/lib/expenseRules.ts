@@ -1,5 +1,4 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import * as config from "../config.js";
+import pg from "pg";
 
 export type ExpensePolicy = {
   max_total_claim?: number;
@@ -42,20 +41,35 @@ export type PolicyWarningPublic = {
 const TTL_MS = 60_000;
 const cache = new Map<string, { pack: CompanyRulesPack; exp: number }>();
 
-let supabase: SupabaseClient | null | undefined;
+// Lazy singleton pg pool — connects to the same DATABASE_URL as the main app.
+let pool: pg.Pool | null | undefined;
 
-function getSupabase(): SupabaseClient | null {
-  if (supabase !== undefined) return supabase;
-  const url = config.SUPABASE_URL?.trim();
-  const key = config.SUPABASE_SERVICE_ROLE_KEY?.trim();
-  if (!url || !key) {
-    supabase = null;
+function getPool(): pg.Pool | null {
+  if (pool !== undefined) return pool;
+  const url = process.env.DATABASE_URL_RUNTIME?.trim() || process.env.DATABASE_URL?.trim();
+  if (!url) {
+    pool = null;
     return null;
   }
-  supabase = createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
+  const sslMode = (process.env.DATABASE_SSL || "auto").toLowerCase();
+  const useSsl =
+    sslMode === "require" ||
+    (sslMode !== "disable" && /supabase\.co/i.test(url));
+  pool = new pg.Pool({
+    connectionString: url,
+    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+    max: 2,
+    idleTimeoutMillis: 10_000,
   });
-  return supabase;
+  pool.on("error", (err) => {
+    console.warn("[expense-rules] pg pool error:", err.message);
+  });
+  return pool;
+}
+
+/** Whether the backing DB is available (used by the rules endpoint to set supabase_configured). */
+export function isDbConfigured(): boolean {
+  return !!getPool();
 }
 
 /** Default two-stage labels for UIs (`workflow.steps`) — line manager then HR / finance. */
@@ -92,37 +106,40 @@ export async function loadCompanyRulesPack(companyKey: string): Promise<CompanyR
   const hit = cache.get(companyKey);
   if (hit && hit.exp > now) return hit.pack;
 
-  const client = getSupabase();
-  if (!client) {
+  const db = getPool();
+  if (!db) {
     const empty = defaultPack();
     cache.set(companyKey, { pack: empty, exp: now + TTL_MS });
     return empty;
   }
 
-  const { data, error } = await client
-    .from("expense_hub_company_rules")
-    .select("policy, workflow, feature_flags")
-    .eq("company_key", companyKey)
-    .maybeSingle();
-
-  if (error) {
-    console.error("[expense-rules] Supabase load failed:", error.message);
+  try {
+    const res = await db.query<{
+      policy: unknown;
+      workflow: unknown;
+      feature_flags: unknown;
+    }>(
+      "SELECT policy, workflow, feature_flags FROM hr_expense_company_rules WHERE company_key = $1",
+      [companyKey],
+    );
+    const data = res.rows[0];
+    const wf = (data?.workflow as ExpenseWorkflow) ?? {};
+    const pack: CompanyRulesPack = {
+      policy: (data?.policy as ExpensePolicy) ?? {},
+      workflow: {
+        ...wf,
+        steps: wf.steps && wf.steps.length > 0 ? wf.steps : defaultWorkflowSteps(),
+      },
+      feature_flags: normalizeFlags((data?.feature_flags as ExpenseFeatureFlags) ?? {}),
+    };
+    cache.set(companyKey, { pack, exp: now + TTL_MS });
+    return pack;
+  } catch (err) {
+    console.error("[expense-rules] DB load failed:", (err as Error).message);
     const empty = defaultPack();
     cache.set(companyKey, { pack: empty, exp: now + 5_000 });
     return empty;
   }
-
-  const wf = (data?.workflow as ExpenseWorkflow) ?? {};
-  const pack: CompanyRulesPack = {
-    policy: (data?.policy as ExpensePolicy) ?? {},
-    workflow: {
-      ...wf,
-      steps: wf.steps && wf.steps.length > 0 ? wf.steps : defaultWorkflowSteps(),
-    },
-    feature_flags: normalizeFlags((data?.feature_flags as ExpenseFeatureFlags) ?? {}),
-  };
-  cache.set(companyKey, { pack, exp: now + TTL_MS });
-  return pack;
 }
 
 export function claimTotal(doc: Record<string, unknown>): number {
@@ -233,33 +250,34 @@ export async function upsertCompanyRules(
   companyKey: string,
   body: { policy?: Record<string, unknown>; workflow?: Record<string, unknown>; feature_flags?: Record<string, unknown> }
 ): Promise<CompanyRulesPack> {
-  const client = getSupabase();
-  if (!client) {
-    throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured on BFF");
+  const db = getPool();
+  if (!db) {
+    throw new Error("DATABASE_URL not configured on BFF — cannot save rules");
   }
 
-  const { data: cur, error: readErr } = await client
-    .from("expense_hub_company_rules")
-    .select("policy, workflow, feature_flags")
-    .eq("company_key", companyKey)
-    .maybeSingle();
-  if (readErr) throw readErr;
+  // Read current row
+  const cur = await db.query<{ policy: unknown; workflow: unknown; feature_flags: unknown }>(
+    "SELECT policy, workflow, feature_flags FROM hr_expense_company_rules WHERE company_key = $1",
+    [companyKey],
+  );
+  const existing = cur.rows[0];
 
   const next = {
-    company_key: companyKey,
-    policy: { ...((cur?.policy as object) ?? {}), ...(body.policy ?? {}) },
-    workflow: { ...((cur?.workflow as object) ?? {}), ...(body.workflow ?? {}) },
+    policy: { ...((existing?.policy as object) ?? {}), ...(body.policy ?? {}) },
+    workflow: { ...((existing?.workflow as object) ?? {}), ...(body.workflow ?? {}) },
     feature_flags: normalizeFlags({
-      ...((cur?.feature_flags as ExpenseFeatureFlags) ?? {}),
+      ...((existing?.feature_flags as ExpenseFeatureFlags) ?? {}),
       ...((body.feature_flags as ExpenseFeatureFlags) ?? {}),
     }),
-    updated_at: new Date().toISOString(),
   };
 
-  const { error: writeErr } = await client.from("expense_hub_company_rules").upsert(next, {
-    onConflict: "company_key",
-  });
-  if (writeErr) throw writeErr;
+  await db.query(
+    `INSERT INTO hr_expense_company_rules (company_key, policy, workflow, feature_flags, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (company_key) DO UPDATE
+       SET policy = $2, workflow = $3, feature_flags = $4, updated_at = now()`,
+    [companyKey, JSON.stringify(next.policy), JSON.stringify(next.workflow), JSON.stringify(next.feature_flags)],
+  );
 
   invalidateRulesCache(companyKey);
   return loadCompanyRulesPack(companyKey);
@@ -271,18 +289,27 @@ export async function fetchRulesRowForResponse(companyKey: string): Promise<{
   feature_flags: ExpenseFeatureFlags;
   updated_at: string | null;
 } | null> {
-  const client = getSupabase();
-  if (!client) return null;
-  const { data, error } = await client
-    .from("expense_hub_company_rules")
-    .select("policy, workflow, feature_flags, updated_at")
-    .eq("company_key", companyKey)
-    .maybeSingle();
-  if (error || !data) return null;
-  return {
-    policy: (data.policy as ExpensePolicy) ?? {},
-    workflow: (data.workflow as ExpenseWorkflow) ?? {},
-    feature_flags: normalizeFlags((data.feature_flags as ExpenseFeatureFlags) ?? {}),
-    updated_at: data.updated_at ? String(data.updated_at) : null,
-  };
+  const db = getPool();
+  if (!db) return null;
+  try {
+    const res = await db.query<{
+      policy: unknown;
+      workflow: unknown;
+      feature_flags: unknown;
+      updated_at: Date | null;
+    }>(
+      "SELECT policy, workflow, feature_flags, updated_at FROM hr_expense_company_rules WHERE company_key = $1",
+      [companyKey],
+    );
+    const data = res.rows[0];
+    if (!data) return null;
+    return {
+      policy: (data.policy as ExpensePolicy) ?? {},
+      workflow: (data.workflow as ExpenseWorkflow) ?? {},
+      feature_flags: normalizeFlags((data.feature_flags as ExpenseFeatureFlags) ?? {}),
+      updated_at: data.updated_at ? data.updated_at.toISOString() : null,
+    };
+  } catch {
+    return null;
+  }
 }
