@@ -1,6 +1,15 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import multipart from "@fastify/multipart";
+import * as appConfig from "../config.js";
 import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
+import {
+  validateEmployeeDoc,
+  validateKraPin,
+  normalizeKraPin,
+  normalizePhone,
+  normalizeEmail,
+} from "../lib/employeeValidation.js";
 import { parseFrappeErrorBody, publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 import { insertEmployeeInvite, invitesAvailable } from "../lib/employeeInvites.js";
@@ -38,7 +47,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 
 const SUMMARY_SCAN_CAP = 5000;
 /** Max expense claim rows scanned for per-employee aggregates (snapshot + heatmap). */
-const EMPLOYEE_INSIGHTS_CLAIM_CAP = 2000;
+const EMPLOYEE_INSIGHTS_CLAIM_CAP = 500;
 /** Max rows for connection counts (honest cap — UI may show "500+"). */
 const CONNECTION_COUNT_CAP = 500;
 
@@ -85,10 +94,10 @@ async function loadEmployeeReadableByCaller(ctx: HrContext, employeeId: string):
 async function ensureEmployeeInsightAccess(
   ctx: HrContext,
   employeeId: string
-): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+): Promise<{ ok: true; doc: Record<string, unknown> } | { ok: false; status: number; error: string }> {
   const r = await loadEmployeeReadableByCaller(ctx, employeeId);
   if (!r.ok) return r;
-  return { ok: true };
+  return { ok: true, doc: r.doc };
 }
 
 function parsePageParams(req: FastifyRequest): { page: number; pageSize: number; limitStart: number } {
@@ -119,11 +128,19 @@ const EMPLOYEE_CREATE_FIELDS = new Set([
   "company_email",
   "personal_email",
   "reports_to",
+  // Identity / statutory (can be set at onboarding)
+  "tax_id",         // KRA PIN
+  "id_number",      // National ID (custom field — silently skipped if not present on ERP)
+  "salutation",
+  "employment_type",
+  "grade",
 ]);
 
 const EMPLOYEE_LIST_FIELDS = [
   "name",
   "employee_name",
+  "creation",
+  "image",
   "department",
   "designation",
   "branch",
@@ -132,7 +149,6 @@ const EMPLOYEE_LIST_FIELDS = [
   "status",
   "user_id",
   "date_of_joining",
-  "creation",
   "cell_number",
   "company_email",
   "prefered_email",
@@ -145,7 +161,7 @@ function normalizeStatus(s: unknown): string {
 /** Fields Pay Hub may PATCH on Employee (ERPNext); avoids arbitrary writes. */
 const EMPLOYEE_PATCH_WHITELIST = new Set([
   // Identity
-  "salutation", "first_name", "last_name",
+  "salutation", "first_name", "last_name", "image",
   // Contact
   "cell_number", "prefered_email", "personal_email", "company_email",
   "expense_approver", "current_address", "permanent_address",
@@ -178,8 +194,22 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   "kra_pin", "custom_kra_pin",
 ]);
 
+const EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE = /^(custom_)?(nssf|nhif|shif|nita|kra)(_[a-z0-9]+)*$/i;
+
+function isAllowedEmployeePatchField(field: string): boolean {
+  return EMPLOYEE_PATCH_WHITELIST.has(field) || EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE.test(field);
+}
+
+function isDynamicStatutoryPatchField(field: string): boolean {
+  return EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE.test(field) && !EMPLOYEE_PATCH_WHITELIST.has(field);
+}
+
+
+const PHOTO_MAX_BYTES = 5 * 1024 * 1024; // 5 MB
+const PHOTO_MIME_RE = /^image\/(jpeg|png|webp|gif)$/;
 
 export const employeeRoutes: FastifyPluginAsync = async (app) => {
+  await app.register(multipart, { limits: { fileSize: PHOTO_MAX_BYTES, files: 1 } });
   /** Bio / master data for the logged-in user's Employee row (same Company). */
   app.get("/v1/me/employee", async (req, reply) => {
     let ctx;
@@ -424,7 +454,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const rawBody = (req.body ?? {}) as Record<string, unknown>;
     const patch: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(rawBody)) {
-      if (!EMPLOYEE_PATCH_WHITELIST.has(k)) continue;
+      if (!isAllowedEmployeePatchField(k)) continue;
       if (v === null || v === undefined) continue;
       patch[k] = typeof v === "string" ? v.trim() : v;
     }
@@ -745,9 +775,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const first = String(doc.first_name ?? "").trim();
-    if (!first) {
-      return reply.status(400).send({ error: "first_name is required" });
-    }
+    if (!first) return reply.status(400).send({ error: "first_name is required" });
     const last = String(doc.last_name ?? "").trim();
     doc.first_name = first;
     doc.last_name = last;
@@ -765,21 +793,64 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const dob = String(doc.date_of_birth ?? "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
-      // Default DOB to 25 years before date_of_joining — same-day DOB fails ERPNext age validation
       const dobDefault = new Date(doc.date_of_joining as string);
       dobDefault.setFullYear(dobDefault.getFullYear() - 25);
       doc.date_of_birth = dobDefault.toISOString().slice(0, 10);
     }
 
+    // ── Normalize & validate identity / contact fields ───────────────────────
+    if (doc.cell_number) doc.cell_number = normalizePhone(String(doc.cell_number));
+    if (doc.prefered_email) doc.prefered_email = normalizeEmail(String(doc.prefered_email));
+    if (doc.company_email) doc.company_email = normalizeEmail(String(doc.company_email));
+    if (doc.personal_email) doc.personal_email = normalizeEmail(String(doc.personal_email));
+    if (doc.tax_id) doc.tax_id = normalizeKraPin(String(doc.tax_id));
+
+    const fieldErrors = validateEmployeeDoc(doc);
+    if (fieldErrors.length > 0) {
+      return reply.status(422).send({
+        error: "Validation failed",
+        fields: fieldErrors,
+        // Also expose as flat message for clients that only read .error
+        message: fieldErrors.map((e) => e.message).join("; "),
+      });
+    }
+
+    // ── Duplicate detection — check by KRA PIN and phone within company ───────
+    const duplicateFilters: Array<{ field: string; value: string; label: string }> = [];
+    if (doc.tax_id) duplicateFilters.push({ field: "tax_id",      value: String(doc.tax_id),      label: "KRA PIN"       });
+    if (doc.cell_number) duplicateFilters.push({ field: "cell_number", value: String(doc.cell_number), label: "phone number"  });
+    if (doc.company_email) duplicateFilters.push({ field: "company_email", value: String(doc.company_email), label: "company email" });
+    if (doc.id_number) duplicateFilters.push({ field: "id_number", value: String(doc.id_number), label: "National ID" });
+
+    for (const { field, value, label } of duplicateFilters) {
+      try {
+        const existing = await erp.getList(ctx.creds, "Employee", {
+          filters: [[field, "=", value], ["company", "=", ctx.company]],
+          fields: ["name", "employee_name"],
+          limit_page_length: 1,
+        });
+        if (Array.isArray(existing) && existing.length > 0) {
+          const dup = existing[0] as Record<string, unknown>;
+          return reply.status(409).send({
+            error: `An employee with this ${label} already exists in this company`,
+            code: "DUPLICATE_EMPLOYEE",
+            duplicate: { id: String(dup.name ?? ""), name: String(dup.employee_name ?? "") },
+            field,
+          });
+        }
+      } catch {
+        // If ERP field doesn't exist (e.g. custom id_number field not installed),
+        // skip that duplicate check rather than blocking creation.
+      }
+    }
+
     try {
       const created = await erp.createDoc(ctx.creds, "Employee", doc);
-      erpCacheBust(ctx.company); // invalidate list/summary caches
+      erpCacheBust(ctx.company);
       const { company: _drop, ...data } = created as Record<string, unknown>;
       return { data };
     } catch (e) {
-      if (e instanceof ErpError) {
-        return replyErp(reply, e);
-      }
+      if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
   });
@@ -842,7 +913,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     try {
       const { page, pageSize, limitStart } = parsePageParams(req);
       const q = parseSearchQuery(req);
-      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}:creation_desc`;
+      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}`;
       const cachedList = erpCacheGet<unknown>(listCacheKey);
       if (cachedList) return cachedList;
       const take = pageSize + 1;
@@ -871,7 +942,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         res = await erp.listDocs(ctx.creds, "Employee", {
           filters,
           fields: EMPLOYEE_LIST_FIELDS,
-          order_by: "creation desc",
+          order_by: "creation desc, employee_name asc",
           limit_start: limitStart,
           limit_page_length: take,
         });
@@ -883,7 +954,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
               ["employee_name", "like", like],
             ],
             fields: EMPLOYEE_LIST_FIELDS,
-            order_by: "creation desc",
+            order_by: "creation desc, employee_name asc",
             limit_start: limitStart,
             limit_page_length: take,
           });
@@ -1055,24 +1126,27 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const empDoc = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-      const claims = await cappedCount("Expense Claim", [
-        ["company", "=", ctx.company],
-        ["employee", "=", name],
+      // Reuse the Employee doc already fetched by the access gate — no second getDoc needed.
+      // All 4 count queries run in parallel.
+      const left = normalizeStatus(gate.doc.status) === "left" ? 1 : 0;
+      const [claims, advances, leaveApps, leaveAllocs] = await Promise.all([
+        cappedCount("Expense Claim", [
+          ["company", "=", ctx.company],
+          ["employee", "=", name],
+        ]),
+        cappedCount("Employee Advance", [
+          ["company", "=", ctx.company],
+          ["employee", "=", name],
+        ]),
+        cappedCount("Leave Application", [
+          ["company", "=", ctx.company],
+          ["employee", "=", name],
+        ]),
+        cappedCount("Leave Allocation", [
+          ["company", "=", ctx.company],
+          ["employee", "=", name],
+        ]),
       ]);
-      const advances = await cappedCount("Employee Advance", [
-        ["company", "=", ctx.company],
-        ["employee", "=", name],
-      ]);
-      const leaveApps = await cappedCount("Leave Application", [
-        ["company", "=", ctx.company],
-        ["employee", "=", name],
-      ]);
-      const leaveAllocs = await cappedCount("Leave Allocation", [
-        ["company", "=", ctx.company],
-        ["employee", "=", name],
-      ]);
-      const left = normalizeStatus(empDoc.status) === "left" ? 1 : 0;
 
       return {
         data: {
@@ -1113,6 +1187,107 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     return { data: rest };
   });
 
+  /**
+   * GET /v1/employees/:id/photo — proxy employee's profile image from ERPNext.
+   * Returns the raw image bytes with the correct Content-Type so the browser
+   * can display it via <img src="/api/hr/v1/employees/{id}/photo">.
+   */
+  app.get("/v1/employees/:id/photo", async (req, reply) => {
+    let ctx;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+
+    const name = (req.params as { id: string }).id;
+    const access = await loadEmployeeReadableByCaller(ctx, name);
+    if (!access.ok) return reply.status(access.status).send({ error: access.error });
+
+    const imageField = String(access.doc.image ?? "").trim();
+    if (!imageField) return reply.status(404).send({ error: "No photo set" });
+
+    // imageField is a Frappe file path like /files/photo.jpg or /private/files/photo.jpg
+    const imageUrl = imageField.startsWith("http") ? imageField : `${appConfig.ERP_BASE_URL}${imageField}`;
+
+    try {
+      const res = await fetch(imageUrl, {
+        headers: { Authorization: `token ${ctx.creds.apiKey}:${ctx.creds.apiSecret}` },
+      });
+      if (!res.ok) return reply.status(404).send({ error: "Photo not found" });
+      const contentType = res.headers.get("content-type") ?? "image/jpeg";
+      const buf = Buffer.from(await res.arrayBuffer());
+      reply.header("Content-Type", contentType);
+      reply.header("Cache-Control", "private, max-age=300");
+      return reply.send(buf);
+    } catch {
+      return reply.status(502).send({ error: "Could not fetch photo from HR directory" });
+    }
+  });
+
+  /**
+   * POST /v1/employees/:id/photo — upload a profile photo (multipart/form-data, field name "file").
+   * Stores in ERPNext and sets Employee.image to the uploaded file URL.
+   */
+  app.post("/v1/employees/:id/photo", async (req, reply) => {
+    let ctx;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR admin privileges required" });
+
+    const name = (req.params as { id: string }).id;
+    try {
+      const emp = await erp.getDoc(ctx.creds, "Employee", name) as Record<string, unknown>;
+      if (String(emp.company) !== ctx.company) return reply.status(403).send({ error: "Employee not in your company" });
+    } catch (e) {
+      if (e instanceof ErpError) return reply.status(404).send({ error: "Employee not found" });
+      throw e;
+    }
+
+    let fileBuffer: Buffer;
+    let fileName: string;
+    let contentType: string;
+    try {
+      const data = await req.file();
+      if (!data) return reply.status(400).send({ error: "No file provided" });
+      fileName = data.filename || "photo.jpg";
+      contentType = data.mimetype || "image/jpeg";
+      if (!PHOTO_MIME_RE.test(contentType)) {
+        return reply.status(415).send({ error: "Only JPEG, PNG, WebP, or GIF images are allowed." });
+      }
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of data.file) {
+        total += (chunk as Buffer).length;
+        if (total > PHOTO_MAX_BYTES) return reply.status(413).send({ error: "Photo must be under 5 MB." });
+        chunks.push(chunk as Buffer);
+      }
+      fileBuffer = Buffer.concat(chunks);
+    } catch {
+      return reply.status(400).send({ error: "Could not read the uploaded photo." });
+    }
+
+    try {
+      const uploaded = await erp.uploadFile(ctx.creds, {
+        buffer: fileBuffer,
+        filename: fileName,
+        contentType,
+        isPrivate: false,
+        doctype: "Employee",
+        docname: name,
+        fieldname: "image",
+      });
+      const u = uploaded as Record<string, unknown>;
+      const fileDoc = (u.message as Record<string, unknown>) ?? u;
+      const fileUrl = String(fileDoc.file_url ?? "");
+      // Persist the image URL on the Employee record
+      if (fileUrl) {
+        await erp.updateDoc(ctx.creds, "Employee", name, { image: fileUrl });
+      }
+      return { data: { image: fileUrl } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
   /** HR admin: update whitelisted fields on an employee in the same company. */
   app.patch("/v1/employees/:id", async (req, reply) => {
     let ctx;
@@ -1128,24 +1303,122 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const name = (req.params as { id: string }).id;
     const rawBody = (req.body ?? {}) as Record<string, unknown>;
-    const STATUTORY_CUSTOM_RE = /nssf|nhif|shif|nita|kra/i;
     const patch: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(rawBody)) {
-      // Accept whitelisted standard fields OR any custom_ statutory field dynamically
-      const allowed = EMPLOYEE_PATCH_WHITELIST.has(k) || (k.startsWith("custom_") && STATUTORY_CUSTOM_RE.test(k));
-      if (!allowed) continue;
+      if (!isAllowedEmployeePatchField(k)) continue;
       if (v === null || v === undefined) continue;
       patch[k] = typeof v === "string" ? v.trim() : v;
     }
-    console.log("[hr:patch-allowed] keys being sent to ERPNext:", Object.keys(patch).join(", "));
     if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: "No allowed fields to update" });
     }
 
+    // Normalize identifiers / contact fields before write
+    if (patch.cell_number) patch.cell_number = normalizePhone(String(patch.cell_number));
+    if (patch.prefered_email) patch.prefered_email = normalizeEmail(String(patch.prefered_email));
+    if (patch.company_email) patch.company_email = normalizeEmail(String(patch.company_email));
+    if (patch.personal_email) patch.personal_email = normalizeEmail(String(patch.personal_email));
+    if (patch.tax_id) patch.tax_id = normalizeKraPin(String(patch.tax_id));
+
+    const fieldErrors = validateEmployeeDoc(patch);
+    if (fieldErrors.length > 0) {
+      return reply.status(422).send({
+        error: "Validation failed",
+        fields: fieldErrors,
+        message: fieldErrors.map((e) => e.message).join("; "),
+      });
+    }
+
+    // Uniqueness check — only for fields that are being changed
+    const uniqueChecks: Array<{ field: string; value: string; label: string }> = [];
+    if (patch.tax_id) uniqueChecks.push({ field: "tax_id", value: String(patch.tax_id), label: "KRA PIN" });
+    if (patch.cell_number) uniqueChecks.push({ field: "cell_number", value: String(patch.cell_number), label: "phone number" });
+    if (patch.company_email) uniqueChecks.push({ field: "company_email", value: String(patch.company_email), label: "company email" });
+    for (const { field, value, label } of uniqueChecks) {
+      try {
+        const existing = await erp.getList(ctx.creds, "Employee", {
+          filters: [[field, "=", value], ["company", "=", ctx.company], ["name", "!=", name]],
+          fields: ["name", "employee_name"],
+          limit_page_length: 1,
+        });
+        if (Array.isArray(existing) && existing.length > 0) {
+          const dup = existing[0] as Record<string, unknown>;
+          return reply.status(409).send({
+            error: `Another employee in this company already has this ${label}`,
+            code: "DUPLICATE_EMPLOYEE",
+            duplicate: { id: String(dup.name ?? ""), name: String(dup.employee_name ?? "") },
+            field,
+          });
+        }
+      } catch { /* skip if field doesn't exist in ERP */ }
+    }
+
     try {
-      const updated = await erp.updateDoc(ctx.creds, "Employee", name, patch);
-      const record = updated as Record<string, unknown>;
-      // Post-update company guard — one round-trip instead of two
+      // Split patch: custom/statutory fields go directly via set_value (more reliable than PUT
+      // for ERPNext custom fields); standard fields go via updateDoc (PUT).
+      const isCustomOrStatutory = (field: string) =>
+        field.startsWith("custom_") || EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE.test(field);
+
+      const standardPatch: Record<string, unknown> = {};
+      const statutoryPatch: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(patch)) {
+        if (isCustomOrStatutory(k)) {
+          statutoryPatch[k] = v;
+        } else {
+          standardPatch[k] = v;
+        }
+      }
+
+      // Apply standard fields via PUT
+      if (Object.keys(standardPatch).length > 0) {
+        await erp.updateDoc(ctx.creds, "Employee", name, standardPatch);
+      }
+
+      // Apply custom/statutory fields one-by-one via frappe.client.set_value
+      // (PUT /api/resource silently drops custom fields on some ERPNext versions)
+      for (const [field, value] of Object.entries(statutoryPatch)) {
+        console.warn(`[hr:patch] set_value field="${field}" value="${String(value).slice(0, 40)}"`);
+        try {
+          await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+            doctype: "Employee",
+            name,
+            fieldname: field,
+            value,
+          });
+        } catch (svErr) {
+          console.warn(`[hr:patch] set_value failed for field="${field}":`, String(svErr).slice(0, 200));
+        }
+      }
+
+      // Fetch the updated record and verify statutory fields were persisted
+      let record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
+
+      // Second-pass: any statutory field still mismatched → retry set_value once more
+      const stillMismatched = Object.entries(statutoryPatch).filter(([field, value]) => {
+        const saved = String(record[field] ?? "").trim();
+        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+        const mismatch = saved !== expected;
+        if (mismatch) console.warn(`[hr:patch] mismatch field="${field}" saved="${saved}" expected="${expected}"`);
+        return mismatch;
+      });
+
+      if (stillMismatched.length > 0) {
+        console.warn(`[hr:patch] ${stillMismatched.length} field(s) still mismatched after set_value — retrying`);
+        for (const [field, value] of stillMismatched) {
+          try {
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Employee",
+              name,
+              fieldname: field,
+              value,
+            });
+          } catch (svErr) {
+            console.warn(`[hr:patch] retry set_value failed for "${field}":`, String(svErr).slice(0, 200));
+          }
+        }
+        record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
+      }
+
       if (String(record.company) !== ctx.company) {
         return reply.status(403).send({ error: "Employee not in your Company" });
       }
@@ -1226,14 +1499,8 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     if (!ctx.canSubmitOnBehalf) {
       return reply.status(403).send({ error: "HR admin privileges required to delete employee records" });
     }
-
     const name = (req.params as { id: string }).id;
     try {
-      // Verify the employee belongs to the caller's company before deleting.
-      const cur = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-      if (String(cur.company) !== ctx.company) {
-        return reply.status(403).send({ error: "Employee not in your Company" });
-      }
       await erp.deleteDoc(ctx.creds, "Employee", name);
       return reply.status(200).send({ data: { deleted: name } });
     } catch (e) {
