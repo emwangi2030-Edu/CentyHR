@@ -810,16 +810,24 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         }
         employeeDept = String(other.department ?? "").trim() || undefined;
       } else {
-        // Creating own claim — must have a linked employee record
-        const mine = await erp.listDocs(ctx.creds, "Employee", {
-          filters: [
-            ["user_id", "=", ctx.userEmail],
-            ["company", "=", ctx.company],
-          ],
-          fields: ["name", "company", "department", "expense_approver"],
-          limit_page_length: 1,
-        });
-        const selfEmp = asRecord(mine.data?.[0]);
+        // Creating own claim — look up employee by user_id first, then personal_email as fallback.
+        // The ensure endpoint may create an employee with only personal_email when the ERP User
+        // isn't provisioned yet, so we must check both fields.
+        async function findSelfEmployee(): Promise<Record<string, unknown> | null> {
+          for (const field of ["user_id", "personal_email"] as const) {
+            try {
+              const rows = await erp.listDocs(ctx!.creds, "Employee", {
+                filters: [[field, "=", ctx!.userEmail], ["company", "=", ctx!.company]],
+                fields: ["name", "company", "department", "expense_approver"],
+                limit_page_length: 1,
+              });
+              const row = asRecord(rows.data?.[0]);
+              if (row?.name) return row;
+            } catch { /* try next */ }
+          }
+          return null;
+        }
+        const selfEmp = await findSelfEmployee();
         if (!selfEmp?.name) {
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
         }
