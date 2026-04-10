@@ -324,9 +324,8 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
       throw e;
     }
-    if (!ctx.canSubmitOnBehalf) {
-      return reply.status(403).send({ error: "HR admin privileges required" });
-    }
+    // Any authenticated user may ensure their OWN employee record.
+    // (finance/HR users can also call this, no role gate needed)
 
     async function resolveCompanyDocName(): Promise<string> {
       const raw = String(ctx!.company ?? "").trim();
