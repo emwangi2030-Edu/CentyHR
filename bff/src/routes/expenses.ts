@@ -813,6 +813,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         // Creating own claim — look up employee by user_id first, then personal_email as fallback.
         // The ensure endpoint may create an employee with only personal_email when the ERP User
         // isn't provisioned yet, so we must check both fields.
+        console.log(`[expense-create] self-claim lookup: email=${ctx.userEmail} company=${ctx.company}`);
         async function findSelfEmployee(): Promise<Record<string, unknown> | null> {
           for (const field of ["user_id", "personal_email"] as const) {
             try {
@@ -822,17 +823,25 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
                 limit_page_length: 1,
               });
               const row = asRecord(rows.data?.[0]);
-              if (row?.name) return row;
-            } catch { /* try next */ }
+              if (row?.name) {
+                console.log(`[expense-create] found employee via ${field}: ${row.name}`);
+                return row;
+              }
+              console.log(`[expense-create] no match via ${field}`);
+            } catch (e) {
+              console.warn(`[expense-create] error searching by ${field}:`, e instanceof Error ? e.message : e);
+            }
           }
           return null;
         }
         const selfEmp = await findSelfEmployee();
         if (!selfEmp?.name) {
+          console.error(`[expense-create] BLOCKED — no employee found for email=${ctx.userEmail} company=${ctx.company}`);
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
         }
         employee = String(selfEmp.name);
         employeeDept = String(selfEmp.department ?? "").trim() || undefined;
+        console.log(`[expense-create] using employee=${employee} dept=${employeeDept ?? "none"}`);
       }
 
       // Frappe will copy employee.department onto the claim via fetch_from on every save.

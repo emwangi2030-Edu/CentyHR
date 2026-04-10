@@ -283,16 +283,23 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       }
 
       // Primary: look up by user_id; fallback: personal_email
+      console.log(`[me-employee] lookup email=${ctx.userEmail} company=${companyDocName}`);
       let empName = await resolveEmployeeName("user_id");
-      if (!empName) empName = await resolveEmployeeName("personal_email");
+      console.log(`[me-employee] user_id lookup result: ${empName ?? "not found"}`);
+      if (!empName) {
+        empName = await resolveEmployeeName("personal_email");
+        console.log(`[me-employee] personal_email lookup result: ${empName ?? "not found"}`);
+      }
 
       if (!empName) {
+        console.warn(`[me-employee] HR_NO_EMPLOYEE for email=${ctx.userEmail} company=${companyDocName}`);
         return reply.status(404).send({
           error: "No employee record for your account in this company.",
           code: "HR_NO_EMPLOYEE",
           company: companyDocName,
         });
       }
+      console.log(`[me-employee] resolved employee: ${empName}`);
 
       // getDoc returns all fields the doctype has — no field whitelist, never throws "Field not permitted"
       const doc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
@@ -352,6 +359,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const companyDocName = await resolveCompanyDocName();
     const email = String(ctx.userEmail || "").trim();
+    console.log(`[ensure] START email=${email} company=${companyDocName} role=${ctx.appRole ?? "unknown"}`);
     if (!email) return reply.status(400).send({ error: "Missing email context" });
 
     const fetchExisting = async (): Promise<Record<string, unknown> | null> => {
@@ -365,10 +373,13 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
           });
           const row = rows?.[0] as { name?: string } | undefined;
           if (row?.name) {
+            console.log(`[ensure] found existing employee via ${field}: ${row.name}`);
             // getDoc returns all fields the doctype has without a whitelist
             return (await erp.getDoc(ctx!.creds, "Employee", String(row.name))) as Record<string, unknown>;
           }
+          console.log(`[ensure] no match via ${field}`);
         } catch (e) {
+          console.warn(`[ensure] error searching by ${field}:`, e instanceof Error ? e.message : e);
           if (!(e instanceof ErpError)) throw e;
         }
       }
@@ -378,9 +389,11 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     // If already exists, return it (idempotent)
     const existing = await fetchExisting();
     if (existing) {
+      console.log(`[ensure] employee already exists, returning existing: ${existing.name}`);
       return { data: existing };
     }
 
+    console.log(`[ensure] no existing employee found — creating new record for ${email}`);
     const localPart = email.split("@")[0] || email;
     const firstName = localPart.replace(/[._-]+/g, " ").trim().slice(0, 140) || "Admin";
     const todayIso = new Date().toISOString().slice(0, 10);
@@ -409,29 +422,43 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       let created: unknown;
       try {
         // Preferred: attach `user_id` when ERP User exists.
+        console.log(`[ensure] attempting createDoc WITH user_id`);
         created = await erp.createDoc(ctx.creds, "Employee", {
           ...baseDoc,
           user_id: email,
         });
+        console.log(`[ensure] created employee WITH user_id: ${(created as any)?.name}`);
       } catch (inner) {
         if (!(inner instanceof ErpError)) throw inner;
         if (isMissingUserIdLink(inner)) {
           // Fallback for tenants where ERP User isn't provisioned for the login email yet.
+          console.warn(`[ensure] user_id link failed ("could not find user id") — retrying WITHOUT user_id`);
           created = await erp.createDoc(ctx.creds, "Employee", baseDoc);
+          console.log(`[ensure] created employee WITHOUT user_id (personal_email only): ${(created as any)?.name}`);
         } else {
+          console.error(`[ensure] createDoc WITH user_id failed (non-user-id error): status=${inner.status} body=${inner.body}`);
           throw inner;
         }
       }
       const createdName = String((created as any)?.name ?? "").trim();
-      if (!createdName) return { data: { created: true } };
+      if (!createdName) {
+        console.warn(`[ensure] createDoc succeeded but returned no name — returning generic ok`);
+        return { data: { created: true } };
+      }
       const doc = await erp.getDoc(ctx.creds, "Employee", createdName);
+      console.log(`[ensure] SUCCESS — employee=${createdName}`);
       return { data: doc };
     } catch (e) {
       if (e instanceof ErpError) {
+        console.error(`[ensure] ErpError status=${e.status} body=${e.body}`);
         // If another concurrent request created/updated the employee, return the now-existing row.
         if (e.status === 409 || e.status === 417) {
+          console.log(`[ensure] 409/417 — checking if concurrent request already created the employee`);
           const row = await fetchExisting();
-          if (row) return { data: row };
+          if (row) {
+            console.log(`[ensure] concurrent create resolved: employee=${row.name}`);
+            return { data: row };
+          }
         }
         const status = e.status >= 500 ? 502 : e.status;
         return reply.status(status).send(publicErpFailure(e));
