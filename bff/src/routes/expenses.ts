@@ -841,7 +841,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         // Creating own claim — resolve company docname first (ctx.company may be a display name
         // that doesn't match the ERP docname), then look up by user_id / personal_email fallback.
         const resolvedCompany = await resolveCompanyDocName(ctx.creds, ctx.company);
-        console.log(`[expense-create] self-claim lookup: email=${ctx.userEmail} ctx.company="${ctx.company}" resolved="${resolvedCompany}"`);
+        req.log.warn({ email: ctx.userEmail, ctx_company: ctx.company, resolved_company: resolvedCompany }, "[expense-create] self-claim lookup");
         async function findSelfEmployee(): Promise<Record<string, unknown> | null> {
           for (const field of ["user_id", "personal_email"] as const) {
             try {
@@ -852,24 +852,24 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
               });
               const row = asRecord(rows.data?.[0]);
               if (row?.name) {
-                console.log(`[expense-create] found employee via ${field}: ${row.name}`);
+                req.log.warn({ field, employee: row.name }, "[expense-create] found employee");
                 return row;
               }
-              console.log(`[expense-create] no match via ${field}`);
+              req.log.warn({ field }, "[expense-create] no match");
             } catch (e) {
-              console.warn(`[expense-create] error searching by ${field}:`, e instanceof Error ? e.message : e);
+              req.log.warn({ field, err: e instanceof Error ? e.message : String(e) }, "[expense-create] lookup error");
             }
           }
           return null;
         }
         const selfEmp = await findSelfEmployee();
         if (!selfEmp?.name) {
-          console.error(`[expense-create] BLOCKED — no employee found for email=${ctx.userEmail} resolved_company="${resolvedCompany}"`);
+          req.log.warn({ email: ctx.userEmail, resolved_company: resolvedCompany }, "[expense-create] BLOCKED — no employee found");
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
         }
         employee = String(selfEmp.name);
         employeeDept = String(selfEmp.department ?? "").trim() || undefined;
-        console.log(`[expense-create] using employee=${employee} dept=${employeeDept ?? "none"}`);
+        req.log.warn({ employee, dept: employeeDept ?? "none" }, "[expense-create] resolved employee");
       }
 
       // Frappe will copy employee.department onto the claim via fetch_from on every save.
