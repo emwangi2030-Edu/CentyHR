@@ -7,6 +7,7 @@ Canonical **Git** and **Supabase** references for this bundle (no secrets in git
 | | |
 |--|--|
 | **Repository** | [github.com/emwangi2030-Edu/CentyHR](https://github.com/emwangi2030-Edu/CentyHR) |
+| **Branch (CentyHQ / BSC staging)** | [`performance`](https://github.com/emwangi2030-Edu/CentyHR/tree/performance) — deployed at `https://staging.centyhq.com/hr-api` (see `docs/DEPLOY-staging-centyhq.md`) |
 
 Push this tree (e.g. `bff/`, `erpnext-custom-app/`) from your workstation; keep `.env` out of version control.
 

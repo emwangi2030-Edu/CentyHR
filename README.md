@@ -1,10 +1,10 @@
 # Centy HR ↔ ERPNext integration
 
-Implementation bundle for **staging.centycapital.com** (and mobile) talking to **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
+Implementation bundle for Centy Pay Hub + **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
 
-**Git:** [github.com/emwangi2030-Edu/CentyHR](https://github.com/emwangi2030-Edu/CentyHR) · **Supabase + push targets:** see [`REMOTE.md`](./REMOTE.md).
+**Git:** [github.com/emwangi2030-Edu/CentyHR](https://github.com/emwangi2030-Edu/CentyHR) · **Active integration branch:** [`performance`](https://github.com/emwangi2030-Edu/CentyHR/tree/performance) · **Supabase + push targets:** see [`REMOTE.md`](./REMOTE.md).
 
-## Staging deployment (live)
+## Staging — CentyCapital (`staging.centycapital.com`)
 
 | Item | Value |
 |------|--------|
@@ -19,6 +19,23 @@ Implementation bundle for **staging.centycapital.com** (and mobile) talking to *
 **Note:** If CyberPanel rewrites the staging vhost, re-apply the **`/hr-api`** `extprocessor` + `context` blocks (or add an equivalent rule in the panel) so traffic reaches port **3040**.
 
 Environment on the app server: `BASE_PATH=/hr-api`, `PORT=3040`, `ERP_BASE_URL=https://erp.tarakilishicloud.com` (see `bff/.env`).
+
+## Staging — CentyHQ (`staging.centyhq.com`)
+
+Pay Hub staging for **centyhq.com** uses the same BFF integration pattern on host **`172.239.110.187`** (OpenLiteSpeed vhost `staging.centyhq.com`).
+
+| Item | Value |
+|------|--------|
+| **Public base URL** | `https://staging.centyhq.com/hr-api` |
+| **Health check** | `GET https://staging.centyhq.com/hr-api/health` → `{"ok":true}` |
+| **Repo checkout** | `/opt/centy-hr-integration-clean` — track **`performance`** for HR+BSC work |
+| **Process** | `pm2` app **`centy-hr-bff-clean`** — `npx tsx src/server.ts` from `bff/` |
+| **Listen** | `127.0.0.1:3041` (Pay Hub uses `HR_BFF_PORT=3041` + `HR_BFF_PATH_PREFIX=/hr-api`) |
+| **Reverse proxy** | OLS `context /hr-api` → `127.0.0.1:3041` |
+
+**Deploy (centyhq):** see [`docs/DEPLOY-staging-centyhq.md`](./docs/DEPLOY-staging-centyhq.md).
+
+**`.env` essentials:** `BASE_PATH=/hr-api`, `PORT=3041`, `HR_BFF_HOST=127.0.0.1`, `ERP_BASE_URL`, bridge + ERP keys (same pattern as other staging hosts; never commit `.env`).
 
 ## Contents
 
