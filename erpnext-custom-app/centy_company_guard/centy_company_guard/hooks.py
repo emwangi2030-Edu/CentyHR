@@ -13,3 +13,5 @@ doc_events = {
         "validate": "centy_company_guard.events.expense_claim.validate",
     },
 }
+
+after_install = "centy_company_guard.install.after_install"

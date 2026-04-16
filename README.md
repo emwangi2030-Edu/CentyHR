@@ -43,6 +43,8 @@ Pay Hub staging for **centyhq.com** uses the same BFF integration pattern on hos
 |------|---------|
 | `bff/` | Node (Fastify) **BFF**: employee profile, expense claims, attachments, submit. |
 | `erpnext-custom-app/centy_company_guard/` | **Frappe app**: server-side validation so **Expense Claim.company** matches **Employee.company** and approver is in the same company. |
+| `docs/P0-recruitment-permissions-matrix.md` | **P0** recruitment DocType ↔ route map + roles (planning). |
+| `docs/DEPLOY-staging-centyhq.md` | Deploy **staging.centyhq.com** HR BFF (`/hr-api`, port **3041**). |
 
 ## ERPNext (Desk) — do this before relying on the BFF
 
