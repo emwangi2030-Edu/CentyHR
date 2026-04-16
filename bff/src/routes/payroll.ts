@@ -25,18 +25,19 @@ function parseDate(v: unknown): string {
 
 export const payrollRoutes: FastifyPluginAsync = async (app) => {
   async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
-    const mine = await erp.listDocs(ctx.creds, "Employee", {
-      filters: [
-        ["user_id", "=", ctx.userEmail],
-        ["company", "=", ctx.company],
-      ],
-      fields: ["name"],
-      limit_page_length: 1,
-    });
-    const row = mine.data?.[0];
-    return row && typeof (row as { name?: unknown }).name === "string"
-      ? String((row as { name: string }).name)
-      : null;
+    for (const field of ["user_id", "personal_email", "prefered_email"] as const) {
+      const mine = await erp.listDocs(ctx.creds, "Employee", {
+        filters: [[field, "=", ctx.userEmail], ["company", "=", ctx.company]],
+        fields: ["name"],
+        limit_page_length: 1,
+      });
+      const row = mine.data?.[0];
+      const name = row && typeof (row as { name?: unknown }).name === "string"
+        ? String((row as { name: string }).name)
+        : null;
+      if (name) return name;
+    }
+    return null;
   }
 
   async function resolveEmployeeIdForRequest(ctx: HrContext, qEmp: string): Promise<string | null> {

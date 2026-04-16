@@ -65,16 +65,41 @@ async function loadEmployeeReadableByCaller(ctx: HrContext, employeeId: string):
       return { ok: false, status: 403, error: "Employee not in your Company" };
     }
     if (!ctx.canSubmitOnBehalf) {
-      const mine = await erp.listDocs(ctx.creds, "Employee", {
-        filters: [
-          ["user_id", "=", ctx.userEmail],
-          ["company", "=", ctx.company],
-        ],
+      // Primary: match by user_id (the Frappe User link field).
+      // Fallback: match by personal_email or prefered_email for employees whose
+      // user_id field was never populated (e.g. onboarding before this field was set).
+      const byUserId = await erp.listDocs(ctx.creds, "Employee", {
+        filters: [["user_id", "=", ctx.userEmail], ["company", "=", ctx.company]],
         fields: ["name"],
         limit_page_length: 1,
       });
-      const myName = asRecord(mine.data?.[0])?.name;
-      if (String(myName) !== employeeId) {
+      let myName: string | undefined = String(asRecord(byUserId.data?.[0])?.name ?? "").trim() || undefined;
+
+      if (!myName) {
+        const byEmail = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [
+            ["company", "=", ctx.company],
+            ["personal_email", "=", ctx.userEmail],
+          ],
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        myName = String(asRecord(byEmail.data?.[0])?.name ?? "").trim() || undefined;
+      }
+
+      if (!myName) {
+        const byPrefEmail = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [
+            ["company", "=", ctx.company],
+            ["prefered_email", "=", ctx.userEmail],
+          ],
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        myName = String(asRecord(byPrefEmail.data?.[0])?.name ?? "").trim() || undefined;
+      }
+
+      if (myName !== employeeId) {
         return { ok: false, status: 403, error: "You can only access your own employee record" };
       }
     }
@@ -297,6 +322,21 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       // getDoc returns all fields the doctype has — no field whitelist, never throws "Field not permitted"
       const doc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
       const { company: _c, ...data } = doc;
+
+      // Resolve reports_to display name (best-effort, non-fatal)
+      const reportsToId = String(data.reports_to ?? "").trim();
+      if (reportsToId) {
+        try {
+          const mgr = await erp.listDocs(ctx.creds, "Employee", {
+            filters: [["name", "=", reportsToId]],
+            fields: ["name", "employee_name"],
+            limit_page_length: 1,
+          });
+          const mgrName = String(asRecord(mgr.data?.[0])?.employee_name ?? "").trim();
+          if (mgrName) (data as Record<string, unknown>).reports_to_name = mgrName;
+        } catch { /* non-fatal */ }
+      }
+
       const result = { data };
       erpCacheSet(cacheKey, result);
       return result;
@@ -1184,6 +1224,21 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(access.status).send({ error: access.error });
     }
     const { company: _drop, ...rest } = access.doc;
+
+    // Resolve the display name of the "reports to" employee so the UI can show a name instead of an ID.
+    const reportsToId = String(rest.reports_to ?? "").trim();
+    if (reportsToId) {
+      try {
+        const mgr = await erp.listDocs(ctx.creds, "Employee", {
+          filters: [["name", "=", reportsToId]],
+          fields: ["name", "employee_name"],
+          limit_page_length: 1,
+        });
+        const mgrName = String(asRecord(mgr.data?.[0])?.employee_name ?? "").trim();
+        if (mgrName) (rest as Record<string, unknown>).reports_to_name = mgrName;
+      } catch { /* non-fatal — ID is shown as fallback */ }
+    }
+
     return { data: rest };
   });
 

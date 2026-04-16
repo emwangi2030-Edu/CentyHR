@@ -77,16 +77,16 @@ function buildListFilters(
 }
 
 async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
-  const mine = await erp.listDocs(ctx.creds, "Employee", {
-    filters: [
-      ["user_id", "=", ctx.userEmail],
-      ["company", "=", ctx.company],
-    ],
-    fields: ["name"],
-    limit_page_length: 1,
-  });
-  const empName = asRecord(mine.data?.[0])?.name;
-  return typeof empName === "string" ? empName : null;
+  for (const field of ["user_id", "personal_email", "prefered_email"] as const) {
+    const mine = await erp.listDocs(ctx.creds, "Employee", {
+      filters: [[field, "=", ctx.userEmail], ["company", "=", ctx.company]],
+      fields: ["name"],
+      limit_page_length: 1,
+    });
+    const empName = asRecord(mine.data?.[0])?.name;
+    if (typeof empName === "string" && empName) return empName;
+  }
+  return null;
 }
 
 async function ensureLeaveReadAccess(ctx: HrContext, doc: Record<string, unknown>): Promise<Gate> {
