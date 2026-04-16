@@ -22,6 +22,34 @@ import { attachCentyTwoStageExpenseRow, isFirstApproverFlagSet } from "../lib/tw
 
 const erp = defaultClient();
 
+/**
+ * Resolve the canonical ERPNext Company docname from ctx.company.
+ * ctx.company may be a display name that differs from the ERP docname — this
+ * function tries a direct getDoc first (fast path), then falls back to a
+ * company_name filter lookup. Mirrors the same logic in employee.ts.
+ */
+async function resolveCompanyDocName(creds: ErpCredentials, company: string): Promise<string> {
+  const raw = String(company ?? "").trim();
+  if (!raw) return raw;
+  try {
+    await erp.getDoc(creds, "Company", raw);
+    return raw; // raw IS the docname
+  } catch (e) {
+    if (!(e instanceof ErpError)) throw e;
+  }
+  try {
+    const rows = await erp.getList(creds, "Company", {
+      filters: [["company_name", "=", raw]],
+      fields: ["name"],
+      limit_page_length: 1,
+    });
+    const found = (rows?.[0] as any)?.name;
+    return typeof found === "string" && found.trim() ? found.trim() : raw;
+  } catch {
+    return raw;
+  }
+}
+
 const BULK_APPROVE_MAX = 40;
 const EXPORT_MAX_ROWS = 2000;
 
@@ -810,21 +838,38 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         }
         employeeDept = String(other.department ?? "").trim() || undefined;
       } else {
-        // Creating own claim — must have a linked employee record
-        const mine = await erp.listDocs(ctx.creds, "Employee", {
-          filters: [
-            ["user_id", "=", ctx.userEmail],
-            ["company", "=", ctx.company],
-          ],
-          fields: ["name", "company", "department", "expense_approver"],
-          limit_page_length: 1,
-        });
-        const selfEmp = asRecord(mine.data?.[0]);
+        // Creating own claim — resolve company docname first (ctx.company may be a display name
+        // that doesn't match the ERP docname), then look up by user_id / personal_email fallback.
+        const resolvedCompany = await resolveCompanyDocName(ctx.creds, ctx.company);
+        req.log.warn({ email: ctx.userEmail, ctx_company: ctx.company, resolved_company: resolvedCompany }, "[expense-create] self-claim lookup");
+        async function findSelfEmployee(): Promise<Record<string, unknown> | null> {
+          for (const field of ["user_id", "personal_email"] as const) {
+            try {
+              const rows = await erp.listDocs(ctx!.creds, "Employee", {
+                filters: [[field, "=", ctx!.userEmail], ["company", "=", resolvedCompany]],
+                fields: ["name", "company", "department", "expense_approver"],
+                limit_page_length: 1,
+              });
+              const row = asRecord(rows.data?.[0]);
+              if (row?.name) {
+                req.log.warn({ field, employee: row.name }, "[expense-create] found employee");
+                return row;
+              }
+              req.log.warn({ field }, "[expense-create] no match");
+            } catch (e) {
+              req.log.warn({ field, err: e instanceof Error ? e.message : String(e) }, "[expense-create] lookup error");
+            }
+          }
+          return null;
+        }
+        const selfEmp = await findSelfEmployee();
         if (!selfEmp?.name) {
+          req.log.warn({ email: ctx.userEmail, resolved_company: resolvedCompany }, "[expense-create] BLOCKED — no employee found");
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
         }
         employee = String(selfEmp.name);
         employeeDept = String(selfEmp.department ?? "").trim() || undefined;
+        req.log.warn({ employee, dept: employeeDept ?? "none" }, "[expense-create] resolved employee");
       }
 
       // Frappe will copy employee.department onto the claim via fetch_from on every save.
