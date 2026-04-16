@@ -1,7 +1,8 @@
 /**
- * Recruitment writes (Phase 2): Job Requisition (HR), Job Applicant / internal interest (employee).
+ * Recruitment reads + writes: Job Opening list, self-summary, my Job Applicants;
+ * Job Requisition (HR); Job Applicant apply / internal interest.
  *
- * Frappe HRMS DocTypes: Job Requisition, Job Applicant, Employee Referral (reserved for future).
+ * Frappe HRMS DocTypes: Job Opening, Job Applicant, Job Requisition, Interview, Job Offer.
  */
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import { defaultClient, ErpError } from "../erpnext/client.js";
@@ -61,6 +62,90 @@ async function resolveEmployeeInCompany(
 }
 
 /** Best-effort: link a Job Opening on this company whose `job_title` matches free text. */
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function collectApplicantEmails(
+  ctx: { creds: { apiKey: string; apiSecret: string }; userEmail: string },
+  self: { name: string } | null
+): Promise<string[]> {
+  const emails = new Set<string>();
+  const ue = ctx.userEmail.trim().toLowerCase();
+  if (ue) emails.add(ue);
+  if (self) {
+    try {
+      const doc = await erp.getDoc(ctx.creds, "Employee", self.name);
+      for (const k of ["personal_email", "company_email", "prefered_email"] as const) {
+        const v = String(doc[k] ?? "")
+          .trim()
+          .toLowerCase();
+        if (v) emails.add(v);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return [...emails];
+}
+
+/** Job Applicant rows for the signed-in user (matches `email_id` to login / employee emails). */
+async function listMyJobApplicants(ctx: {
+  creds: { apiKey: string; apiSecret: string };
+  userEmail: string;
+  company: string;
+}): Promise<Record<string, unknown>[]> {
+  const self = await resolveSelfEmployee(ctx);
+  const emails = await collectApplicantEmails(ctx, self);
+  if (emails.length === 0) return [];
+  const orFilters = emails.map((e) => ["email_id", "=", e] as [string, string, string]);
+  const rows = await erp.getList(ctx.creds, "Job Applicant", {
+    or_filters: orFilters,
+    fields: [
+      "name",
+      "applicant_name",
+      "email_id",
+      "status",
+      "job_title",
+      "creation",
+      "cover_letter",
+      "designation",
+    ],
+    order_by: "creation desc",
+    limit_page_length: 200,
+  });
+  return rows.map((r) => asRecord(r)).filter((r): r is Record<string, unknown> => r != null);
+}
+
+async function jobOpeningTitleMap(
+  creds: { apiKey: string; apiSecret: string },
+  openingNames: string[]
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const uniq = [...new Set(openingNames.map((n) => n.trim()).filter(Boolean))];
+  for (const part of chunk(uniq, 40)) {
+    try {
+      const rows = await erp.getList(creds, "Job Opening", {
+        filters: [["name", "in", part]],
+        fields: ["name", "job_title"],
+        limit_page_length: part.length,
+      });
+      for (const raw of rows) {
+        const rec = asRecord(raw);
+        const n = rec?.name;
+        if (typeof n === "string" && n) {
+          map.set(n, String(rec.job_title ?? n));
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return map;
+}
+
 async function guessJobOpeningForRole(
   ctx: { creds: { apiKey: string; apiSecret: string }; company: string },
   companyDocName: string,
@@ -83,6 +168,181 @@ async function guessJobOpeningForRole(
 }
 
 export const recruitmentRoutes: FastifyPluginAsync = async (app) => {
+  /** Aggregate counts for employee portal recruitment cards. */
+  app.get("/v1/recruitment/self-summary", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    let companyDocName: string;
+    try {
+      companyDocName = await resolveCompanyDocName(ctx.creds, ctx.company);
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+
+    try {
+      const applicants = await listMyJobApplicants(ctx);
+      const internalInterest = applicants.filter((a) => {
+        const cl = String(a.cover_letter ?? "").toLowerCase();
+        return cl.includes("internal mobility") || cl.includes("expressed interest in role");
+      });
+      const names = applicants.map((a) => String(a.name ?? "").trim()).filter(Boolean).slice(0, 150);
+
+      let interviews = 0;
+      let offers = 0;
+      if (names.length > 0) {
+        try {
+          const intRows = await erp.getList(ctx.creds, "Interview", {
+            filters: [["job_applicant", "in", names]],
+            fields: ["name"],
+            limit_page_length: 200,
+          });
+          interviews = intRows.length;
+        } catch {
+          interviews = 0;
+        }
+        try {
+          const offRows = await erp.getList(ctx.creds, "Job Offer", {
+            filters: [
+              ["job_applicant", "in", names],
+              ["company", "=", companyDocName],
+            ],
+            fields: ["name"],
+            limit_page_length: 200,
+          });
+          offers = offRows.length;
+        } catch {
+          offers = 0;
+        }
+      }
+
+      let openRoles = 0;
+      try {
+        const openRows = await erp.getList(ctx.creds, "Job Opening", {
+          filters: [
+            ["company", "=", companyDocName],
+            ["status", "=", "Open"],
+          ],
+          fields: ["name"],
+          limit_page_length: 200,
+        });
+        openRoles = openRows.length;
+      } catch {
+        openRoles = 0;
+      }
+
+      return {
+        data: {
+          openRoles,
+          applications: applicants.length,
+          interviews,
+          offers,
+          referrals: internalInterest.length,
+        },
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Open Job Openings for the tenant company (Pay Hub may filter external-only for employees). */
+  app.get("/v1/recruitment/openings", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    let companyDocName: string;
+    try {
+      companyDocName = await resolveCompanyDocName(ctx.creds, ctx.company);
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+
+    try {
+      const rows = await erp.getList(ctx.creds, "Job Opening", {
+        filters: [
+          ["company", "=", companyDocName],
+          ["status", "=", "Open"],
+        ],
+        fields: ["name", "job_title", "department", "location", "status", "posted_on", "publish"],
+        order_by: "posted_on desc",
+        limit_page_length: 100,
+      });
+
+      const data = rows.map((raw) => {
+        const r = asRecord(raw);
+        const name = typeof r?.name === "string" ? r.name : "";
+        const posted = r?.posted_on != null ? String(r.posted_on) : "";
+        return {
+          name,
+          id: name,
+          title: typeof r?.job_title === "string" ? r.job_title : name || "Role",
+          department: typeof r?.department === "string" ? r.department : undefined,
+          location: typeof r?.location === "string" ? r.location : undefined,
+          status: typeof r?.status === "string" ? r.status : undefined,
+          postedOn: posted.slice(0, 10) || undefined,
+          scope: r?.publish === 1 ? "published" : "internal",
+        };
+      });
+
+      return { data, meta: { source: "bff" as const } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Job Applicant rows tied to the current user (for “My internal applications”). */
+  app.get("/v1/recruitment/referrals/mine", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    try {
+      const applicants = await listMyJobApplicants(ctx);
+      const openingNames = applicants
+        .map((a) => String(a.job_title ?? "").trim())
+        .filter((n) => n.length > 0);
+      const titleMap = await jobOpeningTitleMap(ctx.creds, openingNames);
+
+      const data = applicants.map((a) => {
+        const name = String(a.name ?? "");
+        const jo = String(a.job_title ?? "").trim();
+        const roleTitle =
+          (jo && titleMap.get(jo)) || String(a.designation ?? "").trim() || jo || "—";
+        const created = a.creation != null ? String(a.creation) : "";
+        return {
+          id: name,
+          candidateName: String(a.applicant_name ?? "—"),
+          roleTitle,
+          status: String(a.status ?? "—"),
+          submittedOn: created.slice(0, 10) || undefined,
+        };
+      });
+
+      return { data, meta: { source: "bff" as const } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
   /**
    * HR / delegated users: create a Job Requisition (Frappe HRMS).
    * Body: designation (required), no_of_positions, expected_compensation, description,
