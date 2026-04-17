@@ -1758,6 +1758,44 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * Optional GPS audit: creates ERPNext `Employee Checkin` when `location` is posted.
+   * Fails soft if the site’s doctype lacks lat/long fields or permissions differ.
+   */
+  async function tryRecordEmployeeCheckinWithLocation(params: {
+    ctx: HrContext;
+    employeeId: string;
+    logType: "IN" | "OUT";
+    at: Date;
+    location: unknown;
+  }): Promise<{ recorded: boolean; reason?: string }> {
+    const loc = asRecord(params.location);
+    if (!loc) return { recorded: false };
+    const lat = Number(loc.latitude);
+    const lng = Number(loc.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return { recorded: false };
+
+    const doc: Record<string, unknown> = {
+      employee: params.employeeId,
+      log_type: params.logType,
+      time: toFrappeDateTime(params.at),
+      latitude: lat,
+      longitude: lng,
+    };
+    const acc = loc.accuracy_meters;
+    if (acc != null && Number.isFinite(Number(acc))) {
+      doc.accuracy = Number(acc);
+    }
+
+    try {
+      await erp.createDoc(params.ctx.creds, "Employee Checkin", doc);
+      return { recorded: true };
+    } catch (e) {
+      const msg = e instanceof ErpError ? String((e as ErpError).message ?? "") : String(e);
+      return { recorded: false, reason: msg.slice(0, 240) };
+    }
+  }
+
   app.post("/v1/attendance/clock-in", async (req, reply) => {
     let ctx: HrContext;
     try {
@@ -1767,6 +1805,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
 
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const q = (req.query ?? {}) as Record<string, unknown>;
     const qEmp = String(q.employee ?? "").trim();
     const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
@@ -1821,6 +1860,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
       const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", active.shift_assignment_name);
 
+      const checkinMeta = await tryRecordEmployeeCheckinWithLocation({
+        ctx,
+        employeeId,
+        logType: "IN",
+        at: now,
+        location: body.location,
+      });
+
       return {
         data: {
           from_time: toFrappeDateTime(now),
@@ -1831,6 +1878,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           project: (shiftAssignmentDoc as any)?.project ?? null,
           shift_location: (shiftAssignmentDoc as any)?.shift_location ?? null,
         },
+        meta: { employee_checkin: checkinMeta },
       };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -1967,7 +2015,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         to_time: toResolved,
         shift_assignment_name,
       });
-      return { data: result };
+      const outAt = parseFrappeDateTime(toResolved) ?? new Date();
+      const checkinMeta = await tryRecordEmployeeCheckinWithLocation({
+        ctx,
+        employeeId,
+        logType: "OUT",
+        at: outAt,
+        location: body.location,
+      });
+      return { data: result, meta: { employee_checkin: checkinMeta } };
     } catch (e) {
       if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
       if (e instanceof ErpError) return replyErp(reply, e);
