@@ -17,6 +17,33 @@ import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
 import { parseFrappeErrorBody, publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const _dowFilename = fileURLToPath(import.meta.url);
+const _dowDirname = dirname(_dowFilename);
+const DOW_STORE_PATH = join(_dowDirname, "..", ".shift-assignment-days.json");
+
+const _dowStore: Map<string, string> = (() => {
+  try {
+    if (existsSync(DOW_STORE_PATH)) {
+      const raw = readFileSync(DOW_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, string>));
+    }
+  } catch { }
+  return new Map();
+})();
+
+function dowGet(name: string): string { return _dowStore.get(name) ?? ""; }
+function dowSet(name: string, value: string): void {
+  if (value) { _dowStore.set(name, value); } else { _dowStore.delete(name); }
+  try {
+    const obj: Record<string, string> = {};
+    _dowStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(DOW_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
 
 const erp = defaultClient();
 
@@ -451,13 +478,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         limit_page_length: 200,
       });
       // Post-filter: exclude shifts whose end_date is set and falls before `from` (shift ended before the range).
-      const rows = from
+      const filtered = from
         ? (rawRows as Record<string, unknown>[]).filter((r) => {
             const endDate = String(r.end_date ?? "").slice(0, 10);
-            if (!endDate) return true; // open-ended shift — always included
+            if (!endDate) return true;
             return endDate >= from;
           })
-        : rawRows;
+        : (rawRows as Record<string, unknown>[]);
+      const rows = filtered.map((r) => ({ ...r, custom_days_of_week: dowGet(String(r.name ?? "")) }));
       return { data: rows };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -880,15 +908,22 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           let d = iterStart > saStartD ? iterStart : saStartD;
           const last = iterEnd < saEndD ? iterEnd : saEndD;
 
+          // Check days-of-week restriction from local store.
+          const saDowStr = dowGet(String(sa.name ?? ""));
+          const DOW_NAMES_D = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"] as const;
+          const saDow = saDowStr ? saDowStr.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+
           while (d <= last) {
             const dd = dateToIso(d);
+            const dayName = DOW_NAMES_D[new Date(dd + "T00:00:00").getDay()];
+            const isScheduledDay = saDow.length === 0 || saDow.includes(dayName);
             if (!byDate.has(dd)) {
               byDate.set(dd, {
                 name: `scheduled-${employeeId}-${dd}-${shiftType}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
                 employee: employeeId,
                 attendance_date: dd,
-                status: "Scheduled",
-                shift: shiftType,
+                status: isScheduledDay ? "Scheduled" : "Unscheduled",
+                shift: isScheduledDay ? shiftType : null,
                 in_time: null,
                 out_time: null,
                 working_hours: null,
@@ -992,6 +1027,9 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const shift_type = parseBodyString(body.shift_type);
     const start_date = parseBodyString(body.start_date);
     const end_date = parseBodyString(body.end_date);
+    const rawDaysPost = body.days_of_week;
+    const daysArrPost = Array.isArray(rawDaysPost) ? rawDaysPost.map(String) : typeof rawDaysPost === "string" ? rawDaysPost.split(",") : [];
+    const daysValuePost = daysArrPost.map((d) => d.trim().toLowerCase()).filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
 
     if (!employee || !shift_type || !start_date) {
       return reply.status(400).send({ error: "employee, shift_type, and start_date are required" });
@@ -1104,6 +1142,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const name = parseBodyString((created as Record<string, unknown>)?.name);
+      if (name && daysValuePost) dowSet(name, daysValuePost);
       if (name) {
         try {
           await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
@@ -1126,6 +1165,69 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
+  });
+
+  /**
+   * PATCH /v1/attendance/shift-assignments/:name — update start_date, end_date, and/or days_of_week.
+   */
+  app.patch("/v1/attendance/shift-assignments/:name", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can update shift assignments." });
+    }
+
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+
+    const rawDays = body.days_of_week;
+    const daysArr = Array.isArray(rawDays) ? rawDays.map(String) : typeof rawDays === "string" ? rawDays.split(",") : [];
+    const daysValue = daysArr.map((d) => d.trim().toLowerCase()).filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+
+    const start_date = typeof body.start_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.start_date.trim()) ? body.start_date.trim() : null;
+    const end_date = typeof body.end_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.end_date.trim()) ? body.end_date.trim() : body.end_date === "" ? "" : null;
+
+    // Always save days to local store (even if empty = clear restriction).
+    dowSet(name, daysValue);
+
+    // If dates are provided, update them in ERPNext.
+    if (start_date !== null || end_date !== null) {
+      try {
+        const doc = await erp.getDoc(ctx.creds, "Shift Assignment", name);
+        if (String((doc as any).company) !== ctx.company) {
+          return reply.status(403).send({ error: "Shift assignment not in your Company" });
+        }
+        const docstatus = Number((doc as any).docstatus ?? 0);
+        if (docstatus === 2) {
+          return reply.status(409).send({ error: "Cannot update a cancelled shift assignment." });
+        }
+
+        const updates: Record<string, string> = {};
+        if (start_date !== null) updates.start_date = start_date;
+        if (end_date !== null) updates.end_date = end_date;
+
+        if (docstatus === 0) {
+          await erp.updateDoc(ctx.creds, "Shift Assignment", name, updates);
+        } else {
+          for (const [fieldname, value] of Object.entries(updates)) {
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Shift Assignment", name, fieldname, value,
+            });
+          }
+        }
+      } catch (e) {
+        if (e instanceof ErpError) return replyErp(reply, e);
+        throw e;
+      }
+    }
+
+    return { data: { name, days_of_week: daysValue, start_date, end_date } };
   });
 
   /**
@@ -1286,6 +1388,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       stByName.set(String(st.name), { start_time: String(st.start_time ?? ""), end_time: String(st.end_time ?? "") });
     }
 
+    const DOW_NAMES_RS = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"] as const;
+    function dowAllowsDate(saName: string, dateIso: string): boolean {
+      const dowStr = dowGet(String(saName ?? ""));
+      if (!dowStr) return true; // no restriction — all days allowed
+      const allowed = dowStr.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+      const dayName = DOW_NAMES_RS[new Date(dateIso + "T00:00:00").getDay()];
+      return allowed.includes(dayName);
+    }
+
     // 1) Prefer assignments whose shift window (calculated relative to TODAY or
     //    YESTERDAY for overnight shifts) covers the current timestamp.
     //    We use ddNow/ddPrev as the calendar day — NOT sa.start_date — because
@@ -1300,6 +1411,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       // Try yesterday first (overnight shift that started yesterday evening),
       // then today (normal or overnight shift starting today).
       for (const calDay of [ddPrev, ddNow]) {
+        if (!dowAllowsDate(sa.name, calDay)) continue;
         const win = shiftWindowToMs({
           shift_start_date: calDay,
           start_time: timings.start_time,
@@ -1327,6 +1439,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const shiftTypeName = String(sa.shift_type ?? "");
       const timings = stByName.get(shiftTypeName);
       if (!timings) continue;
+      if (!dowAllowsDate(sa.name, ddNow)) continue;
 
       const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
       const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : ddNow;
@@ -1434,18 +1547,25 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const toMs = to.getTime();
     if (toMs <= fromMs) throw new HttpError("to_time must be after from_time", 400);
 
-    const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", shift_assignment_name);
-    if (String((shiftAssignmentDoc as any)?.employee ?? "") !== employeeId) {
-      throw new HttpError("This shift assignment does not belong to the selected employee", 400);
-    }
-    const shiftTypeName = String(shiftAssignmentDoc?.shift_type ?? "");
-    if (!shiftTypeName) {
-      throw new HttpError("Invalid shift assignment (missing shift type)", 400);
+    // Fetch the shift assignment — it may have been deleted after the employee clocked in.
+    let shiftAssignmentDoc: Record<string, unknown> | null = null;
+    try {
+      const doc = await erp.getDoc(ctx.creds, "Shift Assignment", shift_assignment_name);
+      if (String((doc as any)?.employee ?? "") !== employeeId) {
+        throw new HttpError("This shift assignment does not belong to the selected employee", 400);
+      }
+      shiftAssignmentDoc = doc as Record<string, unknown>;
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      if (e instanceof ErpError && e.status === 404) {
+        // Shift assignment was deleted — allow clock-out with all hours as regular (no window splitting).
+        shiftAssignmentDoc = null;
+      } else {
+        throw e;
+      }
     }
 
-    const shiftTypeDoc = await erp.getDoc(ctx.creds, "Shift Type", shiftTypeName);
-
-    // Derive the shift calendar day from the clock-in time, NOT the assignment's
+    // Derive the shift calendar day from the clock-in time, NOT the assignment’s
     // start_date. The assignment start_date is when the recurring schedule began
     // (e.g. April 7); the attendance date must be the actual day worked (e.g. April 14).
     // For overnight shifts (e.g. 22:00–06:00) where clock-in is in the early hours,
@@ -1453,63 +1573,88 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const fromDateStr = toFrappeDate(from);
     const fromDatePrevStr = toFrappeDate(new Date(fromMs - 24 * 3600 * 1000));
     let shiftCalendarDay = fromDateStr;
-    let win = shiftWindowToMs({
-      shift_start_date: fromDateStr,
-      start_time: String(shiftTypeDoc?.start_time ?? ""),
-      end_time: String(shiftTypeDoc?.end_time ?? ""),
-    });
-    if (!win || fromMs < win.startMs) {
-      const winPrev = shiftWindowToMs({
-        shift_start_date: fromDatePrevStr,
+    let win: ReturnType<typeof shiftWindowToMs> = null;
+    let shiftTypeName = "";
+
+    if (shiftAssignmentDoc) {
+      shiftTypeName = String(shiftAssignmentDoc.shift_type ?? "");
+      if (!shiftTypeName) {
+        throw new HttpError("Invalid shift assignment (missing shift type)", 400);
+      }
+      const shiftTypeDoc = await erp.getDoc(ctx.creds, "Shift Type", shiftTypeName);
+      win = shiftWindowToMs({
+        shift_start_date: fromDateStr,
         start_time: String(shiftTypeDoc?.start_time ?? ""),
         end_time: String(shiftTypeDoc?.end_time ?? ""),
       });
-      if (winPrev && fromMs >= winPrev.startMs) {
-        shiftCalendarDay = fromDatePrevStr;
-        win = winPrev;
+      if (!win || fromMs < win.startMs) {
+        const winPrev = shiftWindowToMs({
+          shift_start_date: fromDatePrevStr,
+          start_time: String(shiftTypeDoc?.start_time ?? ""),
+          end_time: String(shiftTypeDoc?.end_time ?? ""),
+        });
+        if (winPrev && fromMs >= winPrev.startMs) {
+          shiftCalendarDay = fromDatePrevStr;
+          win = winPrev;
+        }
       }
+      if (!win) throw new HttpError("Invalid shift type timing", 400);
     }
-    if (!win) throw new HttpError("Invalid shift type timing", 400);
-
-    const regularStartMs = Math.max(fromMs, win.startMs);
-    const regularEndMs = Math.min(toMs, win.endMs);
-    const regularMs = Math.max(0, regularEndMs - regularStartMs);
-
-    // Overtime is only recorded when the employee stays past the end of their shift.
-    // Early clock-ins (before shift start) are not logged — regular hours begin from
-    // the shift start time, not from an early clock-in.
-    const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
 
     const activityMap = await resolveActivityTypeMap(ctx.creds);
     if (!activityMap.overtime) {
       throw new HttpError("Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup.", 400);
     }
 
-    const regularActivity =
-      String(shiftTypeName ?? "").toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
-    if (regularMs > 0 && !regularActivity) {
-      throw new HttpError(
-        "Regular or night-shift hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
-        400
-      );
-    }
-
     const time_logs: Record<string, unknown>[] = [];
-    if (regularMs > 0 && regularActivity) {
+
+    if (win) {
+      const regularStartMs = Math.max(fromMs, win.startMs);
+      const regularEndMs = Math.min(toMs, win.endMs);
+      const regularMs = Math.max(0, regularEndMs - regularStartMs);
+      // Overtime is only recorded when the employee stays past the end of their shift.
+      const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
+
+      const regularActivity =
+        shiftTypeName.toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
+      if (regularMs > 0 && !regularActivity) {
+        throw new HttpError(
+          "Regular or night-shift hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
+          400
+        );
+      }
+
+      if (regularMs > 0 && regularActivity) {
+        time_logs.push({
+          activity_type: regularActivity,
+          from_time: toFrappeDateTime(new Date(regularStartMs)),
+          to_time: toFrappeDateTime(new Date(regularEndMs)),
+          hours: Number((regularMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+      if (overtimeLateMs > 0) {
+        time_logs.push({
+          activity_type: activityMap.overtime,
+          from_time: toFrappeDateTime(new Date(win.endMs)),
+          to_time: toFrappeDateTime(new Date(toMs)),
+          hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+    } else {
+      // Fallback: shift assignment was deleted — record all elapsed time as regular.
+      if (!activityMap.regular) {
+        throw new HttpError(
+          "Regular hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
+          400
+        );
+      }
       time_logs.push({
-        activity_type: regularActivity,
-        from_time: toFrappeDateTime(new Date(regularStartMs)),
-        to_time: toFrappeDateTime(new Date(regularEndMs)),
-        hours: Number((regularMs / 3600000).toFixed(2)),
-        is_billable: 0,
-      });
-    }
-    if (overtimeLateMs > 0) {
-      time_logs.push({
-        activity_type: activityMap.overtime,
-        from_time: toFrappeDateTime(new Date(win.endMs)),
+        activity_type: activityMap.regular,
+        from_time: from_time,
         to_time: toFrappeDateTime(new Date(toMs)),
-        hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+        hours: Number(((toMs - fromMs) / 3600000).toFixed(2)),
         is_billable: 0,
       });
     }
@@ -1518,8 +1663,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError("No time would be recorded — clock times did not overlap this shift’s window.", 400);
     }
 
-    const projectName = (shiftAssignmentDoc as any)?.project ?? null;
-    const shift_location = (shiftAssignmentDoc as any)?.shift_location ?? null;
+    const projectName = shiftAssignmentDoc ? ((shiftAssignmentDoc as any)?.project ?? null) : null;
+    const shift_location = shiftAssignmentDoc ? ((shiftAssignmentDoc as any)?.shift_location ?? null) : null;
     const timesheetName = await getOrCreateDraftTimesheet({
       ctx,
       employeeId,
@@ -1541,7 +1686,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
-    const totalHours = Number(((regularMs + overtimeLateMs) / 3600000).toFixed(2));
+    const totalHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
 
     // Update the Attendance record's in_time, out_time, and working_hours.
     // ERPNext auto-attendance may have already submitted the record (docstatus=1),
@@ -1599,12 +1744,19 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       console.warn("[clock-out] attendance update failed (non-fatal):", erpMsg(e));
     }
 
+    const regularHours = time_logs
+      .filter((l) => l.activity_type !== activityMap.overtime)
+      .reduce((sum, l) => sum + Number(l.hours ?? 0), 0);
+    const overtimeHours = time_logs
+      .filter((l) => l.activity_type === activityMap.overtime)
+      .reduce((sum, l) => sum + Number(l.hours ?? 0), 0);
+
     return {
       timesheet: timesheetName,
       attendance_date: shiftCalendarDay,
       shift_assignment: shift_assignment_name,
-      regular_hours: Number((regularMs / 3600000).toFixed(2)),
-      overtime_hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+      regular_hours: Number(regularHours.toFixed(2)),
+      overtime_hours: Number(overtimeHours.toFixed(2)),
     };
   }
 
