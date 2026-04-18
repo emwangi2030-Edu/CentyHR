@@ -185,6 +185,8 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   // Exit
   "resignation_letter_date", "relieving_date", "held_on", "new_workplace",
   "leave_encashed", "reason_for_leaving", "feedback",
+  // Identity document
+  "id_number", "custom_national_id",                 // National ID (custom field)
   // Statutory / Tax compliance
   "tax_id",                                          // KRA PIN (standard ERPNext field)
   // Common custom field name variants for Kenya statutory numbers:
