@@ -73,3 +73,24 @@ export const EXPENSE_FIRST_APPROVER_FIELD =
   process.env.EXPENSE_FIRST_APPROVER_FIELD?.trim() || "custom_centy_first_approver_done";
 
 export const EXPENSE_HR_BYPASS_FIRST_APPROVER = process.env.EXPENSE_HR_BYPASS_FIRST_APPROVER === "1";
+
+/** DocuSeal webhook: header name + secret (console “Add Secret”). */
+export const DOCUSEAL_WEBHOOK_HEADER_NAME = process.env.DOCUSEAL_WEBHOOK_HEADER_NAME ?? "";
+export const DOCUSEAL_WEBHOOK_SECRET = process.env.DOCUSEAL_WEBHOOK_SECRET ?? "";
+
+/** Dev only: skip header verification (never use in production). */
+export const DOCUSEAL_WEBHOOK_INSECURE = process.env.DOCUSEAL_WEBHOOK_INSECURE === "1";
+
+/** ERP method DocuSeal payload is forwarded to. */
+export const DOCUSEAL_WEBHOOK_ERP_METHOD =
+  process.env.DOCUSEAL_WEBHOOK_ERP_METHOD?.trim() ||
+  "centypay_dms.api.documents.handle_docuseal_webhook";
+
+const DEFAULT_HR_COMPANY_DOCUMENT_ROLES = ["super_admin", "admin"];
+
+/** Roles allowed to manage company vault documents (comma-separated env override). */
+export function hrCompanyDocumentRoles(): string[] {
+  const raw = process.env.HR_COMPANY_DOCUMENT_ROLES?.trim();
+  if (!raw) return [...DEFAULT_HR_COMPANY_DOCUMENT_ROLES];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
