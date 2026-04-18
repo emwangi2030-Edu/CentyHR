@@ -1433,13 +1433,20 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // ── Step 3: HELB first, then SSA ─────────────────────────────────────────
-      // HELB must run before the SSA cancel step. ERPNext's on_cancel hook for
-      // Salary Structure Assignment re-validates existing Additional Salary records,
-      // so any stuck HELB record (missing to_date) must be removed first.
+      // ── Step 3: Clear old Additional Salary records BEFORE SSA cancel ─────────
+      // ERPNext's on_cancel hook for Salary Structure Assignment re-validates all
+      // existing Additional Salary records. If a HELB/OT record is stuck (e.g.
+      // missing to_date), the SSA cancel fails. We clear them first (amount=0 /
+      // overtimeAmount=0) so the SSA cancel hook has nothing to trip over.
+      // New employees have no existing records so this is a safe no-op for them.
       if (helbProvided) {
-        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, helb_monthly);
+        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, 0);
       }
+      if (overtimeProvided) {
+        await upsertOvertimeAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, 0);
+      }
+
+      // ── Step 4: SSA — now safe to cancel/recreate ────────────────────────────
       await upsertSalaryStructureAssignment(ctx.creds, {
         employeeId,
         structName,
@@ -1447,7 +1454,14 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         from_date,
         base: gross_salary,
       });
-      if (overtimeProvided) {
+
+      // ── Step 5: Insert new Additional Salary records after SSA is active ─────
+      // ERPNext requires an active (docstatus=1) SSA before Additional Salary
+      // records can be inserted/submitted for the employee.
+      if (helbProvided && helb_monthly > 0) {
+        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, helb_monthly);
+      }
+      if (overtimeProvided && overtime_hours > 0) {
         const hourlyRate = gross_salary > 0 ? gross_salary / 22 / 8 : 0;
         const overtimeAmount = Math.round(overtime_hours * hourlyRate * 1.5 * 100) / 100;
         await upsertOvertimeAdditionalSalary(
