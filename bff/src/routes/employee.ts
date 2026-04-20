@@ -131,7 +131,8 @@ const EMPLOYEE_CREATE_FIELDS = new Set([
   // Identity / statutory (can be set at onboarding)
   "tax_id",         // KRA PIN (standard ERPNext Employee field)
   "custom_kra_pin", // KRA PIN (custom field on Statutory tab — mirror of tax_id)
-  "id_number",      // National ID (custom field — silently skipped if not present on ERP)
+  "id_number",          // National ID (ERPNext standard field — used for duplicate detection)
+  "custom_national_id", // National ID (custom Statutory tab field — display copy)
   "salutation",
   "employment_type",
   "grade",
@@ -1039,58 +1040,49 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const gate = await ensureEmployeeInsightAccess(ctx, name);
     if (!gate.ok) return reply.status(gate.status).send({ error: gate.error });
 
+    let rows: unknown[] = [];
     try {
-      const res = await erp.listDocs(ctx.creds, "Expense Claim", {
+      rows = await erp.getList(ctx.creds, "Expense Claim", {
         filters: [
           ["company", "=", ctx.company],
           ["employee", "=", name],
         ],
-        fields: [
-          "docstatus",
-          "approval_status",
-          "grand_total",
-          "total_claimed_amount",
-          "total_amount_reimbursed",
-        ],
+        fields: ["docstatus", "approval_status", "total_claimed_amount", "total_amount_reimbursed"],
         order_by: "modified desc",
         limit_page_length: EMPLOYEE_INSIGHTS_CLAIM_CAP,
       });
-      const rows = res.data ?? [];
-      let total = 0;
-      let pending = 0;
-      let approved = 0;
-      let total_claimed = 0;
-      let paid_out = 0;
-      for (const r of rows) {
-        const rec = asRecord(r);
-        if (!rec) continue;
-        total++;
-        const docstatus = Number(rec.docstatus);
-        const appr = String(rec.approval_status ?? "").trim().toLowerCase();
-        if (docstatus === 0) pending++;
-        else if (docstatus === 1 && appr !== "approved" && appr !== "rejected") pending++;
-        if (appr === "approved") approved++;
-        const gt =
-          Number(rec.grand_total ?? rec.total_claimed_amount ?? 0) ||
-          Number(rec.total_claimed_amount ?? 0) ||
-          0;
-        total_claimed += gt;
-        paid_out += Number(rec.total_amount_reimbursed ?? 0) || 0;
-      }
-      return {
-        data: {
-          total,
-          pending,
-          approved,
-          total_claimed,
-          paid_out,
-          scan_capped: rows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
-        },
-      };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
+      // Expense module may not be installed or API key lacks permission — return empty snapshot.
+      console.warn("[expense-snapshot] ERPNext query failed, returning empty snapshot:", e instanceof Error ? e.message : String(e));
     }
+    let total = 0;
+    let pending = 0;
+    let approved = 0;
+    let total_claimed = 0;
+    let paid_out = 0;
+    for (const r of rows) {
+      const rec = asRecord(r);
+      if (!rec) continue;
+      total++;
+      const docstatus = Number(rec.docstatus);
+      const appr = String(rec.approval_status ?? "").trim().toLowerCase();
+      if (docstatus === 0) pending++;
+      else if (docstatus === 1 && appr !== "approved" && appr !== "rejected") pending++;
+      if (appr === "approved") approved++;
+      total_claimed += Number(rec.total_claimed_amount ?? 0) || 0;
+      paid_out += Number(rec.total_amount_reimbursed ?? 0) || 0;
+    }
+    return {
+      data: {
+        total,
+        pending,
+        approved,
+        total_claimed,
+        paid_out,
+        scan_capped: rows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
+        unavailable: rows.length === 0 && total === 0,
+      },
+    };
   });
 
   /** Daily claim counts for activity heatmap (posting_date preferred, else modified). */
@@ -1113,8 +1105,9 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     since.setMonth(since.getMonth() - months);
     const cutoff = since.toISOString().slice(0, 10);
 
+    let claimRows: unknown[] = [];
     try {
-      const res = await erp.listDocs(ctx.creds, "Expense Claim", {
+      claimRows = await erp.getList(ctx.creds, "Expense Claim", {
         filters: [
           ["company", "=", ctx.company],
           ["employee", "=", name],
@@ -1123,26 +1116,25 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         order_by: "modified desc",
         limit_page_length: EMPLOYEE_INSIGHTS_CLAIM_CAP,
       });
-      const cells: Record<string, number> = {};
-      for (const r of res.data ?? []) {
-        const rec = asRecord(r);
-        if (!rec) continue;
-        const raw = String(rec.posting_date ?? rec.modified ?? "").trim();
-        const day = raw.slice(0, 10);
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoff) continue;
-        cells[day] = (cells[day] ?? 0) + 1;
-      }
-      return {
-        data: {
-          cells,
-          months,
-          scan_capped: (res.data ?? []).length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
-        },
-      };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
+      console.warn("[claim-activity] ERPNext query failed, returning empty heatmap:", e instanceof Error ? e.message : String(e));
     }
+    const cells: Record<string, number> = {};
+    for (const r of claimRows) {
+      const rec = asRecord(r);
+      if (!rec) continue;
+      const raw = String(rec.posting_date ?? rec.modified ?? "").trim();
+      const day = raw.slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoff) continue;
+      cells[day] = (cells[day] ?? 0) + 1;
+    }
+    return {
+      data: {
+        cells,
+        months,
+        scan_capped: claimRows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
+      },
+    };
   });
 
   /** Related record counts (ERPNext); optional doctypes return -1 when unavailable. */

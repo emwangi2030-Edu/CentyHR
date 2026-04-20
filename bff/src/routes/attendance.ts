@@ -1193,10 +1193,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const start_date = typeof body.start_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.start_date.trim()) ? body.start_date.trim() : null;
     const end_date = typeof body.end_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.end_date.trim()) ? body.end_date.trim() : body.end_date === "" ? "" : null;
 
-    // Always save days to local store (even if empty = clear restriction).
-    dowSet(name, daysValue);
+    // Validate date range.
+    if (start_date && end_date && start_date > end_date) {
+      return reply.status(400).send({ error: "Start date must not be after end date." });
+    }
 
-    // If dates are provided, update them in ERPNext.
+    // If dates are being updated, fetch the doc first so we can run the clock-in guard.
     if (start_date !== null || end_date !== null) {
       try {
         const doc = await erp.getDoc(ctx.creds, "Shift Assignment", name);
@@ -1206,6 +1208,23 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         const docstatus = Number((doc as any).docstatus ?? 0);
         if (docstatus === 2) {
           return reply.status(409).send({ error: "Cannot update a cancelled shift assignment." });
+        }
+
+        // Guard: block if the employee is currently clocked in.
+        const employeeId = String((doc as any).employee ?? "").trim();
+        if (employeeId) {
+          const recentCheckins = (await erp.getList(ctx.creds, "Employee Checkin", {
+            fields: ["name", "log_type", "time"],
+            filters: [["employee", "=", employeeId]],
+            order_by: "time desc",
+            limit_page_length: 1,
+          })) as any[];
+          if (recentCheckins.length && String(recentCheckins[0].log_type ?? "").toUpperCase() === "IN") {
+            return reply.status(409).send({
+              error: "Employee is currently clocked in. They must clock out before this shift assignment can be edited.",
+              code: "HR_EMPLOYEE_CLOCKED_IN",
+            });
+          }
         }
 
         const updates: Record<string, string> = {};
@@ -1226,6 +1245,9 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         throw e;
       }
     }
+
+    // Always save days to local store (even if empty = clear restriction).
+    dowSet(name, daysValue);
 
     return { data: { name, days_of_week: daysValue, start_date, end_date } };
   });
@@ -1339,6 +1361,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     shift_type_name: string;
     shift_start_date: string; // shift-start calendar day (YYYY-MM-DD)
     shift_window: { startMs: number; endMs: number };
+    shift_start_time: string; // "HH:MM:SS"
+    shift_end_time: string;   // "HH:MM:SS"
   }> {
     const { ctx, employeeId, at, strictWindow = false } = params;
     const atMs = at.getTime();
@@ -1424,6 +1448,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             shift_type_name: shiftTypeName,
             shift_start_date: calDay,
             shift_window: win,
+            shift_start_time: timings.start_time,
+            shift_end_time: timings.end_time,
           };
         }
       }
@@ -1457,6 +1483,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           shift_type_name: shiftTypeName,
           shift_start_date: ddNow,
           shift_window: win,
+          shift_start_time: timings.start_time,
+          shift_end_time: timings.end_time,
         };
       }
     }
@@ -1522,6 +1550,34 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     };
   }
 
+  // Ensure required Activity Types exist. Called lazily before clock-out so the
+  // first clock-out on a fresh install self-heals instead of returning a 400.
+  async function ensureActivityTypes(creds: HrContext["creds"]): Promise<void> {
+    const seeds = [
+      { activity_type: "Regular Hours", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Overtime", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Night Shift", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Public Holiday", costing_rate: 0, billing_rate: 0 },
+    ];
+    try {
+      const names = seeds.map((s) => s.activity_type);
+      const existing = (await erp.getList(creds, "Activity Type", {
+        fields: ["name"],
+        filters: [["name", "IN", names]],
+        limit_page_length: 50,
+      })) as any[];
+      const existingNames = new Set(existing.map((r) => String(r.name)));
+      for (const seed of seeds) {
+        if (!existingNames.has(seed.activity_type)) {
+          await erp.createDoc(creds, "Activity Type", seed);
+        }
+      }
+    } catch {
+      // best-effort — if ERPNext rejects the creation the later resolveActivityTypeMap
+      // will still throw a descriptive 400 rather than silently missing types.
+    }
+  }
+
   /**
    * Shared clock-out / manual-time logic: split interval vs shift window and append to the daily Draft Timesheet.
    */
@@ -1537,6 +1593,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     shift_assignment: string;
     regular_hours: number;
     overtime_hours: number;
+    warnings: string[];
   }> {
     const { ctx, employeeId, from_time, to_time, shift_assignment_name } = params;
 
@@ -1601,6 +1658,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (!win) throw new HttpError("Invalid shift type timing", 400);
     }
 
+    await ensureActivityTypes(ctx.creds);
     const activityMap = await resolveActivityTypeMap(ctx.creds);
     if (!activityMap.overtime) {
       throw new HttpError("Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup.", 400);
@@ -1687,6 +1745,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const totalHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
+    const warnings: string[] = [];
 
     // Update the Attendance record's in_time, out_time, and working_hours.
     // ERPNext auto-attendance may have already submitted the record (docstatus=1),
@@ -1738,9 +1797,11 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           console.log("[clock-out] attendance updated (submitted via set_value)", { attName, totalHours });
         }
       } else {
+        warnings.push("No attendance record found for today — your hours are saved but the attendance entry may need manual review.");
         console.warn("[clock-out] no Attendance record found for", { employeeId, shiftCalendarDay });
       }
     } catch (e) {
+      warnings.push("Attendance record could not be updated automatically. Your hours are saved but HR may need to manually correct the attendance entry.");
       console.warn("[clock-out] attendance update failed (non-fatal):", erpMsg(e));
     }
 
@@ -1757,6 +1818,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       shift_assignment: shift_assignment_name,
       regular_hours: Number(regularHours.toFixed(2)),
       overtime_hours: Number(overtimeHours.toFixed(2)),
+      warnings,
     };
   }
 
@@ -2027,6 +2089,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           attendance_date: active.shift_start_date,
           shift_assignment: active.shift_assignment_name,
           shift_type: active.shift_type_name,
+          shift_start_time: active.shift_start_time,
+          shift_end_time: active.shift_end_time,
           project: (shiftAssignmentDoc as any)?.project ?? null,
           shift_location: (shiftAssignmentDoc as any)?.shift_location ?? null,
         },
