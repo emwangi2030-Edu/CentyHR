@@ -2057,6 +2057,9 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
           "currency",
           "status",
           "docstatus",
+          "gross_pay",
+          "net_pay",
+          "total_deduction",
         ],
         filters,
         order_by: "start_date desc, employee asc",
@@ -2105,6 +2108,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
             _emp_tax_id: String(empDoc.tax_id ?? empDoc.custom_kra_pin ?? "").trim(),
             _emp_nssf_number: String(empDoc.custom_nssf_number ?? "").trim(),
             _emp_shif_number: String(empDoc.custom_nhif__shif_number ?? empDoc.custom_shif_number ?? "").trim(),
+            _emp_designation: String(empDoc.designation ?? "").trim(),
           };
         } catch (e) {
           // Non-fatal: statutory IDs are supplementary display info
