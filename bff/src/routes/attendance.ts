@@ -123,6 +123,58 @@ function toFrappeDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** Returns YYYY-MM-DD in the given timezone offset (minutes east of UTC). */
+function toLocalDate(d: Date, tzOffsetMinutes: number): string {
+  return new Date(d.getTime() + tzOffsetMinutes * 60_000).toISOString().slice(0, 10);
+}
+
+/** In-memory cache so we only fetch System Settings once per BFF process lifetime. */
+const _tzOffsetCache = new Map<string, number>();
+
+/**
+ * Fetch the ERPNext site timezone offset in minutes (east of UTC).
+ * Uses `System Settings.time_zone` and resolves via `Intl.DateTimeFormat`.
+ * Falls back to 0 (UTC) on any error.
+ */
+async function getErpTzOffsetMinutes(creds: { apiKey: string; apiSecret: string }): Promise<number> {
+  const cacheKey = `${creds.apiKey ?? ""}|${creds.apiSecret ?? ""}`;
+  const cached = _tzOffsetCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  try {
+    const doc = await erp.getDoc(creds, "System Settings", "System Settings");
+    const tz = String((doc as any)?.time_zone ?? "").trim();
+    if (!tz) {
+      _tzOffsetCache.set(cacheKey, 0);
+      return 0;
+    }
+    // Use Intl to resolve offset: format a known UTC epoch and measure local-time offset.
+    const testDate = new Date("2024-01-15T12:00:00Z");
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "numeric",
+      minute: "numeric",
+      hour12: false,
+      timeZoneName: "shortOffset",
+    }).formatToParts(testDate);
+    const tzNamePart = parts.find((p) => p.type === "timeZoneName")?.value ?? "";
+    // "GMT+3" or "GMT+5:30" etc.
+    const m = tzNamePart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    if (!m) {
+      _tzOffsetCache.set(cacheKey, 0);
+      return 0;
+    }
+    const sign = m[1] === "+" ? 1 : -1;
+    const hours = Number(m[2]);
+    const minutes = Number(m[3] ?? "0");
+    const offset = sign * (hours * 60 + minutes);
+    _tzOffsetCache.set(cacheKey, offset);
+    return offset;
+  } catch {
+    _tzOffsetCache.set(cacheKey, 0);
+    return 0;
+  }
+}
+
 function toFrappeDateTime(d: Date): string {
   // ISO `YYYY-MM-DDTHH:MM:SS.sssZ` -> `YYYY-MM-DD HH:MM:SS`
   return d.toISOString().slice(0, 19).replace("T", " ");
@@ -143,15 +195,19 @@ function shiftWindowToMs(params: {
   shift_start_date: string;
   start_time: string;
   end_time: string;
+  /** UTC offset of the ERPNext site in minutes (e.g. 180 for EAT/UTC+3). Default 0. */
+  tzOffsetMinutes?: number;
 }): { startMs: number; endMs: number } | null {
-  const { shift_start_date, start_time, end_time } = params;
+  const { shift_start_date, start_time, end_time, tzOffsetMinutes = 0 } = params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(shift_start_date ?? ""))) return null;
   const startT = parseTimeHHMMSS(start_time);
   const endT = parseTimeHHMMSS(end_time);
   if (!startT || !endT) return null;
 
-  const base = new Date(shift_start_date + "T00:00:00.000Z");
-  const baseMs = base.getTime();
+  // Anchor to LOCAL midnight: UTC midnight of the date string minus the tz offset.
+  // e.g. for EAT (UTC+3): local midnight = UTC 21:00 previous day.
+  const utcMidnightMs = new Date(shift_start_date + "T00:00:00.000Z").getTime();
+  const baseMs = utcMidnightMs - tzOffsetMinutes * 60_000;
   const startSeconds = timeToSeconds(startT);
   const endSeconds = timeToSeconds(endT);
   const startMs = baseMs + startSeconds * 1000;
@@ -1366,9 +1422,10 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   }> {
     const { ctx, employeeId, at, strictWindow = false } = params;
     const atMs = at.getTime();
-    const ddNow = toFrappeDate(at);
+    const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+    const ddNow = toLocalDate(at, tzOff);
     // Look back 2 days to catch overnight shifts whose start_date is yesterday.
-    const ddPrev = toFrappeDate(new Date(atMs - 24 * 3600 * 1000));
+    const ddPrev = toLocalDate(new Date(atMs - 24 * 3600 * 1000), tzOff);
 
     // Fetch all assignments that started on or before today.
     // We intentionally do NOT filter by end_date here because ERPNext cannot
@@ -1440,6 +1497,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           shift_start_date: calDay,
           start_time: timings.start_time,
           end_time: timings.end_time,
+          tzOffsetMinutes: tzOff,
         });
         if (!win) continue;
         if (atMs >= win.startMs && atMs <= win.endMs) {
@@ -1474,6 +1532,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           shift_start_date: ddNow,
           start_time: timings.start_time,
           end_time: timings.end_time,
+          tzOffsetMinutes: tzOff,
         });
         if (!win) continue;
         // strictWindow: don't allow clock-in after the shift window has ended
@@ -1627,8 +1686,9 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     // (e.g. April 7); the attendance date must be the actual day worked (e.g. April 14).
     // For overnight shifts (e.g. 22:00–06:00) where clock-in is in the early hours,
     // the shift started the previous calendar day — try both.
-    const fromDateStr = toFrappeDate(from);
-    const fromDatePrevStr = toFrappeDate(new Date(fromMs - 24 * 3600 * 1000));
+    const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+    const fromDateStr = toLocalDate(from, tzOff);
+    const fromDatePrevStr = toLocalDate(new Date(fromMs - 24 * 3600 * 1000), tzOff);
     let shiftCalendarDay = fromDateStr;
     let win: ReturnType<typeof shiftWindowToMs> = null;
     let shiftTypeName = "";
@@ -1643,12 +1703,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         shift_start_date: fromDateStr,
         start_time: String(shiftTypeDoc?.start_time ?? ""),
         end_time: String(shiftTypeDoc?.end_time ?? ""),
+        tzOffsetMinutes: tzOff,
       });
       if (!win || fromMs < win.startMs) {
         const winPrev = shiftWindowToMs({
           shift_start_date: fromDatePrevStr,
           start_time: String(shiftTypeDoc?.start_time ?? ""),
           end_time: String(shiftTypeDoc?.end_time ?? ""),
+          tzOffsetMinutes: tzOff,
         });
         if (winPrev && fromMs >= winPrev.startMs) {
           shiftCalendarDay = fromDatePrevStr;

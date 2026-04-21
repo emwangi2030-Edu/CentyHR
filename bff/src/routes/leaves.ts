@@ -245,6 +245,77 @@ const PATCH_WHITELIST = new Set([
   "description",
 ]);
 
+/**
+ * Ensures a permissive ERPNext Leave Allocation exists so ERPNext's allocation
+ * period validation never blocks Pay Hub leave applications.
+ * Pay Hub is the authoritative balance owner; this is bookkeeping only.
+ */
+async function ensureErpLeaveType(
+  creds: { apiKey: string; apiSecret: string },
+  leaveTypeName: string,
+): Promise<void> {
+  try {
+    await erp.getDoc(creds, "Leave Type", leaveTypeName);
+    // Exists — nothing to do.
+  } catch {
+    // Doesn't exist — create a minimal Leave Type document.
+    try {
+      await erp.createDoc(creds, "Leave Type", {
+        doctype: "Leave Type",
+        leave_type_name: leaveTypeName,
+        max_leaves_allowed: 0,
+        allow_negative: 0,
+        is_lwp: 0,
+      });
+      console.log(`[ensureErpLeaveType] created "${leaveTypeName}" in ERPNext`);
+    } catch (err: any) {
+      console.warn(`[ensureErpLeaveType] could not create "${leaveTypeName}":`, err?.message ?? err);
+    }
+  }
+}
+
+async function ensureErpLeaveAllocation(
+  creds: { apiKey: string; apiSecret: string },
+  params: { employee: string; leave_type: string; from_date: string; company: string; applicationDate: string },
+): Promise<void> {
+  try {
+    // Only count submitted (docstatus=1) allocations — drafts are not active in ERPNext.
+    const existing = await erp.getList(creds, "Leave Allocation", {
+      filters: [
+        ["employee", "=", params.employee],
+        ["leave_type", "=", params.leave_type],
+        ["docstatus", "=", 1],
+        ["from_date", "<=", params.applicationDate],
+        ["to_date", ">=", params.applicationDate],
+      ],
+      fields: ["name"],
+      limit_page_length: 1,
+    });
+    if (existing.length > 0) return;
+
+    // Create a year-spanning allocation covering the application date.
+    // Using Jan 1 → Dec 31 of the application's year avoids fiscal-year boundary rejections.
+    const appYear = params.applicationDate.slice(0, 4);
+    const alloc = await erp.createDoc(creds, "Leave Allocation", {
+      doctype: "Leave Allocation",
+      employee: params.employee,
+      leave_type: params.leave_type,
+      from_date: `${appYear}-01-01`,
+      to_date: `${appYear}-12-31`,
+      new_leaves_allocated: 9999,
+      company: params.company,
+      carry_forward: 0,
+    });
+    // Submit so ERPNext considers it active.
+    await erp.callMethod(creds, "frappe.client.submit", {
+      doc: { doctype: "Leave Allocation", name: String(alloc.name) },
+    });
+  } catch {
+    // Non-fatal: log so issues are visible in BFF logs.
+    console.warn("[ensureErpLeaveAllocation] failed for", params.employee, params.leave_type);
+  }
+}
+
 export const leaveRoutes: FastifyPluginAsync = async (app) => {
   app.get("/v1/meta/leave-types", async (req, reply) => {
     let ctx: HrContext;
@@ -521,6 +592,20 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const description = typeof body.description === "string" ? body.description : "";
       const empFull = await erp.getDoc(ctx.creds, "Employee", employee);
       const leaveApprover = empFull.leave_approver != null ? String(empFull.leave_approver) : "";
+
+      // Ensure the Leave Type document exists in ERPNext before creating the allocation.
+      await ensureErpLeaveType(ctx.creds, leaveType);
+
+      // Ensure an ERPNext Leave Allocation exists so ERPNext's validation never blocks.
+      // Pay Hub owns the actual balance rules; this allocation is intentionally permissive.
+      await ensureErpLeaveAllocation(ctx.creds, {
+        employee,
+        leave_type: leaveType,
+        from_date: String(empFull.date_of_joining ?? "2020-01-01").slice(0, 10),
+        company: ctx.company,
+        applicationDate: fromDate,
+      });
+
       const doc: Record<string, unknown> = {
         doctype: "Leave Application",
         company: ctx.company,
@@ -537,7 +622,16 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const created = await erp.createDoc(ctx.creds, "Leave Application", doc);
       return { data: { ...created, ui_status: leaveUiStatus(created) } };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
+      if (e instanceof ErpError) {
+        const msg = e.message ?? "";
+        if (/not a valid leave type/i.test(msg)) {
+          const lt = doc?.leave_type ?? leaveType;
+          return reply.status(422).send({
+            error: `Leave type "${lt}" has not been created in ERPNext yet. Go to Settings → Leave Policy → ERP Leave Type Mappings and set this type to one that already exists in your ERPNext (e.g. "Sick Leave"), or ask your ERPNext admin to create a "${lt}" Leave Type there.`,
+          });
+        }
+        return replyErp(reply, e);
+      }
       throw e;
     }
   });

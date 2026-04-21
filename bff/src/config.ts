@@ -57,8 +57,8 @@ export const LEAVE_MANAGER_APPROVE_MAX_DAYS: number | null = (() => {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 })();
 
-/** When `1`, leave uses a custom Check field for the first approver, then HR finalises `status`. See docs/ERP_TWO_STAGE_CUSTOM_FIELDS.md */
-export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL === "1";
+/** Two-stage leave approval: line manager first, then HR finalises. Enabled by default; set to "0" to disable. */
+export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL !== "0";
 
 /** Custom field on Leave Application (Allow on Submit = Yes). */
 export const LEAVE_FIRST_APPROVER_FIELD =
