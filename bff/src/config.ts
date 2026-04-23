@@ -9,6 +9,9 @@ function req(name: string, fallback?: string): string {
 /** Public base of the Frappe site, e.g. https://erp.tarakilishicloud.com */
 export const ERP_BASE_URL = req("ERP_BASE_URL").replace(/\/+$/, "");
 
+/** Base URL of the Pay Hub server for internal service calls (e.g. compulsory leave checks). */
+export const PAY_HUB_INTERNAL_URL = (process.env.PAY_HUB_INTERNAL_URL ?? "http://localhost:5002").replace(/\/+$/, "");
+
 /** Optional: set if your reverse proxy expects `X-Frappe-Site-Name` (usually unnecessary when Host matches the site). */
 export const ERP_SITE_NAME = process.env.ERP_SITE_NAME ?? "";
 

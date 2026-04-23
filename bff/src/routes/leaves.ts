@@ -84,7 +84,19 @@ async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
       limit_page_length: 1,
     });
     const empName = asRecord(mine.data?.[0])?.name;
-    if (typeof empName === "string" && empName) return empName;
+    if (typeof empName === "string" && empName) {
+      // Keep employeeUserLinks in Pay Hub current so the login-block check is always reliable.
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        fetch(`${internalUrl.replace(/\/+$/, "")}/api/internal/employee-link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+          body: JSON.stringify({ user_email: ctx.userEmail, erp_employee_id: empName }),
+        }).catch(() => { /* non-fatal */ });
+      }
+      return empName;
+    }
   }
   return null;
 }

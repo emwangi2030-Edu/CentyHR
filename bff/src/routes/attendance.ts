@@ -17,6 +17,7 @@ import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
 import { parseFrappeErrorBody, publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
+import * as config from "../config.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -66,7 +67,19 @@ async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
       limit_page_length: 1,
     });
     const empName = asRecord(mine.data?.[0])?.name;
-    if (typeof empName === "string" && empName) return empName;
+    if (typeof empName === "string" && empName) {
+      // Keep employeeUserLinks in Pay Hub current so the login-block check is always reliable.
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        fetch(`${internalUrl.replace(/\/+$/, "")}/api/internal/employee-link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+          body: JSON.stringify({ user_email: ctx.userEmail, erp_employee_id: empName }),
+        }).catch(() => { /* non-fatal */ });
+      }
+      return empName;
+    }
   }
   return null;
 }
@@ -877,6 +890,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             "employee_name",
             "attendance_date",
             "status",
+            "leave_type",
             "shift",
             "in_time",
             "out_time",
@@ -1027,14 +1041,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           const tsDateMap = new Map<string, string>();
           for (const ts of timesheets) tsDateMap.set(String(ts.name), String(ts.start_date ?? "").slice(0, 10));
 
-          const otDetails = (await erp.getList(ctx.creds, "Timesheet Detail", {
-            fields: ["parent", "hours"],
-            filters: [["parent", "IN", tsNames], ["activity_type", "=", "Overtime"]],
+          const allDetails = (await erp.getList(ctx.creds, "Timesheet Detail", {
+            fields: ["parent", "hours", "activity_type"],
+            filters: [["parent", "IN", tsNames]],
             limit_page_length: 5000,
           })) as any[];
 
           const dateOtMap = new Map<string, number>();
-          for (const d of otDetails) {
+          for (const d of allDetails) {
+            if (!isActivityOvertimeLabel(String(d.activity_type ?? ""))) continue;
             const date = tsDateMap.get(String(d.parent ?? "")) ?? "";
             if (date) dateOtMap.set(date, (dateOtMap.get(date) ?? 0) + Number(d.hours ?? 0));
           }
@@ -1047,6 +1062,79 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         }
       } catch {
         // best-effort — don't fail the daily view if overtime query fails
+      }
+
+      // Derive regular_hours = total working_hours minus overtime for each row.
+      for (const row of merged) {
+        const total = Number((row as any).working_hours ?? 0);
+        const ot = Number((row as any).overtime_hours ?? 0);
+        (row as any).regular_hours = Number(Math.max(0, total - ot).toFixed(2));
+      }
+
+      // Enrich "Absent" rows with leave type from ERPNext Leave Applications.
+      try {
+        const absentDates = merged
+          .filter((r) => String((r as any).status ?? "").toLowerCase() === "absent" && !(r as any).leave_type)
+          .map((r) => String((r as any).attendance_date ?? "").slice(0, 10))
+          .filter(Boolean);
+        if (absentDates.length) {
+          const leaveApps = (await erp.getList(ctx.creds, "Leave Application", {
+            fields: ["from_date", "to_date", "leave_type", "status"],
+            filters: [
+              ["employee", "=", employeeId],
+              ["docstatus", "=", 1],
+              ...(from ? [["to_date", ">=", from] as [string, string, string]] : []),
+              ...(to ? [["from_date", "<=", to] as [string, string, string]] : []),
+            ],
+            limit_page_length: 200,
+          })) as any[];
+          for (const row of merged) {
+            if (String((row as any).status ?? "").toLowerCase() !== "absent") continue;
+            if ((row as any).leave_type) continue;
+            const d = String((row as any).attendance_date ?? "").slice(0, 10);
+            const app = leaveApps.find(
+              (la) => String(la.from_date ?? "").slice(0, 10) <= d && String(la.to_date ?? "").slice(0, 10) >= d,
+            );
+            if (app) {
+              (row as any).leave_type = app.leave_type;
+              (row as any).status = "On Leave";
+            }
+          }
+        }
+      } catch {
+        // best-effort — don't fail if leave application query fails
+      }
+
+      // Overlay compulsory leave status from Pay Hub for any date in range.
+      try {
+        const secret = (config.HR_BRIDGE_SECRET || "").trim();
+        const internalUrl = config.PAY_HUB_INTERNAL_URL;
+        if (secret && internalUrl && from && to) {
+          const compRes = await fetch(
+            `${internalUrl}/api/internal/compulsory-leave/range?employee=${encodeURIComponent(employeeId)}&from=${from}&to=${to}`,
+            { headers: { Authorization: `Bearer ${secret}` } },
+          );
+          if (compRes.ok) {
+            const j = (await compRes.json()) as { data?: { startDate: string; endDate: string; reason?: string }[] };
+            const compLeaves = j.data ?? [];
+            if (compLeaves.length) {
+              for (const row of merged) {
+                const d = String((row as any).attendance_date ?? "").slice(0, 10);
+                const onComp = compLeaves.some(
+                  (c) => c.startDate <= d && c.endDate >= d,
+                );
+                if (onComp) {
+                  (row as any).status = "On Leave";
+                  (row as any).leave_type = "Compulsory Leave";
+                  (row as any).working_hours = 0;
+                  (row as any).regular_hours = 0;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // best-effort — don't fail if compulsory leave check fails
       }
 
       return { data: merged };
@@ -1728,12 +1816,53 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
     const time_logs: Record<string, unknown>[] = [];
 
+    // Check if the employee has an approved half-day leave for this shift day.
+    // If so, the overtime threshold is halved (e.g. 8h shift → 4h regular, then overtime).
+    let isHalfDayLeave = false;
+    try {
+      const attRows = (await erp.getList(ctx.creds, "Attendance", {
+        fields: ["status"],
+        filters: [
+          ["employee", "=", employeeId],
+          ["attendance_date", "=", shiftCalendarDay],
+          ["docstatus", "!=", 2],
+        ],
+        limit_page_length: 1,
+      })) as any[];
+      if (attRows.length && String(attRows[0].status ?? "") === "Half Day") {
+        isHalfDayLeave = true;
+      }
+    } catch {
+      // best-effort — if we can't check, treat as a full shift
+    }
+
+    let halfDayExceeded = false;
+    let halfDayThresholdH = 0;
+
     if (win) {
-      const regularStartMs = Math.max(fromMs, win.startMs);
-      const regularEndMs = Math.min(toMs, win.endMs);
-      const regularMs = Math.max(0, regularEndMs - regularStartMs);
-      // Overtime is only recorded when the employee stays past the end of their shift.
-      const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
+      const fullShiftDurationMs = win.endMs - win.startMs;
+      const totalWorkedMs = Math.max(0, toMs - fromMs);
+
+      let regularMs: number;
+      let overtimeLateMs: number;
+
+      if (isHalfDayLeave) {
+        // On half-day leave: no overtime is recorded regardless of hours worked.
+        // All time is treated as regular (unbillable beyond the half-shift threshold).
+        const halfDurationMs = fullShiftDurationMs * 0.5;
+        regularMs = totalWorkedMs;
+        overtimeLateMs = 0;
+        if (totalWorkedMs > halfDurationMs) {
+          halfDayExceeded = true;
+          halfDayThresholdH = halfDurationMs / 3600000;
+        }
+      } else {
+        // Overtime starts only after working the full shift duration from clock-in.
+        regularMs = Math.min(totalWorkedMs, fullShiftDurationMs);
+        overtimeLateMs = Math.max(0, totalWorkedMs - fullShiftDurationMs);
+      }
+
+      const regularEndMs = fromMs + regularMs;
 
       const regularActivity =
         shiftTypeName.toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
@@ -1747,7 +1876,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (regularMs > 0 && regularActivity) {
         time_logs.push({
           activity_type: regularActivity,
-          from_time: toFrappeDateTime(new Date(regularStartMs)),
+          from_time: toFrappeDateTime(new Date(fromMs)),
           to_time: toFrappeDateTime(new Date(regularEndMs)),
           hours: Number((regularMs / 3600000).toFixed(2)),
           is_billable: 0,
@@ -1756,7 +1885,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (overtimeLateMs > 0) {
         time_logs.push({
           activity_type: activityMap.overtime,
-          from_time: toFrappeDateTime(new Date(win.endMs)),
+          from_time: toFrappeDateTime(new Date(regularEndMs)),
           to_time: toFrappeDateTime(new Date(toMs)),
           hours: Number((overtimeLateMs / 3600000).toFixed(2)),
           is_billable: 0,
@@ -1808,6 +1937,13 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
     const totalHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
     const warnings: string[] = [];
+
+    if (halfDayExceeded) {
+      warnings.push(
+        `You are on half-day leave and are only required to work ${halfDayThresholdH.toFixed(1)}h today. ` +
+        `Any hours worked beyond this are unbillable and will not be counted as overtime.`
+      );
+    }
 
     // Update the Attendance record's in_time, out_time, and working_hours.
     // ERPNext auto-attendance may have already submitted the record (docstatus=1),
@@ -2087,6 +2223,33 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
     if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
 
+    // Check for active compulsory leave before allowing clock-in.
+    try {
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        const checkRes = await fetch(
+          `${internalUrl}/api/internal/compulsory-leave/active?employee=${encodeURIComponent(employeeId)}&date=${todayStr}`,
+          { headers: { Authorization: `Bearer ${secret}` } },
+        );
+        if (checkRes.ok) {
+          const j = (await checkRes.json()) as { active?: boolean; data?: { reason?: string }[] };
+          if (j.active) {
+            const reason = j.data?.[0]?.reason;
+            return reply.status(403).send({
+              error: reason
+                ? `You are on compulsory leave: ${reason}. Clock-in is not permitted during this period.`
+                : "You are on compulsory leave. Clock-in is not permitted during this period.",
+              code: "HR_COMPULSORY_LEAVE",
+            });
+          }
+        }
+      }
+    } catch {
+      // best-effort — do not block clock-in if the check fails
+    }
+
     try {
       const now = new Date();
       let active: Awaited<ReturnType<typeof resolveActiveShiftForTimestamp>>;
@@ -2147,6 +2310,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       return {
         data: {
           from_time: toFrappeDateTime(now),
+          from_time_utc: now.toISOString(), // explicit UTC — client should prefer this
           attendance: attendanceName,
           attendance_date: active.shift_start_date,
           shift_assignment: active.shift_assignment_name,
@@ -3126,6 +3290,55 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
+    }
+  });
+
+  /**
+   * POST /api/internal/force-clock-out
+   * Called by Pay Hub when compulsory leave is issued for an employee currently clocked in.
+   * Creates an OUT Employee Checkin at the same time as the open IN checkin (zeroing worked hours).
+   * Auth: Bearer <HR_BRIDGE_SECRET>
+   */
+  app.post("/api/internal/force-clock-out", async (req, reply) => {
+    const secret = (config.HR_BRIDGE_SECRET || "").trim();
+    const auth = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+    if (!secret || auth !== secret) return reply.status(401).send({ error: "Unauthorized" });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const employeeId = String(body.employee_erp_id ?? "").trim();
+    if (!employeeId) return reply.status(400).send({ error: "employee_erp_id is required" });
+
+    if (!config.ERP_API_KEY || !config.ERP_API_SECRET) {
+      return reply.status(500).send({ error: "ERP credentials not configured" });
+    }
+    const creds = { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET };
+
+    try {
+      // Find the most recent Employee Checkin for this employee.
+      const recent = (await erp.getList(creds, "Employee Checkin", {
+        fields: ["name", "log_type", "time"],
+        filters: [["employee", "=", employeeId]],
+        order_by: "time desc",
+        limit_page_length: 1,
+      })) as any[];
+
+      if (!recent.length || String(recent[0].log_type ?? "").toUpperCase() !== "IN") {
+        return reply.send({ data: { clocked_out: false, reason: "not_clocked_in" } });
+      }
+
+      // Create an OUT checkin at the same timestamp as the IN to zero out working hours.
+      const inTime = String(recent[0].time ?? "").trim();
+      await erp.createDoc(creds, "Employee Checkin", {
+        employee: employeeId,
+        log_type: "OUT",
+        time: inTime || toFrappeDateTime(new Date()),
+      });
+
+      return reply.send({ data: { clocked_out: true } });
+    } catch (e) {
+      // Non-fatal — compulsory leave was already saved; just report the failure.
+      const msg = e instanceof ErpError ? String((e as any).message ?? e) : String(e);
+      return reply.status(500).send({ error: msg.slice(0, 300) });
     }
   });
 };
