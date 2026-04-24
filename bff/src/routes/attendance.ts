@@ -1012,8 +1012,10 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         return db.localeCompare(da);
       });
 
-      // Augment each row with overtime_hours by querying Timesheet Detail records
-      // (activity_type = "Overtime") for this employee in the date range.
+      // Augment each row with overtime_hours. Fetch full timesheet documents (same
+      // approach as the time-logs route) so we read time_logs from the doc body
+      // rather than querying Timesheet Detail directly (which requires child-table
+      // read permissions and can silently return empty on some Frappe installs).
       try {
         const tsFilters: unknown[] = [
           ["employee", "=", employeeId],
@@ -1037,21 +1039,22 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         })) as any[];
 
         if (timesheets.length) {
-          const tsNames = timesheets.map((t) => String(t.name));
-          const tsDateMap = new Map<string, string>();
-          for (const ts of timesheets) tsDateMap.set(String(ts.name), String(ts.start_date ?? "").slice(0, 10));
-
-          const allDetails = (await erp.getList(ctx.creds, "Timesheet Detail", {
-            fields: ["parent", "hours", "activity_type"],
-            filters: [["parent", "IN", tsNames]],
-            limit_page_length: 5000,
-          })) as any[];
+          // Fetch full documents in parallel so we can read the time_logs child table.
+          const docs = await Promise.all(
+            timesheets.map((t) => erp.getDoc(ctx.creds, "Timesheet", String(t.name)).catch(() => null))
+          );
 
           const dateOtMap = new Map<string, number>();
-          for (const d of allDetails) {
-            if (!isActivityOvertimeLabel(String(d.activity_type ?? ""))) continue;
-            const date = tsDateMap.get(String(d.parent ?? "")) ?? "";
-            if (date) dateOtMap.set(date, (dateOtMap.get(date) ?? 0) + Number(d.hours ?? 0));
+          for (let i = 0; i < timesheets.length; i++) {
+            const doc = docs[i];
+            if (!doc) continue;
+            const date = String(timesheets[i].start_date ?? "").slice(0, 10);
+            if (!date) continue;
+            const logs = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as any[]) : [];
+            const ot = logs
+              .filter((l) => isActivityOvertimeLabel(String(l?.activity_type ?? "")))
+              .reduce((acc, l) => acc + Number(l?.hours ?? 0), 0);
+            if (ot > 0) dateOtMap.set(date, (dateOtMap.get(date) ?? 0) + ot);
           }
 
           for (const row of merged) {
