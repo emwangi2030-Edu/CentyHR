@@ -13,3 +13,9 @@ doc_events = {
         "validate": "centy_company_guard.events.expense_claim.validate",
     },
 }
+
+scheduler_events = {
+    "daily": [
+        "centy_company_guard.holidays.annual_sync_all_countries",
+    ],
+}
