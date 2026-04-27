@@ -12,8 +12,85 @@ import * as config from "../config.js";
 import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
 import { leaveManagerBlockedByDayCeiling, leaveManagerDayCeilingMessage } from "../lib/leaveManagerApprovePolicy.js";
 import { attachCentyTwoStageLeaveRow, isFirstApproverFlagSet } from "../lib/twoStageCustomFields.js";
+import { readFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const erp = defaultClient();
+
+// ---------------------------------------------------------------------------
+// Shift-aware leave day calculation
+// ---------------------------------------------------------------------------
+const _leavesDir = dirname(fileURLToPath(import.meta.url));
+const _dowStorePath = join(_leavesDir, "..", ".shift-assignment-days.json");
+
+function readDowMap(): Map<string, string> {
+  try {
+    if (existsSync(_dowStorePath)) {
+      return new Map(Object.entries(JSON.parse(readFileSync(_dowStorePath, "utf8")) as Record<string, string>));
+    }
+  } catch { }
+  return new Map();
+}
+
+/**
+ * Counts leave days that fall on the employee's scheduled working days.
+ *
+ * Only dates covered by an active Shift Assignment AND within the assignment's
+ * days-of-week restriction are counted. Returns null when no shift assignments
+ * exist in the period, signalling the caller to fall back to ERPNext's native
+ * total_leave_days value.
+ */
+async function countScheduledLeaveDays(
+  creds: { apiKey: string; apiSecret: string },
+  company: string,
+  employee: string,
+  fromDate: string,
+  toDate: string,
+  halfDay: 0 | 1,
+): Promise<number | null> {
+  if (halfDay) return 0.5;
+
+  const assignments = (await erp.getList(creds, "Shift Assignment", {
+    fields: ["name", "start_date", "end_date"],
+    filters: [
+      ["company", "=", company],
+      ["employee", "=", employee],
+      ["docstatus", "!=", 2],
+      ["start_date", "<=", toDate],
+    ],
+    limit_page_length: 200,
+  })) as { name: string; start_date: string; end_date: string | null }[];
+
+  const overlapping = assignments.filter((sa) => {
+    const saEnd = String(sa.end_date ?? "").slice(0, 10);
+    const effectiveEnd = saEnd && /^\d{4}-\d{2}-\d{2}$/.test(saEnd) ? saEnd : "9999-12-31";
+    return effectiveEnd >= fromDate;
+  });
+
+  if (overlapping.length === 0) return null; // no shift context — let ERPNext decide
+
+  const dowMap = readDowMap();
+  const DOW_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+  let count = 0;
+
+  const end = new Date(toDate + "T00:00:00Z");
+  for (let d = new Date(fromDate + "T00:00:00Z"); d <= end; d = new Date(d.getTime() + 86_400_000)) {
+    const ds = d.toISOString().slice(0, 10);
+    const activeSa = overlapping.find((sa) => {
+      const saStart = String(sa.start_date ?? "").slice(0, 10);
+      const saEnd = String(sa.end_date ?? "").slice(0, 10);
+      const effectiveEnd = saEnd && /^\d{4}-\d{2}-\d{2}$/.test(saEnd) ? saEnd : "9999-12-31";
+      return saStart <= ds && effectiveEnd >= ds;
+    });
+    if (!activeSa) continue; // no shift on this date = not a working day
+    const dowStr = dowMap.get(String(activeSa.name ?? "")) ?? "";
+    if (!dowStr) { count++; continue; } // no DOW restriction = all days work
+    if (dowStr.split(",").map((s) => s.trim()).includes(DOW_NAMES[d.getUTCDay()])) count++;
+  }
+
+  return count;
+}
 
 type GateOk = { ok: true };
 type GateFail = { ok: false; status: number; error: string };
@@ -618,6 +695,12 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         applicationDate: fromDate,
       });
 
+      // Calculate leave days based on the employee's shift schedule.
+      // Days outside their assigned shift days-of-week are not counted.
+      const scheduledDays = await countScheduledLeaveDays(
+        ctx.creds, ctx.company, employee, fromDate, toDate, halfDay as 0 | 1,
+      );
+
       const doc: Record<string, unknown> = {
         doctype: "Leave Application",
         company: ctx.company,
@@ -630,9 +713,31 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         description,
         posting_date: postingDate,
         ...(leaveApprover ? { leave_approver: leaveApprover } : {}),
+        ...(scheduledDays !== null ? { total_leave_days: scheduledDays } : {}),
       };
       const created = await erp.createDoc(ctx.creds, "Leave Application", doc);
-      return { data: { ...created, ui_status: leaveUiStatus(created) } };
+
+      // ERPNext's validate hook may have recalculated total_leave_days.
+      // If so, push our shift-aware count back onto the draft doc.
+      const erpDays = Number((created as any).total_leave_days ?? 0);
+      if (scheduledDays !== null && erpDays !== scheduledDays) {
+        try {
+          await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+            doctype: "Leave Application",
+            name: (created as any).name,
+            fieldname: "total_leave_days",
+            value: scheduledDays,
+          });
+        } catch { /* non-fatal — response still carries the correct count */ }
+      }
+
+      return {
+        data: {
+          ...created,
+          total_leave_days: scheduledDays ?? erpDays,
+          ui_status: leaveUiStatus(created),
+        },
+      };
     } catch (e) {
       if (e instanceof ErpError) {
         const msg = e.message ?? "";
@@ -678,6 +783,31 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(400).send({ error: "No editable fields supplied" });
       }
       const updated = await erp.updateDoc(ctx.creds, "Leave Application", name, patch);
+
+      // Recalculate shift-aware leave days if any date-related field changed.
+      const dateFieldChanged = "from_date" in patch || "to_date" in patch || "half_day" in patch;
+      if (dateFieldChanged) {
+        const newFrom = String(patch.from_date ?? cur.from_date ?? "").slice(0, 10);
+        const newTo = String(patch.to_date ?? cur.to_date ?? "").slice(0, 10);
+        const newHalf = ("half_day" in patch ? Number(patch.half_day) : Number(cur.half_day ?? 0)) as 0 | 1;
+        const emp = String(cur.employee ?? "");
+        if (newFrom && newTo && emp) {
+          try {
+            const scheduledDays = await countScheduledLeaveDays(
+              ctx.creds, ctx.company, emp, newFrom, newTo, newHalf,
+            );
+            if (scheduledDays !== null) {
+              try {
+                await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+                  doctype: "Leave Application", name, fieldname: "total_leave_days", value: scheduledDays,
+                });
+              } catch { /* non-fatal */ }
+              return { data: { ...updated, total_leave_days: scheduledDays, ui_status: leaveUiStatus(updated) } };
+            }
+          } catch { /* non-fatal — return updated as-is */ }
+        }
+      }
+
       return { data: { ...updated, ui_status: leaveUiStatus(updated) } };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);

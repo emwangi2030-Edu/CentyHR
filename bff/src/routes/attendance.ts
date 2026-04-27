@@ -46,6 +46,90 @@ function dowSet(name: string, value: string): void {
   } catch { }
 }
 
+type DayOverride = { start_time: string; end_time: string };
+type HolidaySettings = {
+  work_on_holidays: boolean;
+  holiday_shift_override: { start_time: string; end_time: string } | null;
+};
+const DAY_OVERRIDES_STORE_PATH = join(_dowDirname, "..", ".shift-day-overrides.json");
+const _dayOverridesStore: Map<string, Record<string, DayOverride>> = (() => {
+  try {
+    if (existsSync(DAY_OVERRIDES_STORE_PATH)) {
+      const raw = readFileSync(DAY_OVERRIDES_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, Record<string, DayOverride>>));
+    }
+  } catch { }
+  return new Map();
+})();
+function overridesGet(name: string): Record<string, DayOverride> { return _dayOverridesStore.get(name) ?? {}; }
+function overridesSet(name: string, overrides: Record<string, DayOverride>): void {
+  if (Object.keys(overrides).length === 0) { _dayOverridesStore.delete(name); }
+  else { _dayOverridesStore.set(name, overrides); }
+  try {
+    const obj: Record<string, Record<string, DayOverride>> = {};
+    _dayOverridesStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(DAY_OVERRIDES_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
+
+const HOLIDAY_SETTINGS_STORE_PATH = join(_dowDirname, "..", ".shift-holiday-settings.json");
+const _holidaySettingsStore: Map<string, HolidaySettings> = (() => {
+  try {
+    if (existsSync(HOLIDAY_SETTINGS_STORE_PATH)) {
+      const raw = readFileSync(HOLIDAY_SETTINGS_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, HolidaySettings>));
+    }
+  } catch { }
+  return new Map();
+})();
+const DEFAULT_HOLIDAY_SETTINGS: HolidaySettings = { work_on_holidays: false, holiday_shift_override: null };
+function holidaySettingsGet(name: string): HolidaySettings { return _holidaySettingsStore.get(name) ?? DEFAULT_HOLIDAY_SETTINGS; }
+function holidaySettingsSet(name: string, settings: HolidaySettings): void {
+  _holidaySettingsStore.set(name, settings);
+  try {
+    const obj: Record<string, HolidaySettings> = {};
+    _holidaySettingsStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(HOLIDAY_SETTINGS_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
+
+/** Cache: company+year → { dates, fetchedAt }. Re-fetches after 1 h. */
+const _holidayDateCache = new Map<string, { dates: Set<string>; fetchedAt: number }>();
+
+async function getEffectiveHolidayDates(
+  creds: { apiKey: string; apiSecret: string },
+  company: string,
+  year: number,
+): Promise<Set<string>> {
+  const key = `${company}|${year}`;
+  const cached = _holidayDateCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < 3_600_000) return cached.dates;
+  try {
+    const companyDoc = await erp.getDoc(creds, "Company", company);
+    const country = String((companyDoc as any).country ?? "").trim();
+    if (!country) { _holidayDateCache.set(key, { dates: new Set(), fetchedAt: Date.now() }); return new Set(); }
+    const listName = `${country} ${year}`;
+    let listDoc: any;
+    try { listDoc = await erp.getDoc(creds, "Holiday List", listName); }
+    catch { _holidayDateCache.set(key, { dates: new Set(), fetchedAt: Date.now() }); return new Set(); }
+    const effective = new Set<string>();
+    const rows: any[] = Array.isArray(listDoc.holidays) ? listDoc.holidays : [];
+    for (const row of rows) {
+      const ds = String(row.holiday_date ?? "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) continue;
+      const d = new Date(ds + "T00:00:00Z");
+      const dow = d.getUTCDay(); // 0=Sun, 6=Sat
+      if (dow === 6) effective.add(new Date(d.getTime() + 2 * 86_400_000).toISOString().slice(0, 10));
+      else if (dow === 0) effective.add(new Date(d.getTime() + 86_400_000).toISOString().slice(0, 10));
+      else effective.add(ds);
+    }
+    _holidayDateCache.set(key, { dates: effective, fetchedAt: Date.now() });
+    return effective;
+  } catch {
+    return new Set();
+  }
+}
+
 const erp = defaultClient();
 
 function replyErp(reply: FastifyReply, e: ErpError): FastifyReply {
@@ -118,6 +202,33 @@ function normalizeTime(v: unknown): string {
   if (/^\d{2}:\d{2}:\d{2}$/.test(s)) return s;
   if (/^\d{2}:\d{2}$/.test(s)) return `${s}:00`;
   return "";
+}
+
+function parseHolidaySettingsFromBody(body: Record<string, unknown>): HolidaySettings {
+  const work_on_holidays = parseBoolish(body.work_on_holidays) ?? false;
+  let holiday_shift_override: { start_time: string; end_time: string } | null = null;
+  const rawOv = body.holiday_shift_override;
+  if (rawOv && typeof rawOv === "object" && !Array.isArray(rawOv)) {
+    const st = normalizeTime((rawOv as Record<string, unknown>).start_time);
+    const et = normalizeTime((rawOv as Record<string, unknown>).end_time);
+    if (st && et) holiday_shift_override = { start_time: st, end_time: et };
+  }
+  return { work_on_holidays, holiday_shift_override };
+}
+
+const VALID_DOW_SET = new Set(["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]);
+function parseDayOverridesFromBody(raw: unknown): Record<string, DayOverride> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: Record<string, DayOverride> = {};
+  for (const [day, times] of Object.entries(raw as Record<string, unknown>)) {
+    const dayLow = String(day ?? "").trim().toLowerCase();
+    if (!VALID_DOW_SET.has(dayLow)) continue;
+    if (!times || typeof times !== "object" || Array.isArray(times)) continue;
+    const st = normalizeTime((times as Record<string, unknown>).start_time);
+    const et = normalizeTime((times as Record<string, unknown>).end_time);
+    if (st && et) result[dayLow] = { start_time: st, end_time: et };
+  }
+  return result;
 }
 
 function parseFrappeDateTime(s: string): Date | null {
@@ -350,6 +461,63 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     throw lastErr;
   }
 
+  async function assignShiftToOneEmployee(
+    ctx: HrContext,
+    employee: string,
+    shift_type: string,
+    start_date: string,
+    end_date: string,
+    daysValue: string,
+    dayOverrides: Record<string, DayOverride> = {},
+    holidaySettings: HolidaySettings = DEFAULT_HOLIDAY_SETTINGS,
+  ): Promise<{ data: unknown; meta: { submitSkipped: boolean } }> {
+    const empDoc = await erp.getDoc(ctx.creds, "Employee", employee);
+    if (String(empDoc.company) !== ctx.company) throw new Error("Employee not in your Company");
+    const dateOfJoining = String(empDoc.date_of_joining ?? "").slice(0, 10);
+    if (dateOfJoining && start_date < dateOfJoining) {
+      throw Object.assign(new Error(`start before joining date (${dateOfJoining})`), { code: "HR_BEFORE_JOINING" });
+    }
+    let resolvedDepartment: string | null = null;
+    const rawDept = String((empDoc as any).department ?? "").trim();
+    if (rawDept) {
+      try {
+        try { await erp.getDoc(ctx.creds, "Department", rawDept); resolvedDepartment = rawDept; } catch { }
+        if (resolvedDepartment === null) {
+          const byName = (await erp.getList(ctx.creds, "Department", {
+            fields: ["name"], filters: [["department_name", "=", rawDept]], limit_page_length: 1,
+          })) as any[];
+          resolvedDepartment = byName.length ? String((byName[0] as any).name ?? "").trim() : null;
+        }
+        const patchDept = resolvedDepartment ?? "";
+        if (rawDept !== patchDept) {
+          try {
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Employee", name: employee, fieldname: "department", value: patchDept,
+            });
+          } catch {
+            try { await erp.updateDoc(ctx.creds, "Employee", employee, { department: patchDept }); } catch { }
+          }
+        }
+      } catch { }
+    }
+    const doc: Record<string, unknown> = {
+      employee, shift_type, start_date,
+      ...(end_date ? { end_date } : {}),
+      ...(resolvedDepartment != null ? { department: resolvedDepartment } : {}),
+    };
+    const created = await erp.createDoc(ctx.creds, "Shift Assignment", doc);
+    const name = parseBodyString((created as Record<string, unknown>)?.name);
+    if (name && daysValue) dowSet(name, daysValue);
+    if (name && Object.keys(dayOverrides).length > 0) overridesSet(name, dayOverrides);
+    if (name) holidaySettingsSet(name, holidaySettings);
+    let submitSkipped = false;
+    if (name) {
+      try { await submitShiftAssignmentWithRetry(ctx.creds, name, 3); }
+      catch { submitSkipped = true; }
+    }
+    return { data: created, meta: { submitSkipped } };
+  }
+
   /**
    * Shift types (read-only metadata).
    * Intended for showing a configuration summary; not all sites expose the same fields.
@@ -554,7 +722,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             return endDate >= from;
           })
         : (rawRows as Record<string, unknown>[]);
-      const rows = filtered.map((r) => ({ ...r, custom_days_of_week: dowGet(String(r.name ?? "")) }));
+      const rows = filtered.map((r) => ({
+        ...r,
+        custom_days_of_week: dowGet(String(r.name ?? "")),
+        day_overrides: overridesGet(String(r.name ?? "")),
+        holiday_settings: holidaySettingsGet(String(r.name ?? "")),
+      }));
       return { data: rows };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -1140,6 +1313,44 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         // best-effort — don't fail if compulsory leave check fails
       }
 
+      // Holiday off-day overlay: mark rows as "Holiday" when the date is an effective
+      // public holiday (with Sat/Sun → Monday substitution) and the active shift
+      // assignment has work_on_holidays = false.
+      try {
+        // Collect years present in the date range to batch holiday fetches.
+        const years = new Set<number>();
+        for (const row of merged) {
+          const yr = parseInt(String((row as any).attendance_date ?? "").slice(0, 4));
+          if (yr > 2000) years.add(yr);
+        }
+        const effectiveByYear = new Map<number, Set<string>>();
+        for (const yr of years) {
+          effectiveByYear.set(yr, await getEffectiveHolidayDates(ctx.creds, ctx.company, yr));
+        }
+        for (const row of merged) {
+          const d = String((row as any).attendance_date ?? "").slice(0, 10);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+          const yr = parseInt(d.slice(0, 4));
+          if (!(effectiveByYear.get(yr) ?? new Set()).has(d)) continue;
+          // Find the shift assignment active on this date.
+          const activeSa = (shiftRows as any[]).find((sa) => {
+            const saStart = String(sa.start_date ?? "").slice(0, 10);
+            const saEndRaw = String(sa.end_date ?? "").slice(0, 10);
+            const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : "9999-12-31";
+            return saStart <= d && saEnd >= d;
+          });
+          if (!activeSa) continue;
+          const hSettings = holidaySettingsGet(String(activeSa.name ?? ""));
+          if (!hSettings.work_on_holidays) {
+            (row as any).status = "Holiday";
+            (row as any).working_hours = 0;
+            (row as any).regular_hours = 0;
+          }
+        }
+      } catch {
+        // best-effort — don't fail if holiday overlay check fails
+      }
+
       return { data: merged };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -1177,6 +1388,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const rawDaysPost = body.days_of_week;
     const daysArrPost = Array.isArray(rawDaysPost) ? rawDaysPost.map(String) : typeof rawDaysPost === "string" ? rawDaysPost.split(",") : [];
     const daysValuePost = daysArrPost.map((d) => d.trim().toLowerCase()).filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+    const dayOverridesPost = parseDayOverridesFromBody(body.day_overrides);
+    const holidaySettingsPost = parseHolidaySettingsFromBody(body);
 
     if (!employee || !shift_type || !start_date) {
       return reply.status(400).send({ error: "employee, shift_type, and start_date are required" });
@@ -1290,6 +1503,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
       const name = parseBodyString((created as Record<string, unknown>)?.name);
       if (name && daysValuePost) dowSet(name, daysValuePost);
+      if (name && Object.keys(dayOverridesPost).length > 0) overridesSet(name, dayOverridesPost);
+      if (name) holidaySettingsSet(name, holidaySettingsPost);
       if (name) {
         try {
           await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
@@ -1396,7 +1611,27 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     // Always save days to local store (even if empty = clear restriction).
     dowSet(name, daysValue);
 
-    return { data: { name, days_of_week: daysValue, start_date, end_date } };
+    // Conditionally update day overrides when the key was present in the body.
+    if ("day_overrides" in body) {
+      overridesSet(name, parseDayOverridesFromBody(body.day_overrides));
+    }
+
+    // Conditionally update holiday settings when relevant keys are present.
+    if ("work_on_holidays" in body || "holiday_shift_override" in body) {
+      const current = holidaySettingsGet(name);
+      holidaySettingsSet(name, parseHolidaySettingsFromBody({ ...current, ...body }));
+    }
+
+    return {
+      data: {
+        name,
+        days_of_week: daysValue,
+        start_date,
+        end_date,
+        day_overrides: overridesGet(name),
+        holiday_settings: holidaySettingsGet(name),
+      },
+    };
   });
 
   /**
@@ -1465,6 +1700,142 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       }
 
       return { data: { unassigned: name } };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * GET /v1/attendance/shift-assignments/:name/day-overrides — fetch per-day time overrides.
+   */
+  app.get("/v1/attendance/shift-assignments/:name/day-overrides", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage day overrides." });
+    const { name } = req.params as { name: string };
+    return { data: overridesGet(name) };
+  });
+
+  /**
+   * PUT /v1/attendance/shift-assignments/:name/day-overrides — replace per-day time overrides.
+   * Body: { day_overrides: { monday?: { start_time, end_time }, saturday?: { ... }, ... } }
+   * Send an empty object or omit days to clear all overrides.
+   */
+  app.put("/v1/attendance/shift-assignments/:name/day-overrides", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage day overrides." });
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const overrides = parseDayOverridesFromBody(body.day_overrides ?? body);
+    overridesSet(name, overrides);
+    return { data: overridesGet(name) };
+  });
+
+  /** GET /v1/attendance/shift-assignments/:name/holiday-settings */
+  app.get("/v1/attendance/shift-assignments/:name/holiday-settings", async (req, reply) => {
+    let ctx: HrContext;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage holiday settings." });
+    const { name } = req.params as { name: string };
+    return { data: holidaySettingsGet(name) };
+  });
+
+  /** PUT /v1/attendance/shift-assignments/:name/holiday-settings
+   * Body: { work_on_holidays: boolean, holiday_shift_override?: { start_time, end_time } | null }
+   */
+  app.put("/v1/attendance/shift-assignments/:name/holiday-settings", async (req, reply) => {
+    let ctx: HrContext;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage holiday settings." });
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    holidaySettingsSet(name, parseHolidaySettingsFromBody(body));
+    return { data: holidaySettingsGet(name) };
+  });
+
+  /**
+   * POST /v1/attendance/shift-assignments/bulk — assign a shift to all employees
+   * or all employees in a specific department in one request.
+   */
+  app.post("/v1/attendance/shift-assignments/bulk", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can create bulk shift assignments." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const shift_type = parseBodyString(body.shift_type);
+    const start_date = parseBodyString(body.start_date);
+    const end_date = parseBodyString(body.end_date);
+    const target = parseBodyString(body.target);
+    const department = parseBodyString(body.department);
+    const rawDays = body.days_of_week;
+    const daysArr = Array.isArray(rawDays) ? rawDays.map(String) : typeof rawDays === "string" ? rawDays.split(",") : [];
+    const daysValue = daysArr.map((d) => d.trim().toLowerCase())
+      .filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+    const dayOverridesBulk = parseDayOverridesFromBody(body.day_overrides);
+    const holidaySettingsBulk = parseHolidaySettingsFromBody(body);
+
+    if (!shift_type || !start_date) return reply.status(400).send({ error: "shift_type and start_date are required" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date)) return reply.status(400).send({ error: "start_date must be YYYY-MM-DD" });
+    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) return reply.status(400).send({ error: "end_date must be YYYY-MM-DD when provided" });
+    if (!["all", "department"].includes(target)) return reply.status(400).send({ error: "target must be 'all' or 'department'" });
+    if (target === "department" && !department) return reply.status(400).send({ error: "department is required when target is 'department'" });
+
+    try {
+      const filters: unknown[] = [["company", "=", ctx.company], ["status", "=", "Active"]];
+      if (target === "department") filters.push(["department", "=", department]);
+
+      const empRows = (await erp.getList(ctx.creds, "Employee", {
+        fields: ["name"],
+        filters,
+        limit_page_length: 5000,
+      })) as { name: string }[];
+
+      if (empRows.length === 0) return { assigned: [], failed: [], skipped: [] };
+
+      const results = await Promise.allSettled(
+        empRows.map((emp) =>
+          assignShiftToOneEmployee(ctx, String(emp.name), shift_type, start_date, end_date, daysValue, dayOverridesBulk, holidaySettingsBulk)
+        )
+      );
+
+      const assigned: string[] = [];
+      const failed: { employee: string; error: string }[] = [];
+
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        const empName = String(empRows[i].name);
+        if (r.status === "fulfilled") {
+          assigned.push(empName);
+        } else {
+          const errMsg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+          failed.push({ employee: empName, error: errMsg });
+        }
+      }
+
+      console.log(`[bulk-shift-assign] shift=${shift_type} target=${target}${department ? ` dept=${department}` : ""} assigned=${assigned.length} failed=${failed.length}`);
+      return { assigned, failed, skipped: [] };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
