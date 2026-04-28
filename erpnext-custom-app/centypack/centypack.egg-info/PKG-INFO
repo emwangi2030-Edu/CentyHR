@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: centypack
+Version: 0.0.1
+Summary: CentyPack packhouse POC for ERPNext v15
+Author: CentyHQ
+Author-email: info@centyhq.com
+License: MIT
+Dynamic: author
+Dynamic: author-email
+Dynamic: license
+Dynamic: summary

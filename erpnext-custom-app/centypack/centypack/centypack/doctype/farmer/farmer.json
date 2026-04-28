@@ -1,0 +1,71 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:farmer_code",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "farmer_code",
+  "farmer_name",
+  "farmer_type",
+  "gender",
+  "date_of_birth",
+  "age_years",
+  "phone",
+  "mpesa_number",
+  "region_county",
+  "farmer_affiliation",
+  "cbo_group_name",
+  "globalgap_number",
+  "globalgap_expiry",
+  "active"
+ ],
+ "fields": [
+  {"fieldname": "farmer_code", "fieldtype": "Data", "in_list_view": 1, "label": "Farmer Code", "reqd": 1, "unique": 1},
+  {"fieldname": "farmer_name", "fieldtype": "Data", "in_list_view": 1, "label": "Name", "reqd": 1},
+  {
+   "fieldname": "farmer_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Farmer Type",
+   "options": "Organization Member (Contract Farmer)\nNon Organization Member (Outsourced)",
+   "reqd": 1
+  },
+  {"fieldname": "gender", "fieldtype": "Select", "label": "Gender", "options": "Male\nFemale\nOther"},
+  {"fieldname": "date_of_birth", "fieldtype": "Date", "label": "Date of Birth"},
+  {"fieldname": "age_years", "fieldtype": "Int", "label": "Age", "read_only": 1},
+  {"fieldname": "phone", "fieldtype": "Data", "label": "Phone"},
+  {"fieldname": "mpesa_number", "fieldtype": "Data", "label": "Mobile Number (MPESA)", "reqd": 1},
+  {"fieldname": "region_county", "fieldtype": "Data", "label": "Region (County)"},
+  {
+   "fieldname": "farmer_affiliation",
+   "fieldtype": "Select",
+   "label": "Affiliation",
+   "options": "CBO Group\nIndependent Farmer",
+   "reqd": 1
+  },
+  {
+   "fieldname": "cbo_group_name",
+   "fieldtype": "Data",
+   "label": "CBO Group",
+   "depends_on": "eval:doc.farmer_affiliation==\"CBO Group\"",
+   "mandatory_depends_on": "eval:doc.farmer_affiliation==\"CBO Group\""
+  },
+  {"fieldname": "globalgap_number", "fieldtype": "Data", "label": "GlobalG.A.P. Number"},
+  {"fieldname": "globalgap_expiry", "fieldtype": "Date", "label": "GlobalG.A.P. Expiry"},
+  {"default": "1", "fieldname": "active", "fieldtype": "Check", "in_list_view": 1, "label": "Active"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "Farmer",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

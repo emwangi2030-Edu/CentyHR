@@ -1,0 +1,137 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:crop_name",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "crop_name",
+  "product_code",
+  "item_code",
+  "default_min_buying_rate",
+  "effective_rate_section",
+  "effective_rate_date",
+  "effective_buying_rate",
+  "effective_rate_source",
+  "pack_rate_per_box",
+  "shelf_life_days",
+  "active"
+ ],
+ "fields": [
+  {
+   "fieldname": "crop_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Product Name",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "product_code",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Product Code",
+   "reqd": 1,
+   "unique": 1,
+   "description": "Short unique code e.g CH, AV, LG, FB, BC, MT, SS"
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Inventory Item",
+   "options": "Item",
+   "description": "Links product to Item used in purchase orders, delivery notes, and inventory."
+  },
+  {
+   "fieldname": "default_min_buying_rate",
+   "fieldtype": "Currency",
+   "label": "Default Minimum Buying Rate",
+   "non_negative": 1,
+   "reqd": 1,
+   "description": "Default floor buying rate per product."
+  },
+  {
+   "fieldname": "pack_rate_per_box",
+   "fieldtype": "Currency",
+   "label": "Pack Rate Per Box",
+   "non_negative": 1,
+   "reqd": 1,
+   "description": "Fixed casual worker pay rate per packed box for this product."
+  },
+  {
+   "fieldname": "shelf_life_days",
+   "fieldtype": "Int",
+   "label": "Shelf Life Days",
+   "non_negative": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "active",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Active"
+  },
+  {
+   "fieldname": "effective_rate_section",
+   "fieldtype": "Section Break",
+   "label": "Effective Buying Rate"
+  },
+  {
+   "fieldname": "effective_rate_date",
+   "fieldtype": "Date",
+   "label": "Rate Date",
+   "default": "Today",
+   "description": "Used to resolve effective buying rate (daily override else default minimum)."
+  },
+  {
+   "fieldname": "effective_buying_rate",
+   "fieldtype": "Currency",
+   "label": "Effective Buying Rate",
+   "read_only": 1,
+   "description": "Resolved buying rate for selected date."
+  },
+  {
+   "fieldname": "effective_rate_source",
+   "fieldtype": "Data",
+   "label": "Rate Source",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "Crop",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Finance Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

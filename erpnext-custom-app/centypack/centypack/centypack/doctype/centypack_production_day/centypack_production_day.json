@@ -1,0 +1,46 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "company",
+  "log_date",
+  "auto_rollup",
+  "kg_graded",
+  "cartons_packed",
+  "gdn_count",
+  "pack_sessions_count",
+  "remarks"
+ ],
+ "fields": [
+  {"fieldname": "company", "fieldtype": "Link", "in_list_view": 1, "label": "Company", "options": "Company", "reqd": 1},
+  {"fieldname": "log_date", "fieldtype": "Date", "in_list_view": 1, "label": "Log Date", "reqd": 1},
+  {
+   "default": "0",
+   "fieldname": "auto_rollup",
+   "fieldtype": "Check",
+   "label": "Auto roll-up from transactions",
+   "description": "When set, totals are recalculated from submitted Grading Runs, GD_ns, and Pack Sessions for this company and date."
+  },
+  {"fieldname": "kg_graded", "fieldtype": "Float", "label": "Kg graded", "non_negative": 1},
+  {"fieldname": "cartons_packed", "fieldtype": "Float", "label": "Cartons packed", "non_negative": 1},
+  {"fieldname": "gdn_count", "fieldtype": "Int", "label": "GDN count", "non_negative": 1},
+  {"fieldname": "pack_sessions_count", "fieldtype": "Int", "label": "Pack sessions", "non_negative": 1},
+  {"fieldname": "remarks", "fieldtype": "Small Text", "label": "Remarks"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "CentyPack Production Day",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
