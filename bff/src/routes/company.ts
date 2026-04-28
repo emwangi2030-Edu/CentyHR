@@ -2,6 +2,12 @@ import type { FastifyPluginAsync } from "fastify";
 import { defaultClient, ErpError } from "../erpnext/client.js";
 import { publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
+import {
+  normalizePerformanceMethodology,
+  readPerformanceMethodology,
+  writePerformanceMethodology,
+  type PerformanceMethodology,
+} from "../lib/companyPerformanceMethodology.js";
 const erp = defaultClient();
 
 function abbrFromCompanyName(name: string): string {
@@ -90,6 +96,69 @@ export const companyRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(status).send(publicErpFailure(lastErr));
     }
     throw lastErr;
+  });
+
+  /**
+   * Set tenant performance methodology (BSC vs OKR) on ERPNext `Company`.
+   * Requires HR admin (`canSubmitOnBehalf`). Custom field must exist — run `bench migrate`
+   * after updating `centy_company_guard`.
+   */
+  app.post("/v1/company/performance-methodology", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "HR admin privileges required" });
+    }
+
+    const raw = (req.body as Record<string, unknown> | undefined)?.methodology;
+    const methodology = normalizePerformanceMethodology(raw) as PerformanceMethodology;
+
+    try {
+      const { companyDocName } = await writePerformanceMethodology(ctx.creds, ctx.company, methodology);
+      return {
+        data: { methodology, company: companyDocName },
+        meta: { updated: true as const },
+      };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        const msg = String(e.message ?? "");
+        const hint =
+          msg.toLowerCase().includes("centy_performance") || msg.toLowerCase().includes("unknown column")
+            ? "Install/update centy_company_guard on the ERP bench and run bench migrate so Company has centy_performance_methodology."
+            : undefined;
+        const status = e.status >= 500 ? 502 : e.status;
+        return reply.status(status).send({
+          error: msg || "Could not update company",
+          ...(hint ? { hint } : {}),
+        });
+      }
+      throw e;
+    }
+  });
+
+  /** Read current methodology (same auth as other HR routes). */
+  app.get("/v1/company/performance-methodology", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const methodology = await readPerformanceMethodology(ctx.creds, ctx.company);
+      return { data: { methodology } };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        return reply.status(e.status >= 500 ? 502 : e.status).send({ error: String(e.message) });
+      }
+      throw e;
+    }
   });
 };
 
