@@ -93,40 +93,43 @@ function holidaySettingsSet(name: string, settings: HolidaySettings): void {
   } catch { }
 }
 
-/** Cache: company+year → { dates, fetchedAt }. Re-fetches after 1 h. */
-const _holidayDateCache = new Map<string, { dates: Set<string>; fetchedAt: number }>();
+/** Cache: company+year → { holidays: Map<date, name>, fetchedAt }. Re-fetches after 1 h. */
+const _holidayDateCache = new Map<string, { holidays: Map<string, string>; fetchedAt: number }>();
 
-async function getEffectiveHolidayDates(
+/** Returns a Map of effective date → holiday name for the given company and year.
+ *  Sat holidays shift to Monday (+2), Sun holidays shift to Monday (+1). */
+async function getEffectiveHolidays(
   creds: { apiKey: string; apiSecret: string },
   company: string,
   year: number,
-): Promise<Set<string>> {
+): Promise<Map<string, string>> {
   const key = `${company}|${year}`;
   const cached = _holidayDateCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < 3_600_000) return cached.dates;
+  if (cached && Date.now() - cached.fetchedAt < 3_600_000) return cached.holidays;
   try {
     const companyDoc = await erp.getDoc(creds, "Company", company);
     const country = String((companyDoc as any).country ?? "").trim();
-    if (!country) { _holidayDateCache.set(key, { dates: new Set(), fetchedAt: Date.now() }); return new Set(); }
+    if (!country) { _holidayDateCache.set(key, { holidays: new Map(), fetchedAt: Date.now() }); return new Map(); }
     const listName = `${country} ${year}`;
     let listDoc: any;
     try { listDoc = await erp.getDoc(creds, "Holiday List", listName); }
-    catch { _holidayDateCache.set(key, { dates: new Set(), fetchedAt: Date.now() }); return new Set(); }
-    const effective = new Set<string>();
+    catch { _holidayDateCache.set(key, { holidays: new Map(), fetchedAt: Date.now() }); return new Map(); }
+    const holidays = new Map<string, string>();
     const rows: any[] = Array.isArray(listDoc.holidays) ? listDoc.holidays : [];
     for (const row of rows) {
       const ds = String(row.holiday_date ?? "").slice(0, 10);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) continue;
+      const name = String(row.description ?? row.holiday_date ?? "Holiday").trim() || "Holiday";
       const d = new Date(ds + "T00:00:00Z");
       const dow = d.getUTCDay(); // 0=Sun, 6=Sat
-      if (dow === 6) effective.add(new Date(d.getTime() + 2 * 86_400_000).toISOString().slice(0, 10));
-      else if (dow === 0) effective.add(new Date(d.getTime() + 86_400_000).toISOString().slice(0, 10));
-      else effective.add(ds);
+      if (dow === 6) holidays.set(new Date(d.getTime() + 2 * 86_400_000).toISOString().slice(0, 10), name);
+      else if (dow === 0) holidays.set(new Date(d.getTime() + 86_400_000).toISOString().slice(0, 10), name);
+      else holidays.set(ds, name);
     }
-    _holidayDateCache.set(key, { dates: effective, fetchedAt: Date.now() });
-    return effective;
+    _holidayDateCache.set(key, { holidays, fetchedAt: Date.now() });
+    return holidays;
   } catch {
-    return new Set();
+    return new Map();
   }
 }
 
@@ -1313,9 +1316,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         // best-effort — don't fail if compulsory leave check fails
       }
 
-      // Holiday off-day overlay: mark rows as "Holiday" when the date is an effective
-      // public holiday (with Sat/Sun → Monday substitution) and the active shift
-      // assignment has work_on_holidays = false.
+      // Holiday off-day overlay: mark rows with the specific holiday name when the date is
+      // an effective public holiday and the active shift assignment has work_on_holidays = false.
       try {
         // Collect years present in the date range to batch holiday fetches.
         const years = new Set<number>();
@@ -1323,15 +1325,16 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           const yr = parseInt(String((row as any).attendance_date ?? "").slice(0, 4));
           if (yr > 2000) years.add(yr);
         }
-        const effectiveByYear = new Map<number, Set<string>>();
+        const holidaysByYear = new Map<number, Map<string, string>>();
         for (const yr of years) {
-          effectiveByYear.set(yr, await getEffectiveHolidayDates(ctx.creds, ctx.company, yr));
+          holidaysByYear.set(yr, await getEffectiveHolidays(ctx.creds, ctx.company, yr));
         }
         for (const row of merged) {
           const d = String((row as any).attendance_date ?? "").slice(0, 10);
           if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
           const yr = parseInt(d.slice(0, 4));
-          if (!(effectiveByYear.get(yr) ?? new Set()).has(d)) continue;
+          const holidayName = (holidaysByYear.get(yr) ?? new Map()).get(d);
+          if (!holidayName) continue;
           // Find the shift assignment active on this date.
           const activeSa = (shiftRows as any[]).find((sa) => {
             const saStart = String(sa.start_date ?? "").slice(0, 10);
@@ -1342,7 +1345,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           if (!activeSa) continue;
           const hSettings = holidaySettingsGet(String(activeSa.name ?? ""));
           if (!hSettings.work_on_holidays) {
-            (row as any).status = "Holiday";
+            (row as any).status = holidayName;
             (row as any).working_hours = 0;
             (row as any).regular_hours = 0;
           }
