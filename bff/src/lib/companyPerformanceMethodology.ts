@@ -13,7 +13,7 @@ export function normalizePerformanceMethodology(raw: unknown): PerformanceMethod
 
 export async function resolveCompanyDocName(creds: ErpCredentials, tokenCompany: string): Promise<string> {
   const t = tokenCompany.trim();
-  if (!t) throw new ErpError(400, "Missing company context");
+  if (!t) throw new ErpError("Missing company context", 400);
 
   try {
     await erp.getDoc(creds, "Company", t);
@@ -28,7 +28,7 @@ export async function resolveCompanyDocName(creds: ErpCredentials, tokenCompany:
     limit_page_length: 1,
   });
   const first = (rows as { name?: string }[])[0];
-  if (!first?.name) throw new ErpError(404, "Company not found for context: " + t);
+  if (!first?.name) throw new ErpError("Company not found for context: " + t, 404);
   return first.name;
 }
 
