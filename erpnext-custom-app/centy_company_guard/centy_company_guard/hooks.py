@@ -17,5 +17,12 @@ doc_events = {
 scheduler_events = {
     "daily": [
         "centy_company_guard.holidays.annual_sync_all_countries",
+after_install = "centy_company_guard.install.after_install"
+
+scheduler_events = {
+    "daily": [
+        "centy_company_guard.holidays.scheduled_sync",
     ],
 }
+
+after_install = centy_company_guard.install.after_install

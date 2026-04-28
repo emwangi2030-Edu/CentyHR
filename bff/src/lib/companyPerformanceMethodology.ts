@@ -1,34 +1,58 @@
-/**
- * Shared helper: resolve the canonical ERPNext Company docname from a
- * display-name / short-name that ctx.company may carry.
- */
-import { defaultClient, ErpCredentials, ErpError } from "../erpnext/client.js";
+import { defaultClient, ErpError } from "../erpnext/client.js";
+import type { ErpCredentials } from "../erpnext/client.js";
 
 const erp = defaultClient();
 
-/**
- * Resolve the canonical ERPNext Company docname from `company`.
- * `company` may be a display name that differs from the ERP docname —
- * we first try a direct getDoc hit, then fall back to a name-field search.
- */
-export async function resolveCompanyDocName(creds: ErpCredentials, company: string): Promise<string> {
-  const raw = String(company ?? "").trim();
-  if (!raw) return raw;
+export const COMPANY_PERFORMANCE_METHODOLOGY_FIELD = "centy_performance_methodology";
+export type PerformanceMethodology = "bsc" | "okr";
+
+export function normalizePerformanceMethodology(raw: unknown): PerformanceMethodology {
+  const s = String(raw ?? "").trim().toLowerCase();
+  return s === "okr" ? "okr" : "bsc";
+}
+
+export async function resolveCompanyDocName(creds: ErpCredentials, tokenCompany: string): Promise<string> {
+  const t = tokenCompany.trim();
+  if (!t) throw new ErpError("Missing company context", 400);
+
   try {
-    await erp.getDoc(creds, "Company", raw);
-    return raw;
-  } catch (e) {
-    if (!(e instanceof ErpError)) throw e;
-  }
-  try {
-    const rows = await erp.getList(creds, "Company", {
-      filters: [["company_name", "=", raw]],
-      fields: ["name"],
-      limit_page_length: 1,
-    });
-    const found = (rows?.[0] as any)?.name;
-    return typeof found === "string" && found.trim() ? found.trim() : raw;
+    await erp.getDoc(creds, "Company", t);
+    return t;
   } catch {
-    return raw;
+    // fallback to lookup by company_name
   }
+
+  const rows = await erp.getList(creds, "Company", {
+    fields: ["name"],
+    filters: [["company_name", "=", t]],
+    limit_page_length: 1,
+  });
+  const first = (rows as { name?: string }[])[0];
+  if (!first?.name) throw new ErpError("Company not found for context: " + t, 404);
+  return first.name;
+}
+
+export async function readPerformanceMethodology(
+  creds: ErpCredentials,
+  tokenCompany: string,
+): Promise<PerformanceMethodology> {
+  const docName = await resolveCompanyDocName(creds, tokenCompany);
+  const doc = await erp.getDoc(creds, "Company", docName);
+  const v = doc[COMPANY_PERFORMANCE_METHODOLOGY_FIELD];
+  return normalizePerformanceMethodology(v);
+}
+
+export async function writePerformanceMethodology(
+  creds: ErpCredentials,
+  tokenCompany: string,
+  methodology: PerformanceMethodology,
+): Promise<{ companyDocName: string; methodology: PerformanceMethodology }> {
+  const docName = await resolveCompanyDocName(creds, tokenCompany);
+  await erp.callMethod(creds, "frappe.client.set_value", {
+    doctype: "Company",
+    name: docName,
+    fieldname: COMPANY_PERFORMANCE_METHODOLOGY_FIELD,
+    value: methodology,
+  });
+  return { companyDocName: docName, methodology };
 }

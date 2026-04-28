@@ -860,7 +860,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         error: "Validation failed",
         fields: fieldErrors,
         // Also expose as flat message for clients that only read .error
-        message: fieldErrors.map((e) => e.message).join("; "),
+        message: fieldErrors.join("; "),
       });
     }
 
@@ -1375,7 +1375,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(422).send({
         error: "Validation failed",
         fields: fieldErrors,
-        message: fieldErrors.map((e) => e.message).join("; "),
+        message: fieldErrors.join("; "),
       });
     }
 
