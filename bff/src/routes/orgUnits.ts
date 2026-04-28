@@ -6,7 +6,7 @@
  * - DELETE /v1/org/options/:kind/:val — delete a unit (errors if employees linked)
  * - PATCH  /v1/org/options/:kind/:val — rename a unit
  */
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import { defaultClient, ErpError } from "../erpnext/client.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 
@@ -22,7 +22,7 @@ const ERP_SPEC: Record<OrgKind, { doctype: string; field: string; companyScoped:
   branch:      { doctype: "Branch",      field: "branch",           companyScoped: false },
 };
 
-function requireHr(ctx: ReturnType<typeof resolveHrContext>, reply: Parameters<Parameters<FastifyPluginAsync>[0]["post"]>[1]): boolean {
+function requireHr(ctx: ReturnType<typeof resolveHrContext>, reply: FastifyReply): boolean {
   if (!ctx.canSubmitOnBehalf) {
     reply.status(403).send({ error: "HR admin privileges required" });
     return false;
@@ -289,7 +289,7 @@ async function ensureOrgUnit(
   ctx: ReturnType<typeof resolveHrContext>,
   kind: OrgKind,
   value: string,
-  reply: Parameters<Parameters<FastifyPluginAsync>[0]["post"]>[1]
+  reply: FastifyReply
 ) {
   const spec = ERP_SPEC[kind];
   try {

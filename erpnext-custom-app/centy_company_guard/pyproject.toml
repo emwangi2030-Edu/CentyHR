@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Enforce Company consistency on Expense Claim (tenant isolation)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "holidays>=0.46",
+]
 
 [build-system]
 requires = ["setuptools>=61"]
