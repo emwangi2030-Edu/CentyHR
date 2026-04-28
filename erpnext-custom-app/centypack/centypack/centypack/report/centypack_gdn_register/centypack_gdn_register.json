@@ -1,0 +1,23 @@
+{
+ "add_total_row": 0,
+ "creation": "2026-04-24 12:00:00.000000",
+ "disabled": 0,
+ "docstatus": 0,
+ "doctype": "Report",
+ "idx": 0,
+ "is_standard": "Yes",
+ "modified": "2026-04-24 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "CentyPack",
+ "name": "CentyPack GDN Register",
+ "owner": "Administrator",
+ "query": "SELECT\n  g.name AS \"GDN:Link/CentyPack GDN:200\",\n  g.posting_date AS \"Posting Date:Date:120\",\n  g.company AS \"Company:Link/Company:160\",\n  g.docstatus AS \"Docstatus:Int:90\",\n  g.customer AS \"Customer:Link/Customer:160\",\n  g.from_warehouse AS \"From WH:Link/Warehouse:160\",\n  g.to_warehouse AS \"To WH:Link/Warehouse:160\",\n  g.delivery_note AS \"Delivery Note:Link/Delivery Note:180\",\n  g.stock_entry AS \"Stock Entry:Link/Stock Entry:180\"\nFROM `tabCentyPack GDN` g\nORDER BY g.posting_date DESC, g.name DESC",
+ "ref_doctype": "CentyPack GDN",
+ "report_name": "CentyPack GDN Register",
+ "report_type": "Query Report",
+ "roles": [
+  {"role": "System Manager"},
+  {"role": "CentyPack POC Admin"},
+  {"role": "CentyPack POC User"}
+ ]
+}

@@ -1,0 +1,32 @@
+{
+ "add_total_row": 0,
+ "creation": "2026-04-28 12:00:00.000000",
+ "disabled": 0,
+ "docstatus": 0,
+ "doctype": "Report",
+ "idx": 0,
+ "is_standard": "Yes",
+ "modified": "2026-04-28 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "CentyPack",
+ "name": "CentyPack Batch Exceptions",
+ "owner": "Administrator",
+ "query": "SELECT\n  bc.batch_no AS \"Batch:Link/Batch:170\",\n  bc.company AS \"Company:Link/Company:150\",\n  bc.customer AS \"Customer:Link/Customer:170\",\n  bc.farmer AS \"Farmer:Link/Farmer:160\",\n  bc.farm_weight_kg AS \"Farm Kg:Float:100\",\n  bc.packhouse_weight_kg AS \"Packhouse Kg:Float:120\",\n  bc.allowable_variance_kg AS \"Allowable Var Kg:Float:120\",\n  bc.variance_kg AS \"Variance Kg:Float:100\",\n  bc.variance_status AS \"Variance Status:Data:130\",\n  bc.packed_kg AS \"Packed Kg:Float:100\",\n  bc.rejected_kg AS \"Rejected Kg:Float:110\",\n  bc.returned_to_stock_kg AS \"Returned Kg:Float:110\",\n  bc.available_kg AS \"Available Kg:Float:110\",\n  ROUND((COALESCE(bc.rejected_kg,0) / NULLIF(COALESCE(bc.packhouse_weight_kg,0),0)) * 100, 2) AS \"Rejected %:Percent:100\",\n  CASE\n    WHEN ABS(COALESCE(bc.variance_kg,0)) > COALESCE(bc.allowable_variance_kg,20) THEN 'VARIANCE_BREACH'\n    WHEN COALESCE(bc.available_kg,0) <= 0 THEN 'NO_AVAILABLE_BALANCE'\n    WHEN (COALESCE(bc.rejected_kg,0) / NULLIF(COALESCE(bc.packhouse_weight_kg,0),0)) * 100 >= COALESCE(%(rejection_threshold_pct)s,5) THEN 'HIGH_REJECTION_RATE'\n    ELSE 'CHECK'\n  END AS \"Exception Type:Data:170\"\nFROM `tabCentyPack Batch Control` bc\nWHERE (\n    ABS(COALESCE(bc.variance_kg,0)) > COALESCE(bc.allowable_variance_kg,20)\n    OR COALESCE(bc.available_kg,0) <= 0\n    OR (COALESCE(bc.rejected_kg,0) / NULLIF(COALESCE(bc.packhouse_weight_kg,0),0)) * 100 >= COALESCE(%(rejection_threshold_pct)s,5)\n  )\n  AND (%(batch_no)s IS NULL OR %(batch_no)s = '' OR bc.batch_no = %(batch_no)s)\n  AND (%(customer)s IS NULL OR %(customer)s = '' OR bc.customer = %(customer)s)\nORDER BY\n  CASE\n    WHEN ABS(COALESCE(bc.variance_kg,0)) > COALESCE(bc.allowable_variance_kg,20) THEN 1\n    WHEN COALESCE(bc.available_kg,0) <= 0 THEN 2\n    ELSE 3\n  END,\n  ABS(COALESCE(bc.variance_kg,0)) DESC,\n  COALESCE(bc.rejected_kg,0) DESC",
+ "ref_doctype": "CentyPack Batch Control",
+ "report_name": "CentyPack Batch Exceptions",
+ "report_type": "Query Report",
+ "roles": [
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "Finance Manager"
+  },
+  {
+   "role": "CentyPack POC Admin"
+  },
+  {
+   "role": "CentyPack POC User"
+  }
+ ]
+}

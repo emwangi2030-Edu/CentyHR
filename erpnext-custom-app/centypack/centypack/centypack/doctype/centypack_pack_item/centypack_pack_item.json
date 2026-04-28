@@ -1,0 +1,143 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "item_code",
+  "qty",
+  "packed_weight_kg",
+  "rejected_weight_kg",
+  "returned_to_stock_weight_kg",
+  "uom",
+  "carton_type",
+  "batch_no",
+  "serial_prefix",
+  "trace_token",
+  "trace_url",
+  "qr_payload"
+ ],
+ "fields": [
+  {
+   "columns": 2,
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Qty (cartons)",
+   "non_negative": 1,
+   "reqd": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "uom",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "UOM",
+   "options": "UOM",
+   "reqd": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "carton_type",
+   "fieldtype": "Link",
+   "label": "Carton Type",
+   "options": "Carton Type"
+  },
+  {
+   "columns": 1,
+   "fieldname": "batch_no",
+   "fieldtype": "Link",
+   "label": "Batch No",
+   "options": "Batch"
+  },
+  {
+   "columns": 1,
+   "fieldname": "serial_prefix",
+   "fieldtype": "Data",
+   "label": "Serial Prefix",
+   "description": "Prefix for generated serial numbers (serialized items)."
+  },
+  {
+   "columns": 1,
+   "fieldname": "trace_token",
+   "fieldtype": "Data",
+   "label": "Trace Token",
+   "read_only": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "trace_url",
+   "fieldtype": "Data",
+   "label": "Trace URL",
+   "read_only": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "qr_payload",
+   "fieldtype": "Small Text",
+   "label": "QR Payload",
+   "read_only": 1
+  },
+  {
+   "columns": 1,
+   "fieldname": "packed_weight_kg",
+   "fieldtype": "Float",
+   "label": "Packed Weight Kg",
+   "non_negative": 1,
+   "description": "If blank, computed from Qty x carton weight."
+  },
+  {
+   "columns": 1,
+   "fieldname": "rejected_weight_kg",
+   "fieldtype": "Float",
+   "label": "Rejected Weight Kg",
+   "default": "0",
+   "non_negative": 1,
+   "description": "Poor quality weight deducted from batch."
+  },
+  {
+   "columns": 1,
+   "fieldname": "returned_to_stock_weight_kg",
+   "fieldtype": "Float",
+   "label": "Returned To Stock Kg",
+   "default": "0",
+   "non_negative": 1,
+   "description": "Usable unpacked remainder returned to stock for future orders."
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "istable": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "CentyPack Pack Item",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

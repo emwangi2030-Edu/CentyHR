@@ -1,0 +1,175 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:batch_no",
+ "creation": "2026-04-28 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "company",
+  "batch_no",
+  "customer",
+  "farmer",
+  "farm_weight_kg",
+  "packhouse_weight_kg",
+  "allowable_variance_kg",
+  "variance_kg",
+  "variance_status",
+  "packed_kg",
+  "rejected_kg",
+  "returned_to_stock_kg",
+  "available_kg",
+  "remarks"
+ ],
+ "fields": [
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "batch_no",
+   "fieldtype": "Link",
+   "label": "Batch No",
+   "options": "Batch",
+   "reqd": 1,
+   "in_list_view": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "farmer",
+   "fieldtype": "Link",
+   "label": "Farmer",
+   "options": "Farmer"
+  },
+  {
+   "fieldname": "farm_weight_kg",
+   "fieldtype": "Float",
+   "label": "Farm Weight (Kg)",
+   "reqd": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "packhouse_weight_kg",
+   "fieldtype": "Float",
+   "label": "Packhouse Weight (Kg)",
+   "reqd": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "allowable_variance_kg",
+   "fieldtype": "Float",
+   "label": "Allowable Variance (Kg)",
+   "default": "20",
+   "reqd": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "variance_kg",
+   "fieldtype": "Float",
+   "label": "Variance Kg (Packhouse - Farm)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "variance_status",
+   "fieldtype": "Select",
+   "label": "Variance Status",
+   "options": "Within Tolerance\nOut of Tolerance",
+   "read_only": 1
+  },
+  {
+   "fieldname": "packed_kg",
+   "fieldtype": "Float",
+   "label": "Packed Kg",
+   "default": "0",
+   "read_only": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "rejected_kg",
+   "fieldtype": "Float",
+   "label": "Rejected Kg",
+   "default": "0",
+   "read_only": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "returned_to_stock_kg",
+   "fieldtype": "Float",
+   "label": "Returned To Stock Kg",
+   "default": "0",
+   "read_only": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "available_kg",
+   "fieldtype": "Float",
+   "label": "Available Kg",
+   "default": "0",
+   "read_only": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "CentyPack Batch Control",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "CentyPack POC Admin",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "CentyPack POC User",
+   "share": 1,
+   "write": 0
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

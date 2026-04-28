@@ -1,0 +1,51 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:block_code",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "block_code",
+  "block_name",
+  "farm",
+  "farmer",
+  "crop",
+  "variety",
+  "size_ha",
+  "planting_date",
+  "expected_first_harvest",
+  "active"
+ ],
+ "fields": [
+  {"fieldname": "block_code", "fieldtype": "Data", "in_list_view": 1, "label": "Block Code", "reqd": 1, "unique": 1},
+  {"fieldname": "block_name", "fieldtype": "Data", "in_list_view": 1, "label": "Block Name", "reqd": 1},
+  {"fieldname": "farm", "fieldtype": "Link", "in_list_view": 1, "label": "Farm", "options": "Farm", "reqd": 1},
+  {
+   "fetch_from": "farm.farmer",
+   "fieldname": "farmer",
+   "fieldtype": "Link",
+   "label": "Farmer",
+   "options": "Farmer",
+   "read_only": 1
+  },
+  {"fieldname": "crop", "fieldtype": "Link", "in_list_view": 1, "label": "Crop", "options": "Crop", "reqd": 1},
+  {"fieldname": "variety", "fieldtype": "Link", "in_list_view": 1, "label": "Variety", "options": "Variety", "reqd": 1},
+  {"fieldname": "size_ha", "fieldtype": "Float", "label": "Size Ha", "non_negative": 1, "precision": "3"},
+  {"fieldname": "planting_date", "fieldtype": "Date", "label": "Planting Date"},
+  {"fieldname": "expected_first_harvest", "fieldtype": "Date", "label": "Expected First Harvest"},
+  {"default": "1", "fieldname": "active", "fieldtype": "Check", "in_list_view": 1, "label": "Active"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "Block",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
