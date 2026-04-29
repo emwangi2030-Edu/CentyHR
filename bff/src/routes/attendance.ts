@@ -2600,11 +2600,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
     if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const secret = (config.HR_BRIDGE_SECRET || "").trim();
+    const internalUrl = config.PAY_HUB_INTERNAL_URL;
+
     // Check for active compulsory leave before allowing clock-in.
     try {
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const secret = (config.HR_BRIDGE_SECRET || "").trim();
-      const internalUrl = config.PAY_HUB_INTERNAL_URL;
       if (secret && internalUrl) {
         const checkRes = await fetch(
           `${internalUrl}/api/internal/compulsory-leave/active?employee=${encodeURIComponent(employeeId)}&date=${todayStr}`,
@@ -2619,6 +2620,27 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
                 ? `You are on compulsory leave: ${reason}. Clock-in is not permitted during this period.`
                 : "You are on compulsory leave. Clock-in is not permitted during this period.",
               code: "HR_COMPULSORY_LEAVE",
+            });
+          }
+        }
+      }
+    } catch {
+      // best-effort — do not block clock-in if the check fails
+    }
+
+    // Check for approved full-day leave before allowing clock-in.
+    try {
+      if (secret && internalUrl) {
+        const checkRes = await fetch(
+          `${internalUrl}/api/internal/approved-leave/active?employee=${encodeURIComponent(employeeId)}&date=${todayStr}`,
+          { headers: { Authorization: `Bearer ${secret}` } },
+        );
+        if (checkRes.ok) {
+          const j = (await checkRes.json()) as { active?: boolean };
+          if (j.active) {
+            return reply.status(403).send({
+              error: "You have approved leave today. Clock-in is not available during approved leave.",
+              code: "HR_ON_LEAVE",
             });
           }
         }
