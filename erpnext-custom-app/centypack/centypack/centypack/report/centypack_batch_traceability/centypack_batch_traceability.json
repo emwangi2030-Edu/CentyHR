@@ -1,0 +1,32 @@
+{
+ "add_total_row": 0,
+ "creation": "2026-04-28 12:00:00.000000",
+ "disabled": 0,
+ "docstatus": 0,
+ "doctype": "Report",
+ "idx": 0,
+ "is_standard": "Yes",
+ "modified": "2026-04-28 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "CentyPack",
+ "name": "CentyPack Batch Traceability",
+ "owner": "Administrator",
+ "query": "SELECT\n  bc.batch_no AS \"Batch:Link/Batch:170\",\n  bc.company AS \"Company:Link/Company:150\",\n  bc.customer AS \"Batch Customer:Link/Customer:170\",\n  bc.farmer AS \"Farmer:Link/Farmer:160\",\n  bc.farm_weight_kg AS \"Farm Weight Kg:Float:120\",\n  bc.packhouse_weight_kg AS \"Packhouse Weight Kg:Float:140\",\n  bc.variance_kg AS \"Variance Kg:Float:110\",\n  bc.variance_status AS \"Variance Status:Data:130\",\n  bc.packed_kg AS \"Packed Kg:Float:110\",\n  bc.rejected_kg AS \"Rejected Kg:Float:110\",\n  bc.returned_to_stock_kg AS \"Returned Kg:Float:110\",\n  bc.available_kg AS \"Available Kg:Float:110\",\n  psi.parent AS \"Pack Session:Link/CentyPack Pack Session:220\",\n  ps.posting_date AS \"Pack Date:Date:110\",\n  ps.packed_by AS \"Packed By:Data:140\",\n  psi.item_code AS \"Packed Item:Link/Item:180\",\n  psi.qty AS \"Cartons:Float:90\",\n  COALESCE(psi.packed_weight_kg, 0) AS \"Line Packed Kg:Float:120\",\n  COALESCE(psi.rejected_weight_kg, 0) AS \"Line Rejected Kg:Float:130\",\n  COALESCE(psi.returned_to_stock_weight_kg, 0) AS \"Line Returned Kg:Float:130\",\n  gi.parent AS \"GDN:Link/CentyPack GDN:180\",\n  g.posting_date AS \"Ship Date:Date:100\",\n  g.customer AS \"Shipped Customer:Link/Customer:170\",\n  gi.item_code AS \"Shipped Item:Link/Item:160\",\n  gi.qty AS \"Shipped Qty:Float:100\"\nFROM `tabCentyPack Batch Control` bc\nLEFT JOIN `tabCentyPack Pack Item` psi ON psi.batch_no = bc.batch_no\nLEFT JOIN `tabCentyPack Pack Session` ps ON ps.name = psi.parent AND psi.parenttype = 'CentyPack Pack Session'\nLEFT JOIN `tabCentyPack GDN Item` gi ON gi.batch_no = bc.batch_no\nLEFT JOIN `tabCentyPack GDN` g ON g.name = gi.parent AND gi.parenttype = 'CentyPack GDN'\nWHERE (%(batch_no)s IS NULL OR %(batch_no)s = '' OR bc.batch_no = %(batch_no)s)\n  AND (%(customer)s IS NULL OR %(customer)s = '' OR bc.customer = %(customer)s OR g.customer = %(customer)s)\n  AND (%(from_date)s IS NULL OR %(from_date)s = '' OR ps.posting_date >= %(from_date)s OR g.posting_date >= %(from_date)s)\n  AND (%(to_date)s IS NULL OR %(to_date)s = '' OR ps.posting_date <= %(to_date)s OR g.posting_date <= %(to_date)s)\nORDER BY bc.batch_no DESC, ps.posting_date DESC, g.posting_date DESC",
+ "ref_doctype": "CentyPack Batch Control",
+ "report_name": "CentyPack Batch Traceability",
+ "report_type": "Query Report",
+ "roles": [
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "Finance Manager"
+  },
+  {
+   "role": "CentyPack POC Admin"
+  },
+  {
+   "role": "CentyPack POC User"
+  }
+ ]
+}

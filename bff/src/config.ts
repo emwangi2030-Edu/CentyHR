@@ -9,6 +9,9 @@ function req(name: string, fallback?: string): string {
 /** Public base of the Frappe site, e.g. https://erp.tarakilishicloud.com */
 export const ERP_BASE_URL = req("ERP_BASE_URL").replace(/\/+$/, "");
 
+/** Base URL of the Pay Hub server for internal service calls (e.g. compulsory leave checks). */
+export const PAY_HUB_INTERNAL_URL = (process.env.PAY_HUB_INTERNAL_URL ?? "http://localhost:5002").replace(/\/+$/, "");
+
 /** Optional: set if your reverse proxy expects `X-Frappe-Site-Name` (usually unnecessary when Host matches the site). */
 export const ERP_SITE_NAME = process.env.ERP_SITE_NAME ?? "";
 
@@ -57,8 +60,8 @@ export const LEAVE_MANAGER_APPROVE_MAX_DAYS: number | null = (() => {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 })();
 
-/** When `1`, leave uses a custom Check field for the first approver, then HR finalises `status`. See docs/ERP_TWO_STAGE_CUSTOM_FIELDS.md */
-export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL === "1";
+/** Two-stage leave approval: line manager first, then HR finalises. Enabled by default; set to "0" to disable. */
+export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL !== "0";
 
 /** Custom field on Leave Application (Allow on Submit = Yes). */
 export const LEAVE_FIRST_APPROVER_FIELD =
@@ -73,3 +76,24 @@ export const EXPENSE_FIRST_APPROVER_FIELD =
   process.env.EXPENSE_FIRST_APPROVER_FIELD?.trim() || "custom_centy_first_approver_done";
 
 export const EXPENSE_HR_BYPASS_FIRST_APPROVER = process.env.EXPENSE_HR_BYPASS_FIRST_APPROVER === "1";
+
+/** DocuSeal webhook: header name + secret (console “Add Secret”). */
+export const DOCUSEAL_WEBHOOK_HEADER_NAME = process.env.DOCUSEAL_WEBHOOK_HEADER_NAME ?? "";
+export const DOCUSEAL_WEBHOOK_SECRET = process.env.DOCUSEAL_WEBHOOK_SECRET ?? "";
+
+/** Dev only: skip header verification (never use in production). */
+export const DOCUSEAL_WEBHOOK_INSECURE = process.env.DOCUSEAL_WEBHOOK_INSECURE === "1";
+
+/** ERP method DocuSeal payload is forwarded to. */
+export const DOCUSEAL_WEBHOOK_ERP_METHOD =
+  process.env.DOCUSEAL_WEBHOOK_ERP_METHOD?.trim() ||
+  "centypay_dms.api.documents.handle_docuseal_webhook";
+
+const DEFAULT_HR_COMPANY_DOCUMENT_ROLES = ["super_admin", "admin"];
+
+/** Roles allowed to manage company vault documents (comma-separated env override). */
+export function hrCompanyDocumentRoles(): string[] {
+  const raw = process.env.HR_COMPANY_DOCUMENT_ROLES?.trim();
+  if (!raw) return [...DEFAULT_HR_COMPANY_DOCUMENT_ROLES];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}

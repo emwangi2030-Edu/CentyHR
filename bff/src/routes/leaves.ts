@@ -12,8 +12,85 @@ import * as config from "../config.js";
 import { logHrPolicyDenial } from "../lib/approvalPolicyLog.js";
 import { leaveManagerBlockedByDayCeiling, leaveManagerDayCeilingMessage } from "../lib/leaveManagerApprovePolicy.js";
 import { attachCentyTwoStageLeaveRow, isFirstApproverFlagSet } from "../lib/twoStageCustomFields.js";
+import { readFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const erp = defaultClient();
+
+// ---------------------------------------------------------------------------
+// Shift-aware leave day calculation
+// ---------------------------------------------------------------------------
+const _leavesDir = dirname(fileURLToPath(import.meta.url));
+const _dowStorePath = join(_leavesDir, "..", ".shift-assignment-days.json");
+
+function readDowMap(): Map<string, string> {
+  try {
+    if (existsSync(_dowStorePath)) {
+      return new Map(Object.entries(JSON.parse(readFileSync(_dowStorePath, "utf8")) as Record<string, string>));
+    }
+  } catch { }
+  return new Map();
+}
+
+/**
+ * Counts leave days that fall on the employee's scheduled working days.
+ *
+ * Only dates covered by an active Shift Assignment AND within the assignment's
+ * days-of-week restriction are counted. Returns null when no shift assignments
+ * exist in the period, signalling the caller to fall back to ERPNext's native
+ * total_leave_days value.
+ */
+async function countScheduledLeaveDays(
+  creds: { apiKey: string; apiSecret: string },
+  company: string,
+  employee: string,
+  fromDate: string,
+  toDate: string,
+  halfDay: 0 | 1,
+): Promise<number | null> {
+  if (halfDay) return 0.5;
+
+  const assignments = (await erp.getList(creds, "Shift Assignment", {
+    fields: ["name", "start_date", "end_date"],
+    filters: [
+      ["company", "=", company],
+      ["employee", "=", employee],
+      ["docstatus", "!=", 2],
+      ["start_date", "<=", toDate],
+    ],
+    limit_page_length: 200,
+  })) as { name: string; start_date: string; end_date: string | null }[];
+
+  const overlapping = assignments.filter((sa) => {
+    const saEnd = String(sa.end_date ?? "").slice(0, 10);
+    const effectiveEnd = saEnd && /^\d{4}-\d{2}-\d{2}$/.test(saEnd) ? saEnd : "9999-12-31";
+    return effectiveEnd >= fromDate;
+  });
+
+  if (overlapping.length === 0) return null; // no shift context — let ERPNext decide
+
+  const dowMap = readDowMap();
+  const DOW_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+  let count = 0;
+
+  const end = new Date(toDate + "T00:00:00Z");
+  for (let d = new Date(fromDate + "T00:00:00Z"); d <= end; d = new Date(d.getTime() + 86_400_000)) {
+    const ds = d.toISOString().slice(0, 10);
+    const activeSa = overlapping.find((sa) => {
+      const saStart = String(sa.start_date ?? "").slice(0, 10);
+      const saEnd = String(sa.end_date ?? "").slice(0, 10);
+      const effectiveEnd = saEnd && /^\d{4}-\d{2}-\d{2}$/.test(saEnd) ? saEnd : "9999-12-31";
+      return saStart <= ds && effectiveEnd >= ds;
+    });
+    if (!activeSa) continue; // no shift on this date = not a working day
+    const dowStr = dowMap.get(String(activeSa.name ?? "")) ?? "";
+    if (!dowStr) { count++; continue; } // no DOW restriction = all days work
+    if (dowStr.split(",").map((s) => s.trim()).includes(DOW_NAMES[d.getUTCDay()])) count++;
+  }
+
+  return count;
+}
 
 type GateOk = { ok: true };
 type GateFail = { ok: false; status: number; error: string };
@@ -77,16 +154,28 @@ function buildListFilters(
 }
 
 async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
-  const mine = await erp.listDocs(ctx.creds, "Employee", {
-    filters: [
-      ["user_id", "=", ctx.userEmail],
-      ["company", "=", ctx.company],
-    ],
-    fields: ["name"],
-    limit_page_length: 1,
-  });
-  const empName = asRecord(mine.data?.[0])?.name;
-  return typeof empName === "string" ? empName : null;
+  for (const field of ["user_id", "personal_email", "prefered_email"] as const) {
+    const mine = await erp.listDocs(ctx.creds, "Employee", {
+      filters: [[field, "=", ctx.userEmail], ["company", "=", ctx.company]],
+      fields: ["name"],
+      limit_page_length: 1,
+    });
+    const empName = asRecord(mine.data?.[0])?.name;
+    if (typeof empName === "string" && empName) {
+      // Keep employeeUserLinks in Pay Hub current so the login-block check is always reliable.
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        fetch(`${internalUrl.replace(/\/+$/, "")}/api/internal/employee-link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+          body: JSON.stringify({ user_email: ctx.userEmail, erp_employee_id: empName }),
+        }).catch(() => { /* non-fatal */ });
+      }
+      return empName;
+    }
+  }
+  return null;
 }
 
 async function ensureLeaveReadAccess(ctx: HrContext, doc: Record<string, unknown>): Promise<Gate> {
@@ -244,6 +333,77 @@ const PATCH_WHITELIST = new Set([
   "half_day_date",
   "description",
 ]);
+
+/**
+ * Ensures a permissive ERPNext Leave Allocation exists so ERPNext's allocation
+ * period validation never blocks Pay Hub leave applications.
+ * Pay Hub is the authoritative balance owner; this is bookkeeping only.
+ */
+async function ensureErpLeaveType(
+  creds: { apiKey: string; apiSecret: string },
+  leaveTypeName: string,
+): Promise<void> {
+  try {
+    await erp.getDoc(creds, "Leave Type", leaveTypeName);
+    // Exists — nothing to do.
+  } catch {
+    // Doesn't exist — create a minimal Leave Type document.
+    try {
+      await erp.createDoc(creds, "Leave Type", {
+        doctype: "Leave Type",
+        leave_type_name: leaveTypeName,
+        max_leaves_allowed: 0,
+        allow_negative: 0,
+        is_lwp: 0,
+      });
+      console.log(`[ensureErpLeaveType] created "${leaveTypeName}" in ERPNext`);
+    } catch (err: any) {
+      console.warn(`[ensureErpLeaveType] could not create "${leaveTypeName}":`, err?.message ?? err);
+    }
+  }
+}
+
+async function ensureErpLeaveAllocation(
+  creds: { apiKey: string; apiSecret: string },
+  params: { employee: string; leave_type: string; from_date: string; company: string; applicationDate: string },
+): Promise<void> {
+  try {
+    // Only count submitted (docstatus=1) allocations — drafts are not active in ERPNext.
+    const existing = await erp.getList(creds, "Leave Allocation", {
+      filters: [
+        ["employee", "=", params.employee],
+        ["leave_type", "=", params.leave_type],
+        ["docstatus", "=", 1],
+        ["from_date", "<=", params.applicationDate],
+        ["to_date", ">=", params.applicationDate],
+      ],
+      fields: ["name"],
+      limit_page_length: 1,
+    });
+    if (existing.length > 0) return;
+
+    // Create a year-spanning allocation covering the application date.
+    // Using Jan 1 → Dec 31 of the application's year avoids fiscal-year boundary rejections.
+    const appYear = params.applicationDate.slice(0, 4);
+    const alloc = await erp.createDoc(creds, "Leave Allocation", {
+      doctype: "Leave Allocation",
+      employee: params.employee,
+      leave_type: params.leave_type,
+      from_date: `${appYear}-01-01`,
+      to_date: `${appYear}-12-31`,
+      new_leaves_allocated: 9999,
+      company: params.company,
+      carry_forward: 0,
+    });
+    // Submit so ERPNext considers it active.
+    await erp.callMethod(creds, "frappe.client.submit", {
+      doc: { doctype: "Leave Allocation", name: String(alloc.name) },
+    });
+  } catch {
+    // Non-fatal: log so issues are visible in BFF logs.
+    console.warn("[ensureErpLeaveAllocation] failed for", params.employee, params.leave_type);
+  }
+}
 
 export const leaveRoutes: FastifyPluginAsync = async (app) => {
   app.get("/v1/meta/leave-types", async (req, reply) => {
@@ -521,6 +681,26 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       const description = typeof body.description === "string" ? body.description : "";
       const empFull = await erp.getDoc(ctx.creds, "Employee", employee);
       const leaveApprover = empFull.leave_approver != null ? String(empFull.leave_approver) : "";
+
+      // Ensure the Leave Type document exists in ERPNext before creating the allocation.
+      await ensureErpLeaveType(ctx.creds, leaveType);
+
+      // Ensure an ERPNext Leave Allocation exists so ERPNext's validation never blocks.
+      // Pay Hub owns the actual balance rules; this allocation is intentionally permissive.
+      await ensureErpLeaveAllocation(ctx.creds, {
+        employee,
+        leave_type: leaveType,
+        from_date: String(empFull.date_of_joining ?? "2020-01-01").slice(0, 10),
+        company: ctx.company,
+        applicationDate: fromDate,
+      });
+
+      // Calculate leave days based on the employee's shift schedule.
+      // Days outside their assigned shift days-of-week are not counted.
+      const scheduledDays = await countScheduledLeaveDays(
+        ctx.creds, ctx.company, employee, fromDate, toDate, halfDay as 0 | 1,
+      );
+
       const doc: Record<string, unknown> = {
         doctype: "Leave Application",
         company: ctx.company,
@@ -533,11 +713,42 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         description,
         posting_date: postingDate,
         ...(leaveApprover ? { leave_approver: leaveApprover } : {}),
+        ...(scheduledDays !== null ? { total_leave_days: scheduledDays } : {}),
       };
       const created = await erp.createDoc(ctx.creds, "Leave Application", doc);
-      return { data: { ...created, ui_status: leaveUiStatus(created) } };
+
+      // ERPNext's validate hook may have recalculated total_leave_days.
+      // If so, push our shift-aware count back onto the draft doc.
+      const erpDays = Number((created as any).total_leave_days ?? 0);
+      if (scheduledDays !== null && erpDays !== scheduledDays) {
+        try {
+          await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+            doctype: "Leave Application",
+            name: (created as any).name,
+            fieldname: "total_leave_days",
+            value: scheduledDays,
+          });
+        } catch { /* non-fatal — response still carries the correct count */ }
+      }
+
+      return {
+        data: {
+          ...created,
+          total_leave_days: scheduledDays ?? erpDays,
+          ui_status: leaveUiStatus(created),
+        },
+      };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
+      if (e instanceof ErpError) {
+        const msg = e.message ?? "";
+        if (/not a valid leave type/i.test(msg)) {
+          const lt = "selected leave type";
+          return reply.status(422).send({
+            error: `Leave type "${lt}" has not been created in ERPNext yet. Go to Settings → Leave Policy → ERP Leave Type Mappings and set this type to one that already exists in your ERPNext (e.g. "Sick Leave"), or ask your ERPNext admin to create a "${lt}" Leave Type there.`,
+          });
+        }
+        return replyErp(reply, e);
+      }
       throw e;
     }
   });
@@ -572,6 +783,31 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(400).send({ error: "No editable fields supplied" });
       }
       const updated = await erp.updateDoc(ctx.creds, "Leave Application", name, patch);
+
+      // Recalculate shift-aware leave days if any date-related field changed.
+      const dateFieldChanged = "from_date" in patch || "to_date" in patch || "half_day" in patch;
+      if (dateFieldChanged) {
+        const newFrom = String(patch.from_date ?? cur.from_date ?? "").slice(0, 10);
+        const newTo = String(patch.to_date ?? cur.to_date ?? "").slice(0, 10);
+        const newHalf = ("half_day" in patch ? Number(patch.half_day) : Number(cur.half_day ?? 0)) as 0 | 1;
+        const emp = String(cur.employee ?? "");
+        if (newFrom && newTo && emp) {
+          try {
+            const scheduledDays = await countScheduledLeaveDays(
+              ctx.creds, ctx.company, emp, newFrom, newTo, newHalf,
+            );
+            if (scheduledDays !== null) {
+              try {
+                await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+                  doctype: "Leave Application", name, fieldname: "total_leave_days", value: scheduledDays,
+                });
+              } catch { /* non-fatal */ }
+              return { data: { ...updated, total_leave_days: scheduledDays, ui_status: leaveUiStatus(updated) } };
+            }
+          } catch { /* non-fatal — return updated as-is */ }
+        }
+      }
+
       return { data: { ...updated, ui_status: leaveUiStatus(updated) } };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);

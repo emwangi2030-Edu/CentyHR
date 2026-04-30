@@ -129,8 +129,10 @@ const EMPLOYEE_CREATE_FIELDS = new Set([
   "personal_email",
   "reports_to",
   // Identity / statutory (can be set at onboarding)
-  "tax_id",         // KRA PIN
-  "id_number",      // National ID (custom field — silently skipped if not present on ERP)
+  "tax_id",         // KRA PIN (standard ERPNext Employee field)
+  "custom_kra_pin", // KRA PIN (custom field on Statutory tab — mirror of tax_id)
+  "id_number",          // National ID (ERPNext standard field — used for duplicate detection)
+  "custom_national_id", // National ID (custom Statutory tab field — display copy)
   "salutation",
   "employment_type",
   "grade",
@@ -184,6 +186,8 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   // Exit
   "resignation_letter_date", "relieving_date", "held_on", "new_workplace",
   "leave_encashed", "reason_for_leaving", "feedback",
+  // Identity document
+  "id_number", "custom_national_id",                 // National ID (custom field)
   // Statutory / Tax compliance
   "tax_id",                                          // KRA PIN (standard ERPNext field)
   // Common custom field name variants for Kenya statutory numbers:
@@ -192,9 +196,14 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   "shif_no", "custom_shif_no", "shif_number", "custom_shif_number",
   "nita_no", "custom_nita_no", "nita_number", "custom_nita_number",
   "kra_pin", "custom_kra_pin",
+  // ERPNext auto-generates field names with double underscores when the label contains " / "
+  // e.g. label "NHIF / SHIF Number" → fieldname "custom_nhif__shif_number"
+  "custom_nhif__shif_number", "custom_nssf__shif_number",
 ]);
 
-const EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE = /^(custom_)?(nssf|nhif|shif|nita|kra)(_[a-z0-9]+)*$/i;
+// Allow single AND double underscores between segments so fieldnames auto-generated from
+// labels like "NHIF / SHIF Number" (→ custom_nhif__shif_number) are accepted.
+const EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE = /^(custom_)?(nssf|nhif|shif|nita|kra)(_+[a-z0-9]+)*$/i;
 
 function isAllowedEmployeePatchField(field: string): boolean {
   return EMPLOYEE_PATCH_WHITELIST.has(field) || EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE.test(field);
@@ -283,23 +292,16 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       }
 
       // Primary: look up by user_id; fallback: personal_email
-      console.log(`[me-employee] lookup email=${ctx.userEmail} company=${companyDocName}`);
       let empName = await resolveEmployeeName("user_id");
-      console.log(`[me-employee] user_id lookup result: ${empName ?? "not found"}`);
-      if (!empName) {
-        empName = await resolveEmployeeName("personal_email");
-        console.log(`[me-employee] personal_email lookup result: ${empName ?? "not found"}`);
-      }
+      if (!empName) empName = await resolveEmployeeName("personal_email");
 
       if (!empName) {
-        console.warn(`[me-employee] HR_NO_EMPLOYEE for email=${ctx.userEmail} company=${companyDocName}`);
         return reply.status(404).send({
           error: "No employee record for your account in this company.",
           code: "HR_NO_EMPLOYEE",
           company: companyDocName,
         });
       }
-      console.log(`[me-employee] resolved employee: ${empName}`);
 
       // getDoc returns all fields the doctype has — no field whitelist, never throws "Field not permitted"
       const doc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
@@ -359,7 +361,6 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const companyDocName = await resolveCompanyDocName();
     const email = String(ctx.userEmail || "").trim();
-    console.log(`[ensure] START email=${email} company=${companyDocName} role=${ctx.appRole ?? "unknown"}`);
     if (!email) return reply.status(400).send({ error: "Missing email context" });
 
     const fetchExisting = async (): Promise<Record<string, unknown> | null> => {
@@ -373,13 +374,10 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
           });
           const row = rows?.[0] as { name?: string } | undefined;
           if (row?.name) {
-            console.log(`[ensure] found existing employee via ${field}: ${row.name}`);
             // getDoc returns all fields the doctype has without a whitelist
             return (await erp.getDoc(ctx!.creds, "Employee", String(row.name))) as Record<string, unknown>;
           }
-          console.log(`[ensure] no match via ${field}`);
         } catch (e) {
-          console.warn(`[ensure] error searching by ${field}:`, e instanceof Error ? e.message : e);
           if (!(e instanceof ErpError)) throw e;
         }
       }
@@ -389,11 +387,9 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     // If already exists, return it (idempotent)
     const existing = await fetchExisting();
     if (existing) {
-      console.log(`[ensure] employee already exists, returning existing: ${existing.name}`);
       return { data: existing };
     }
 
-    console.log(`[ensure] no existing employee found — creating new record for ${email}`);
     const localPart = email.split("@")[0] || email;
     const firstName = localPart.replace(/[._-]+/g, " ").trim().slice(0, 140) || "Admin";
     const todayIso = new Date().toISOString().slice(0, 10);
@@ -422,43 +418,29 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       let created: unknown;
       try {
         // Preferred: attach `user_id` when ERP User exists.
-        console.log(`[ensure] attempting createDoc WITH user_id`);
         created = await erp.createDoc(ctx.creds, "Employee", {
           ...baseDoc,
           user_id: email,
         });
-        console.log(`[ensure] created employee WITH user_id: ${(created as any)?.name}`);
       } catch (inner) {
         if (!(inner instanceof ErpError)) throw inner;
         if (isMissingUserIdLink(inner)) {
           // Fallback for tenants where ERP User isn't provisioned for the login email yet.
-          console.warn(`[ensure] user_id link failed ("could not find user id") — retrying WITHOUT user_id`);
           created = await erp.createDoc(ctx.creds, "Employee", baseDoc);
-          console.log(`[ensure] created employee WITHOUT user_id (personal_email only): ${(created as any)?.name}`);
         } else {
-          console.error(`[ensure] createDoc WITH user_id failed (non-user-id error): status=${inner.status} body=${inner.body}`);
           throw inner;
         }
       }
       const createdName = String((created as any)?.name ?? "").trim();
-      if (!createdName) {
-        console.warn(`[ensure] createDoc succeeded but returned no name — returning generic ok`);
-        return { data: { created: true } };
-      }
+      if (!createdName) return { data: { created: true } };
       const doc = await erp.getDoc(ctx.creds, "Employee", createdName);
-      console.log(`[ensure] SUCCESS — employee=${createdName}`);
       return { data: doc };
     } catch (e) {
       if (e instanceof ErpError) {
-        console.error(`[ensure] ErpError status=${e.status} body=${e.body}`);
         // If another concurrent request created/updated the employee, return the now-existing row.
         if (e.status === 409 || e.status === 417) {
-          console.log(`[ensure] 409/417 — checking if concurrent request already created the employee`);
           const row = await fetchExisting();
-          if (row) {
-            console.log(`[ensure] concurrent create resolved: employee=${row.name}`);
-            return { data: row };
-          }
+          if (row) return { data: row };
         }
         const status = e.status >= 500 ? 502 : e.status;
         return reply.status(status).send(publicErpFailure(e));
@@ -824,6 +806,47 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       doc.date_of_birth = dobDefault.toISOString().slice(0, 10);
     }
 
+    // ── Ensure link-field org units exist in ERPNext before creating employee ──
+    // ERPNext throws LinkValidationError if Designation / Branch / Department
+    // names don't match existing docs. We auto-create them if missing so the
+    // employee creation never fails on a valid dropdown selection.
+    const ensureOrgUnit = async (
+      doctype: string,
+      nameField: string,
+      value: string,
+      companyScoped?: string
+    ): Promise<string> => {
+      try {
+        const filters: [string, string, string][] = [[nameField, "=", value]];
+        if (companyScoped) filters.push(["company", "=", companyScoped]);
+        const rows = await erp.getList(ctx.creds, doctype, {
+          filters,
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        const existing = (rows as Record<string, unknown>[])[0];
+        if (existing?.name) return String(existing.name);
+      } catch { /* fall through to create */ }
+      try {
+        const payload: Record<string, unknown> = { [nameField]: value };
+        if (companyScoped) payload.company = companyScoped;
+        const created = await erp.createDoc(ctx.creds, doctype, payload);
+        return String((created as Record<string, unknown>).name ?? value);
+      } catch {
+        return value; // best-effort: let ERPNext validate — it may already exist under that name
+      }
+    };
+
+    if (doc.designation) {
+      doc.designation = await ensureOrgUnit("Designation", "designation_name", String(doc.designation));
+    }
+    if (doc.branch) {
+      doc.branch = await ensureOrgUnit("Branch", "branch", String(doc.branch));
+    }
+    if (doc.department) {
+      doc.department = await ensureOrgUnit("Department", "department_name", String(doc.department), ctx.company);
+    }
+
     // ── Normalize & validate identity / contact fields ───────────────────────
     if (doc.cell_number) doc.cell_number = normalizePhone(String(doc.cell_number));
     if (doc.prefered_email) doc.prefered_email = normalizeEmail(String(doc.prefered_email));
@@ -1017,58 +1040,49 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     const gate = await ensureEmployeeInsightAccess(ctx, name);
     if (!gate.ok) return reply.status(gate.status).send({ error: gate.error });
 
+    let rows: unknown[] = [];
     try {
-      const res = await erp.listDocs(ctx.creds, "Expense Claim", {
+      rows = await erp.getList(ctx.creds, "Expense Claim", {
         filters: [
           ["company", "=", ctx.company],
           ["employee", "=", name],
         ],
-        fields: [
-          "docstatus",
-          "approval_status",
-          "grand_total",
-          "total_claimed_amount",
-          "total_amount_reimbursed",
-        ],
+        fields: ["docstatus", "approval_status", "total_claimed_amount", "total_amount_reimbursed"],
         order_by: "modified desc",
         limit_page_length: EMPLOYEE_INSIGHTS_CLAIM_CAP,
       });
-      const rows = res.data ?? [];
-      let total = 0;
-      let pending = 0;
-      let approved = 0;
-      let total_claimed = 0;
-      let paid_out = 0;
-      for (const r of rows) {
-        const rec = asRecord(r);
-        if (!rec) continue;
-        total++;
-        const docstatus = Number(rec.docstatus);
-        const appr = String(rec.approval_status ?? "").trim().toLowerCase();
-        if (docstatus === 0) pending++;
-        else if (docstatus === 1 && appr !== "approved" && appr !== "rejected") pending++;
-        if (appr === "approved") approved++;
-        const gt =
-          Number(rec.grand_total ?? rec.total_claimed_amount ?? 0) ||
-          Number(rec.total_claimed_amount ?? 0) ||
-          0;
-        total_claimed += gt;
-        paid_out += Number(rec.total_amount_reimbursed ?? 0) || 0;
-      }
-      return {
-        data: {
-          total,
-          pending,
-          approved,
-          total_claimed,
-          paid_out,
-          scan_capped: rows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
-        },
-      };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
+      // Expense module may not be installed or API key lacks permission — return empty snapshot.
+      console.warn("[expense-snapshot] ERPNext query failed, returning empty snapshot:", e instanceof Error ? e.message : String(e));
     }
+    let total = 0;
+    let pending = 0;
+    let approved = 0;
+    let total_claimed = 0;
+    let paid_out = 0;
+    for (const r of rows) {
+      const rec = asRecord(r);
+      if (!rec) continue;
+      total++;
+      const docstatus = Number(rec.docstatus);
+      const appr = String(rec.approval_status ?? "").trim().toLowerCase();
+      if (docstatus === 0) pending++;
+      else if (docstatus === 1 && appr !== "approved" && appr !== "rejected") pending++;
+      if (appr === "approved") approved++;
+      total_claimed += Number(rec.total_claimed_amount ?? 0) || 0;
+      paid_out += Number(rec.total_amount_reimbursed ?? 0) || 0;
+    }
+    return {
+      data: {
+        total,
+        pending,
+        approved,
+        total_claimed,
+        paid_out,
+        scan_capped: rows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
+        unavailable: rows.length === 0 && total === 0,
+      },
+    };
   });
 
   /** Daily claim counts for activity heatmap (posting_date preferred, else modified). */
@@ -1091,8 +1105,9 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     since.setMonth(since.getMonth() - months);
     const cutoff = since.toISOString().slice(0, 10);
 
+    let claimRows: unknown[] = [];
     try {
-      const res = await erp.listDocs(ctx.creds, "Expense Claim", {
+      claimRows = await erp.getList(ctx.creds, "Expense Claim", {
         filters: [
           ["company", "=", ctx.company],
           ["employee", "=", name],
@@ -1101,26 +1116,25 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         order_by: "modified desc",
         limit_page_length: EMPLOYEE_INSIGHTS_CLAIM_CAP,
       });
-      const cells: Record<string, number> = {};
-      for (const r of res.data ?? []) {
-        const rec = asRecord(r);
-        if (!rec) continue;
-        const raw = String(rec.posting_date ?? rec.modified ?? "").trim();
-        const day = raw.slice(0, 10);
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoff) continue;
-        cells[day] = (cells[day] ?? 0) + 1;
-      }
-      return {
-        data: {
-          cells,
-          months,
-          scan_capped: (res.data ?? []).length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
-        },
-      };
     } catch (e) {
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
+      console.warn("[claim-activity] ERPNext query failed, returning empty heatmap:", e instanceof Error ? e.message : String(e));
     }
+    const cells: Record<string, number> = {};
+    for (const r of claimRows) {
+      const rec = asRecord(r);
+      if (!rec) continue;
+      const raw = String(rec.posting_date ?? rec.modified ?? "").trim();
+      const day = raw.slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoff) continue;
+      cells[day] = (cells[day] ?? 0) + 1;
+    }
+    return {
+      data: {
+        cells,
+        months,
+        scan_capped: claimRows.length >= EMPLOYEE_INSIGHTS_CLAIM_CAP,
+      },
+    };
   });
 
   /** Related record counts (ERPNext); optional doctypes return -1 when unavailable. */
@@ -1329,12 +1343,22 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
     const name = (req.params as { id: string }).id;
     const rawBody = (req.body ?? {}) as Record<string, unknown>;
+    const incomingKeys = Object.keys(rawBody);
+    console.log(`[hr:patch] incoming body keys (${incomingKeys.length}): ${incomingKeys.join(", ")}`);
+
     const patch: Record<string, unknown> = {};
+    const rejectedKeys: string[] = [];
     for (const [k, v] of Object.entries(rawBody)) {
-      if (!isAllowedEmployeePatchField(k)) continue;
+      if (!isAllowedEmployeePatchField(k)) { rejectedKeys.push(k); continue; }
       if (v === null || v === undefined) continue;
       patch[k] = typeof v === "string" ? v.trim() : v;
     }
+    if (rejectedKeys.length > 0) {
+      console.log(`[hr:patch] rejected keys (not in whitelist): ${rejectedKeys.join(", ")}`);
+    }
+    const allowedKeys = Object.keys(patch);
+    console.log(`[hr:patch] allowed keys (${allowedKeys.length}): ${allowedKeys.join(", ")}`);
+
     if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: "No allowed fields to update" });
     }
@@ -1395,15 +1419,23 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
+      const standardFields = Object.keys(standardPatch);
+      const statutoryFields = Object.keys(statutoryPatch);
+      console.log(`[hr:patch] standard fields (${standardFields.length}): ${standardFields.join(", ") || "(none)"}`);
+      console.log(`[hr:patch] statutory/custom fields (${statutoryFields.length}): ${statutoryFields.join(", ") || "(none)"}`);
+
       // Apply standard fields via PUT
-      if (Object.keys(standardPatch).length > 0) {
+      if (standardFields.length > 0) {
+        console.log(`[hr:patch] calling updateDoc for standard fields`);
         await erp.updateDoc(ctx.creds, "Employee", name, standardPatch);
+        console.log(`[hr:patch] updateDoc OK`);
       }
 
       // Apply custom/statutory fields one-by-one via frappe.client.set_value
       // (PUT /api/resource silently drops custom fields on some ERPNext versions)
       for (const [field, value] of Object.entries(statutoryPatch)) {
-        console.warn(`[hr:patch] set_value field="${field}" value="${String(value).slice(0, 40)}"`);
+        const displayVal = String(value ?? "").slice(0, 60);
+        console.log(`[hr:patch] set_value field="${field}" value="${displayVal}"`);
         try {
           await erp.callMethod(ctx.creds, "frappe.client.set_value", {
             doctype: "Employee",
@@ -1411,12 +1443,14 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
             fieldname: field,
             value,
           });
+          console.log(`[hr:patch] set_value OK field="${field}"`);
         } catch (svErr) {
-          console.warn(`[hr:patch] set_value failed for field="${field}":`, String(svErr).slice(0, 200));
+          console.warn(`[hr:patch] set_value FAILED field="${field}": ${String(svErr).slice(0, 200)}`);
         }
       }
 
       // Fetch the updated record and verify statutory fields were persisted
+      console.log(`[hr:patch] fetching updated record for verification`);
       let record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
 
       // Second-pass: any statutory field still mismatched → retry set_value once more
@@ -1424,13 +1458,18 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         const saved = String(record[field] ?? "").trim();
         const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
         const mismatch = saved !== expected;
-        if (mismatch) console.warn(`[hr:patch] mismatch field="${field}" saved="${saved}" expected="${expected}"`);
+        if (mismatch) {
+          console.warn(`[hr:patch] MISMATCH field="${field}" saved="${saved}" expected="${expected}"`);
+        } else {
+          console.log(`[hr:patch] verified OK field="${field}" value="${saved}"`);
+        }
         return mismatch;
       });
 
       if (stillMismatched.length > 0) {
-        console.warn(`[hr:patch] ${stillMismatched.length} field(s) still mismatched after set_value — retrying`);
+        console.warn(`[hr:patch] ${stillMismatched.length} field(s) still mismatched — retrying`);
         for (const [field, value] of stillMismatched) {
+          console.log(`[hr:patch] retry set_value field="${field}"`);
           try {
             await erp.callMethod(ctx.creds, "frappe.client.set_value", {
               doctype: "Employee",
@@ -1438,18 +1477,41 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
               fieldname: field,
               value,
             });
+            console.log(`[hr:patch] retry set_value OK field="${field}"`);
           } catch (svErr) {
-            console.warn(`[hr:patch] retry set_value failed for "${field}":`, String(svErr).slice(0, 200));
+            console.warn(`[hr:patch] retry set_value FAILED field="${field}": ${String(svErr).slice(0, 200)}`);
           }
         }
+        console.log(`[hr:patch] re-fetching record after retry`);
         record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
       }
+
+      // Build save/fail lists for the client
+      const statutorySaved: string[] = [];
+      const statutoryFailed: string[] = [];
+      for (const [field, value] of Object.entries(statutoryPatch)) {
+        const saved = String(record[field] ?? "").trim();
+        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+        if (saved === expected) {
+          statutorySaved.push(field);
+        } else {
+          statutoryFailed.push(field);
+          console.warn(`[hr:patch] FINAL MISMATCH field="${field}" saved="${saved}" expected="${expected}"`);
+        }
+      }
+
+      console.log(`[hr:patch] done — standard_saved=${standardFields.length} statutory_saved=${statutorySaved.length} statutory_failed=${statutoryFailed.length}`);
 
       if (String(record.company) !== ctx.company) {
         return reply.status(403).send({ error: "Employee not in your Company" });
       }
       const { company: _drop, ...data } = record;
-      return { data };
+      return {
+        data,
+        _saved_fields: standardFields,
+        _statutory_saved: statutorySaved,
+        _statutory_failed: statutoryFailed,
+      };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;

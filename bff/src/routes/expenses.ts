@@ -12,6 +12,7 @@ import {
   evaluateMarkPaid,
   fetchRulesRowForResponse,
   hasBlockingFinding,
+  isDbConfigured,
   loadCompanyRulesPack,
   mergeClaimPolicyWarnings,
   upsertCompanyRules,
@@ -24,16 +25,14 @@ const erp = defaultClient();
 
 /**
  * Resolve the canonical ERPNext Company docname from ctx.company.
- * ctx.company may be a display name that differs from the ERP docname — this
- * function tries a direct getDoc first (fast path), then falls back to a
- * company_name filter lookup. Mirrors the same logic in employee.ts.
+ * ctx.company may be a display name that differs from the ERP docname.
  */
 async function resolveCompanyDocName(creds: ErpCredentials, company: string): Promise<string> {
   const raw = String(company ?? "").trim();
   if (!raw) return raw;
   try {
     await erp.getDoc(creds, "Company", raw);
-    return raw; // raw IS the docname
+    return raw;
   } catch (e) {
     if (!(e instanceof ErpError)) throw e;
   }
@@ -241,6 +240,18 @@ function pendingClaimFilters(ctx: { company: string; userEmail: string }): unkno
     ["docstatus", "=", 1],
     ["approval_status", "not in", ["Approved", "Rejected"]],
   ];
+}
+
+/** Pending list: assigned approver queue, or company-wide submitted queue for finance / HR (`canSubmitOnBehalf`). */
+function pendingApprovalListFilters(ctx: HrContext): unknown[] {
+  if (ctx.canSubmitOnBehalf) {
+    return [
+      ["company", "=", ctx.company],
+      ["docstatus", "=", 1],
+      ["approval_status", "not in", ["Approved", "Rejected"]],
+    ];
+  }
+  return pendingClaimFilters(ctx);
 }
 
 function normalizeStatus(v: unknown): string {
@@ -679,40 +690,46 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const filters: unknown[] = [["company", "=", ctx.company]];
+      const resolvedCompany = await resolveCompanyDocName(ctx.creds, ctx.company);
+      const filters: unknown[] = [["company", "=", resolvedCompany]];
       if (!ctx.canSubmitOnBehalf) {
-        // Regular employee: restrict to their own claims
-        const mine = await erp.listDocs(ctx.creds, "Employee", {
-          filters: [
-            ["user_id", "=", ctx.userEmail],
-            ["company", "=", ctx.company],
-          ],
-          fields: ["name"],
-          limit_page_length: 1,
-        });
-        const empName = asRecord(mine.data?.[0])?.name;
-        if (!empName || typeof empName !== "string") {
-          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        // Regular employee: restrict to their own claims (try user_id then personal_email)
+        let empName: string | undefined;
+        for (const field of ["user_id", "personal_email"] as const) {
+          const rows = await erp.listDocs(ctx.creds, "Employee", {
+            filters: [
+              [field, "=", ctx.userEmail],
+              ["company", "=", resolvedCompany],
+            ],
+            fields: ["name"],
+            limit_page_length: 1,
+          });
+          const row = asRecord(rows.data?.[0]);
+          if (row?.name && typeof row.name === "string") { empName = row.name; break; }
+        }
+        if (!empName) {
+          // Return empty summary rather than 403 so the card shows 0s gracefully
+          return { data: { drafts: 0, in_review: 0, approved: 0, queue: 0, total_in_review: 0, total_approved: 0, total_drafts: 0, scan_capped: false } };
         }
         filters.push(["employee", "=", empName]);
       }
 
       const mineRes = await erp.listDocs(ctx.creds, "Expense Claim", {
         filters,
-        fields: ["docstatus", "approval_status"],
+        fields: ["docstatus", "approval_status", "total_claimed_amount", "grand_total"],
         order_by: "modified desc",
         limit_page_length: SUMMARY_SCAN_CAP,
       });
       const mineRows = mineRes.data ?? [];
-      let drafts = 0;
-      let approved = 0;
-      let inReview = 0;
+      let drafts = 0, approved = 0, inReview = 0;
+      let totalDrafts = 0, totalApproved = 0, totalInReview = 0;
       for (const r of mineRows) {
         const rec = asRecord(r);
         if (!rec) continue;
-        if (Number(rec.docstatus) === 0) drafts++;
-        else if (String(rec.approval_status ?? "").toLowerCase() === "approved") approved++;
-        else inReview++;
+        const amt = Number(rec.total_claimed_amount ?? rec.grand_total ?? 0);
+        if (Number(rec.docstatus) === 0) { drafts++; totalDrafts += amt; }
+        else if (String(rec.approval_status ?? "").toLowerCase() === "approved") { approved++; totalApproved += amt; }
+        else { inReview++; totalInReview += amt; }
       }
 
       const pendRes = await erp.listDocs(ctx.creds, "Expense Claim", {
@@ -729,6 +746,9 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
           in_review: inReview,
           approved,
           queue,
+          total_in_review: totalInReview,
+          total_approved: totalApproved,
+          total_drafts: totalDrafts,
           scan_capped: mineRows.length >= SUMMARY_SCAN_CAP || queue >= SUMMARY_SCAN_CAP,
         },
       };
@@ -738,7 +758,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  /** Policy / workflow / feature flags (Supabase). Empty defaults when not configured. */
+  /** Policy / workflow / feature flags. Empty defaults when DB not configured. */
   app.get("/v1/expenses/rules", async (req, reply) => {
     let ctx;
     try {
@@ -756,7 +776,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
           workflow: pack.workflow,
           feature_flags: pack.feature_flags,
           updated_at: row?.updated_at ?? null,
-          supabase_configured: Boolean(config.SUPABASE_URL?.trim() && config.SUPABASE_SERVICE_ROLE_KEY?.trim()),
+          supabase_configured: isDbConfigured(),
         },
       };
     } catch (e) {
@@ -841,35 +861,23 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         // Creating own claim — resolve company docname first (ctx.company may be a display name
         // that doesn't match the ERP docname), then look up by user_id / personal_email fallback.
         const resolvedCompany = await resolveCompanyDocName(ctx.creds, ctx.company);
-        req.log.warn({ email: ctx.userEmail, ctx_company: ctx.company, resolved_company: resolvedCompany }, "[expense-create] self-claim lookup");
-        async function findSelfEmployee(): Promise<Record<string, unknown> | null> {
-          for (const field of ["user_id", "personal_email"] as const) {
-            try {
-              const rows = await erp.listDocs(ctx!.creds, "Employee", {
-                filters: [[field, "=", ctx!.userEmail], ["company", "=", resolvedCompany]],
-                fields: ["name", "company", "department", "expense_approver"],
-                limit_page_length: 1,
-              });
-              const row = asRecord(rows.data?.[0]);
-              if (row?.name) {
-                req.log.warn({ field, employee: row.name }, "[expense-create] found employee");
-                return row;
-              }
-              req.log.warn({ field }, "[expense-create] no match");
-            } catch (e) {
-              req.log.warn({ field, err: e instanceof Error ? e.message : String(e) }, "[expense-create] lookup error");
-            }
-          }
-          return null;
+        let selfEmp: Record<string, unknown> | null = null;
+        for (const field of ["user_id", "personal_email"] as const) {
+          try {
+            const rows = await erp.listDocs(ctx.creds, "Employee", {
+              filters: [[field, "=", ctx.userEmail], ["company", "=", resolvedCompany]],
+              fields: ["name", "company", "department", "expense_approver"],
+              limit_page_length: 1,
+            });
+            const row = asRecord(rows.data?.[0]);
+            if (row?.name) { selfEmp = row; break; }
+          } catch { /* try next field */ }
         }
-        const selfEmp = await findSelfEmployee();
         if (!selfEmp?.name) {
-          req.log.warn({ email: ctx.userEmail, resolved_company: resolvedCompany }, "[expense-create] BLOCKED — no employee found");
           return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
         }
         employee = String(selfEmp.name);
         employeeDept = String(selfEmp.department ?? "").trim() || undefined;
-        req.log.warn({ employee, dept: employeeDept ?? "none" }, "[expense-create] resolved employee");
       }
 
       // Frappe will copy employee.department onto the claim via fetch_from on every save.
@@ -1069,7 +1077,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         pendFields.push(config.EXPENSE_FIRST_APPROVER_FIELD);
       }
       const res = await erp.listDocs(ctx.creds, "Expense Claim", {
-        filters: pendingClaimFilters(ctx),
+        filters: pendingApprovalListFilters(ctx),
         fields: pendFields,
         order_by: "modified desc",
         limit_start: limitStart,
@@ -1078,6 +1086,73 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       const raw = res.data ?? [];
       const hasMore = raw.length > pageSize;
       const slice = hasMore ? raw.slice(0, pageSize) : raw;
+      const data = await mapRowsWithPolicy(slice, ctx.company);
+      return {
+        data,
+        meta: { page, page_size: pageSize, has_more: hasMore },
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * Approved, submitted claims with no reimbursement recorded yet (finance payout queue).
+   * Only users with `canSubmitOnBehalf` may list this.
+   */
+  app.get("/v1/expenses/ready-to-pay", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only finance users may view the ready-to-pay queue" });
+    }
+
+    try {
+      const { page, pageSize, limitStart } = parsePageParams(req);
+      const take = pageSize + 1;
+      const payFields = [
+        "name",
+        "employee",
+        "employee_name",
+        "company",
+        "posting_date",
+        "approval_status",
+        "expense_approver",
+        "docstatus",
+        "grand_total",
+        "total_claimed_amount",
+        "total_sanctioned_amount",
+        "total_amount_reimbursed",
+      ];
+      if (config.EXPENSE_TWO_STAGE_APPROVAL) {
+        payFields.push(config.EXPENSE_FIRST_APPROVER_FIELD);
+      }
+      const res = await erp.listDocs(ctx.creds, "Expense Claim", {
+        filters: [
+          ["company", "=", ctx.company],
+          ["docstatus", "=", 1],
+          ["approval_status", "=", "Approved"],
+          ["total_amount_reimbursed", "=", 0],
+        ],
+        fields: payFields,
+        order_by: "modified desc",
+        limit_start: limitStart,
+        limit_page_length: take,
+      });
+      const raw = res.data ?? [];
+      const unpaid = raw.filter((row) => {
+        const rec = asRecord(row);
+        if (!rec) return false;
+        return !isPaidClaim(rec);
+      });
+      const hasMore = unpaid.length > pageSize;
+      const slice = hasMore ? unpaid.slice(0, pageSize) : unpaid;
       const data = await mapRowsWithPolicy(slice, ctx.company);
       return {
         data,

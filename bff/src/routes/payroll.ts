@@ -41,32 +41,51 @@ function kenyaStructureName(company: string): string {
 }
 
 /**
- * Kenya PAYE formula (Frappe Python expression evaluated on gross_pay).
- * Tax bands (2024/25): 0-24k:10%, 24k-32333:25%, 32333-500k:30%, 500k-800k:32.5%, 800k+:35%
+ * Kenya PAYE formula — KRA Finance Act 2023.
+ * Taxable income = gross_pay − NSSF − SHIF − HL  (KRA-compliant: statutory
+ * deductions reduce the PAYE base before bands are applied).
+ * NSSF, SHIF, and HL are referenced by their component abbreviations; they
+ * must be evaluated BEFORE PAYE in the salary structure deductions list.
+ *
+ * Tax bands: 0-24k@10%, 24k-32333@25%, 32333-500k@30%, 500k-800k@32.5%, 800k+@35%
  * Personal relief: KES 2,400/month
  *
- * Note: Frappe's safe_eval sandbox does NOT expose max() / min() builtins.
- * We use Python ternary expressions instead.
- * At gross_pay < 24000 the entire tax is covered by personal relief → 0.
- * At gross_pay >= 24000 the band calculation always exceeds the 2400 relief,
- * so no outer clamp is needed.
+ * Algebra shortcut: when taxable ≤ 24,000 the first band (10%) ≤ 2,400 so
+ * personal relief fully covers the tax → PAYE = 0.
+ * When taxable > 24,000 the first band is exactly 2,400 which cancels the
+ * personal relief, so PAYE = round(band2 + band3 + band4 + band5, 2).
+ *
+ * Frappe safe_eval has no max()/min() — ternary expressions are used instead.
  */
+const _T = "gross_pay-NSSF-SHIF-HL"; // taxable income variable (inlined)
 const PAYE_FORMULA =
-  "(0 if gross_pay < 24000 else round(" +
-  "((gross_pay if gross_pay < 32333 else 32333) - 24000) * 0.25 + " +
-  "(0 if gross_pay <= 32333 else ((gross_pay if gross_pay < 500000 else 500000) - 32333) * 0.30) + " +
-  "(0 if gross_pay <= 500000 else ((gross_pay if gross_pay < 800000 else 800000) - 500000) * 0.325) + " +
-  "(0 if gross_pay <= 800000 else (gross_pay - 800000) * 0.35), 2))";
+  `(0 if (${_T})<=24000 else round(` +
+  `(((${_T}) if (${_T})<32333 else 32333)-24000)*0.25+` +
+  `(0 if (${_T})<=32333 else (((${_T}) if (${_T})<500000 else 500000)-32333)*0.30)+` +
+  `(0 if (${_T})<=500000 else (((${_T}) if (${_T})<800000 else 800000)-500000)*0.325)+` +
+  `(0 if (${_T})<=800000 else ((${_T})-800000)*0.35)` +
+  `,2))`;
 
-/** NSSF: 6% of gross, max KES 2,160 (pensionable pay ceiling KES 36,000).
- *  Frappe sandbox has no min() — use ternary. */
-const NSSF_FORMULA = "(round(gross_pay * 0.06, 2) if gross_pay < 36000 else 2160)";
+/**
+ * NSSF Phase 3 (effective Dec 2024): 6% of gross, pensionable pay ceiling
+ * raised to KES 108,000 → max employee contribution KES 6,480/month.
+ * Frappe sandbox has no min() — use ternary.
+ */
+const NSSF_FORMULA = "(round(gross_pay * 0.06, 2) if gross_pay < 108000 else 6480)";
 
 /** SHIF (Social Health Insurance Fund): 2.75% of gross */
 const SHIF_FORMULA = "round(gross_pay * 0.0275, 2)";
 
 /** Affordable Housing Levy (employee share): 1.5% of gross */
 const HOUSING_LEVY_FORMULA = "round(gross_pay * 0.015, 2)";
+
+/**
+ * Overtime Pay formula.
+ * overtime_hours is populated on the Salary Slip when a Timesheet is linked.
+ * Without a linked timesheet the field is 0, so the component contributes nothing.
+ * Rate: 1.5 × daily rate (base ÷ 22 working days ÷ 8 hours per day).
+ */
+const OVERTIME_FORMULA = "round(overtime_hours * (base / 22 / 8) * 1.5, 2)";
 
 // ── Setup Helpers ─────────────────────────────────────────────────────────────
 
@@ -78,7 +97,8 @@ async function ensureSalaryComponent(
   creds: ErpCredentials,
   name: string,
   type: "Earning" | "Deduction",
-  abbr: string
+  abbr: string,
+  opts: { depends_on_payment_days?: 0 | 1 } = {}
 ): Promise<void> {
   try {
     await erp.getDoc(creds, "Salary Component", name);
@@ -95,6 +115,9 @@ async function ensureSalaryComponent(
       salary_component_abbr: abbr,
       type,
       is_payable: 1,
+      ...(opts.depends_on_payment_days !== undefined
+        ? { depends_on_payment_days: opts.depends_on_payment_days }
+        : {}),
     },
   });
 }
@@ -190,23 +213,28 @@ function buildStructureDoc(structName: string, company: string): Record<string, 
         formula: "base",
         idx: 1,
       },
+      {
+        // Overtime: populated only when a Timesheet is linked to the Salary Slip.
+        // When no timesheet is linked, overtime_hours = 0 → component contributes KES 0.
+        doctype: "Salary Detail",
+        salary_component: "Overtime Pay",
+        abbr: "OT",
+        amount_based_on_formula: 1,
+        formula: OVERTIME_FORMULA,
+        idx: 2,
+      },
     ],
     deductions: [
-      {
-        doctype: "Salary Detail",
-        salary_component: "PAYE",
-        abbr: "PAYE",
-        amount_based_on_formula: 1,
-        formula: PAYE_FORMULA,
-        idx: 1,
-      },
+      // NSSF, SHIF, and HL are evaluated first (idx 1-3) so their computed
+      // amounts are available as variables (NSSF, SHIF, HL) when PAYE (idx 4)
+      // calculates taxable income = gross_pay − NSSF − SHIF − HL.
       {
         doctype: "Salary Detail",
         salary_component: "NSSF",
         abbr: "NSSF",
         amount_based_on_formula: 1,
         formula: NSSF_FORMULA,
-        idx: 2,
+        idx: 1,
       },
       {
         doctype: "Salary Detail",
@@ -214,7 +242,7 @@ function buildStructureDoc(structName: string, company: string): Record<string, 
         abbr: "SHIF",
         amount_based_on_formula: 1,
         formula: SHIF_FORMULA,
-        idx: 3,
+        idx: 2,
       },
       {
         doctype: "Salary Detail",
@@ -222,6 +250,14 @@ function buildStructureDoc(structName: string, company: string): Record<string, 
         abbr: "HL",
         amount_based_on_formula: 1,
         formula: HOUSING_LEVY_FORMULA,
+        idx: 3,
+      },
+      {
+        doctype: "Salary Detail",
+        salary_component: "PAYE",
+        abbr: "PAYE",
+        amount_based_on_formula: 1,
+        formula: PAYE_FORMULA,
         idx: 4,
       },
     ],
@@ -229,9 +265,13 @@ function buildStructureDoc(structName: string, company: string): Record<string, 
 }
 
 /**
- * Returns true if any earning/deduction formula uses max() or min(), which are
- * NOT available in Frappe's safe_eval sandbox and will cause a ValidationError
- * when the salary slip is generated.
+ * Returns true if the salary structure needs to be rebuilt.
+ * Triggers:
+ *  1. Any formula uses max()/min() — not available in Frappe's safe_eval sandbox.
+ *  2. NSSF formula still uses the old Phase 2 ceiling (KES 36,000 / KES 2,160).
+ *  3. PAYE formula computes on gross_pay directly instead of taxable income
+ *     (i.e., it doesn't reference NSSF to subtract statutory deductions first).
+ *  4. PAYE is evaluated before NSSF (idx 1) — deduction order must be NSSF→SHIF→HL→PAYE.
  */
 function formulasNeedPatch(doc: Record<string, unknown>): boolean {
   for (const tableKey of ["earnings", "deductions"]) {
@@ -239,11 +279,28 @@ function formulasNeedPatch(doc: Record<string, unknown>): boolean {
     if (!Array.isArray(rows)) continue;
     for (const row of rows) {
       const r = row as Record<string, unknown>;
-      if (
-        typeof r.formula === "string" &&
-        (/\bmax\s*\(/.test(r.formula) || /\bmin\s*\(/.test(r.formula))
-      ) {
-        console.log(`[payroll] Found unsupported max/min in ${tableKey} formula: ${r.formula?.toString().slice(0, 80)}`);
+      if (typeof r.formula !== "string") continue;
+      const comp = String(r.salary_component ?? "");
+      const formula = r.formula;
+
+      // 1. Unsupported builtins in Frappe safe_eval
+      if (/\bmax\s*\(/.test(formula) || /\bmin\s*\(/.test(formula)) {
+        console.log(`[payroll] Found unsupported max/min in ${comp} formula — rebuild needed`);
+        return true;
+      }
+      // 2. Old Phase 2 NSSF cap (36,000 ceiling → 2,160 max)
+      if (comp === "NSSF" && formula.includes("36000")) {
+        console.log(`[payroll] Found Phase 2 NSSF formula — rebuild needed for Phase 3`);
+        return true;
+      }
+      // 3. Old PAYE formula computes on gross_pay, not taxable income
+      if (comp === "PAYE" && !formula.includes("NSSF")) {
+        console.log(`[payroll] Found PAYE formula on gross_pay basis — rebuild needed for taxable income basis`);
+        return true;
+      }
+      // 4. PAYE evaluated before NSSF (NSSF must be idx 1, PAYE idx 4)
+      if (comp === "PAYE" && Number(r.idx ?? 0) < 4) {
+        console.log(`[payroll] PAYE idx=${r.idx} is before NSSF — rebuild needed to fix deduction order`);
         return true;
       }
     }
@@ -353,6 +410,15 @@ async function ensureKenyaStructure(
         ensureSalaryComponent(creds, "NSSF", "Deduction", "NSSF"),
         ensureSalaryComponent(creds, "SHIF", "Deduction", "SHIF"),
         ensureSalaryComponent(creds, "Housing Levy", "Deduction", "HL"),
+        // HELB is a per-employee recurring deduction added via Additional Salary,
+        // not part of the base structure. Register the component master so ERPNext
+        // accepts Additional Salary records that reference it.
+        ensureSalaryComponent(creds, "HELB", "Deduction", "HELB", { depends_on_payment_days: 0 }),
+        ensureSalaryComponent(creds, "Overtime Pay", "Earning", "OT", { depends_on_payment_days: 0 }),
+        // Loan Deduction: per-employee recurring deduction via Additional Salary.
+        // Not in the base structure formula; registered here so ERPNext accepts
+        // Additional Salary records that reference this component.
+        ensureSalaryComponent(creds, "Loan Deduction", "Deduction", "LOAN", { depends_on_payment_days: 0 }),
       ]);
       await erp.callMethod(creds, "frappe.client.insert", { doc: buildStructureDoc(structName, company) });
       console.log(`[payroll] Structure recreated — submitting`);
@@ -401,6 +467,16 @@ async function ensureKenyaStructure(
     ensureSalaryComponent(creds, "NSSF", "Deduction", "NSSF"),
     ensureSalaryComponent(creds, "SHIF", "Deduction", "SHIF"),
     ensureSalaryComponent(creds, "Housing Levy", "Deduction", "HL"),
+    // HELB: per-employee fixed deduction via Additional Salary; not in the base
+    // structure formula. depends_on_payment_days=0 keeps the amount constant
+    // even on partial-month payroll runs.
+    ensureSalaryComponent(creds, "HELB", "Deduction", "HELB", { depends_on_payment_days: 0 }),
+    // Overtime Pay: included in the structure formula; resolves to 0 when no
+    // timesheet is linked. depends_on_payment_days=0 to keep formula-driven.
+    ensureSalaryComponent(creds, "Overtime Pay", "Earning", "OT", { depends_on_payment_days: 0 }),
+    // Loan Deduction: per-employee recurring deduction via Additional Salary.
+    // Not in the base structure formula; registered so ERPNext accepts records.
+    ensureSalaryComponent(creds, "Loan Deduction", "Deduction", "LOAN", { depends_on_payment_days: 0 }),
   ]);
 
   // Create the salary structure (pass __newname to handle autoname="Prompt" setups)
@@ -643,6 +719,337 @@ async function upsertSalaryStructureAssignment(
   console.log(`[payroll] Assignment ${assignName} submitted`);
 }
 
+/**
+ * Idempotent helper: create, update, or remove the recurring HELB Additional
+ * Salary record for an employee.
+ *
+ * amount = 0  → cancel + delete any existing record (employee is clearing HELB)
+ * amount > 0  → cancel + delete old, insert fresh recurring record
+ *
+ * HELB is a post-tax fixed monthly repayment; `depends_on_payment_days=0` on
+ * the Salary Component master ensures ERPNext doesn't pro-rate it.
+ */
+async function upsertHelbAdditionalSalary(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  from_date: string,
+  amount: number,
+): Promise<void> {
+  // Find ALL HELB Additional Salary records for this employee (any is_recurring value,
+  // any docstatus except cancelled) so we clean up both old recurring and new non-recurring ones.
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters: [
+      ["employee", "=", employeeId],
+      ["salary_component", "=", "HELB"],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name", "docstatus", "to_date"],
+    limit_page_length: 20,
+  })) as Array<{ name: string; docstatus: number; to_date?: string }>;
+
+  console.log(`[payroll] Found ${existing.length} existing HELB record(s) for ${employeeId}`);
+
+  // Cancel + delete each existing record.
+  // Old records created without to_date: patch to_date first so ERPNext's
+  // cancel validation passes (it re-validates the doc on cancel).
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        const hasToDate = String(row.to_date ?? "").trim() !== "";
+        if (!hasToDate) {
+          // Best-effort: try to add to_date before cancelling
+          try {
+            await erp.callMethod(creds, "frappe.client.set_value", {
+              doctype: "Additional Salary",
+              name: row.name,
+              fieldname: "to_date",
+              value: "2099-12-31",
+            });
+            console.log(`[payroll] Patched to_date on ${row.name} before cancel`);
+          } catch (patchErr) {
+            // set_value may fail on submitted docs whose field lacks allow_on_submit.
+            // Try an alternative: update the full doc via REST PUT.
+            try {
+              await erp.updateDoc(creds, "Additional Salary", row.name, {
+                to_date: "2099-12-31",
+              });
+              console.log(`[payroll] updateDoc patched to_date on ${row.name}`);
+            } catch (putErr) {
+              console.log(
+                `[payroll] Could not patch to_date on ${row.name} (set_value: ` +
+                `${patchErr instanceof Error ? patchErr.message : String(patchErr)}, ` +
+                `updateDoc: ${putErr instanceof Error ? putErr.message : String(putErr)})`
+              );
+            }
+          }
+        }
+        await erp.callMethod(creds, "frappe.client.cancel", {
+          doctype: "Additional Salary",
+          name: row.name,
+        });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+      console.log(`[payroll] Removed HELB record ${row.name} for ${employeeId}`);
+    } catch (e) {
+      console.log(
+        `[payroll] Could not remove HELB record ${row.name}: ` +
+        (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
+
+  if (amount <= 0) {
+    console.log(`[payroll] HELB cleared for ${employeeId}`);
+    return;
+  }
+
+  // Insert recurring HELB deduction. is_recurring:1 requires both from_date and
+  // to_date — use a far-future sentinel so it applies to every future payroll run.
+  await erp.callMethod(creds, "frappe.client.insert", {
+    doc: {
+      doctype: "Additional Salary",
+      employee: employeeId,
+      salary_component: "HELB",
+      type: "Deduction",
+      amount,
+      company,
+      is_recurring: 1,
+      from_date,
+      to_date: "2099-12-31",
+      currency: "KES",
+    },
+  });
+  console.log(`[payroll] Set HELB ${amount} KES/mo from ${from_date} for ${employeeId}`);
+}
+
+/**
+ * Upsert a one-time Overtime Pay Additional Salary for an employee.
+ * Used when HR inputs overtime manually for employees without a timesheet.
+ *
+ * amount = 0  → cancel + delete any existing OT record for this payroll_date
+ * amount > 0  → cancel + delete old, insert fresh one-time earning
+ *
+ * Non-recurring (is_recurring: 0) — needs payroll_date (the period posting date).
+ */
+async function upsertOvertimeAdditionalSalary(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  payroll_date: string,
+  amount: number,
+): Promise<void> {
+  // Find existing one-time OT Additional Salary records for this employee + date
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters: [
+      ["employee", "=", employeeId],
+      ["salary_component", "=", "Overtime Pay"],
+      ["payroll_date", "=", payroll_date],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name", "docstatus"],
+    limit_page_length: 10,
+  })) as Array<{ name: string; docstatus: number }>;
+
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        await erp.callMethod(creds, "frappe.client.cancel", {
+          doctype: "Additional Salary",
+          name: row.name,
+        });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+      console.log(`[payroll] Removed Overtime Additional Salary ${row.name} for ${employeeId}`);
+    } catch (e) {
+      console.log(
+        `[payroll] Could not remove Overtime record ${row.name}: ` +
+        (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
+
+  if (amount <= 0) {
+    console.log(`[payroll] Overtime cleared for ${employeeId} on ${payroll_date}`);
+    return;
+  }
+
+  await erp.callMethod(creds, "frappe.client.insert", {
+    doc: {
+      doctype: "Additional Salary",
+      employee: employeeId,
+      salary_component: "Overtime Pay",
+      type: "Earning",
+      amount,
+      company,
+      is_recurring: 0,
+      payroll_date,
+      currency: "KES",
+    },
+  });
+  console.log(`[payroll] Set manual Overtime Pay KES ${amount} on ${payroll_date} for ${employeeId}`);
+}
+
+/**
+ * Upsert a recurring Loan Deduction Additional Salary for an employee.
+ *
+ * amount = 0  → cancel + delete any existing record (loan fully repaid / removed)
+ * amount > 0  → cancel + delete old, insert fresh recurring record
+ *
+ * is_recurring:1 — applies every payroll run until the to_date sentinel.
+ * depends_on_payment_days=0 on the component master keeps the amount constant.
+ */
+async function upsertLoanDeductionAdditionalSalary(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  from_date: string,
+  amount: number,
+  loanRef?: string,
+): Promise<void> {
+  const filters: unknown[] = [
+    ["employee", "=", employeeId],
+    ["salary_component", "=", "Loan Deduction"],
+    ["docstatus", "!=", 2],
+  ];
+  if (loanRef) filters.push(["remarks", "=", loanRef]);
+
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters,
+    fields: ["name", "docstatus", "to_date"],
+    limit_page_length: 20,
+  })) as Array<{ name: string; docstatus: number; to_date?: string }>;
+
+  console.log(`[payroll] Found ${existing.length} existing Loan Deduction record(s) for ${employeeId}`);
+
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        const hasToDate = String(row.to_date ?? "").trim() !== "";
+        if (!hasToDate) {
+          try {
+            await erp.callMethod(creds, "frappe.client.set_value", {
+              doctype: "Additional Salary",
+              name: row.name,
+              fieldname: "to_date",
+              value: "2099-12-31",
+            });
+          } catch {
+            try {
+              await erp.updateDoc(creds, "Additional Salary", row.name, { to_date: "2099-12-31" });
+            } catch { /* best-effort */ }
+          }
+        }
+        await erp.callMethod(creds, "frappe.client.cancel", {
+          doctype: "Additional Salary",
+          name: row.name,
+        });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+      console.log(`[payroll] Removed Loan Deduction record ${row.name} for ${employeeId}`);
+    } catch (e) {
+      console.log(
+        `[payroll] Could not remove Loan Deduction record ${row.name}: ` +
+        (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
+
+  if (amount <= 0) {
+    console.log(`[payroll] Loan Deduction cleared for ${employeeId}`);
+    return;
+  }
+
+  const doc: Record<string, unknown> = {
+    doctype: "Additional Salary",
+    employee: employeeId,
+    salary_component: "Loan Deduction",
+    type: "Deduction",
+    amount,
+    company,
+    is_recurring: 1,
+    from_date,
+    to_date: "2099-12-31",
+    currency: "KES",
+  };
+  if (loanRef) doc.remarks = loanRef;
+
+  await erp.callMethod(creds, "frappe.client.insert", { doc });
+  console.log(`[payroll] Set Loan Deduction KES ${amount}/mo from ${from_date} for ${employeeId}${loanRef ? ` (loan: ${loanRef})` : ""}`);
+}
+
+// ── Recurring earning-type allowance upsert ───────────────────────────────────
+
+const EARNING_ALLOWANCE_COMPONENTS: Record<string, { abbr: string; label: string }> = {
+  house_allowance:      { abbr: "HOUSE", label: "House Allowance" },
+  transport_allowance:  { abbr: "TRANS", label: "Transport Allowance" },
+  meal_allowance:       { abbr: "MEAL",  label: "Meal Allowance" },
+  directors_fee:        { abbr: "DIR",   label: "Directors Fee" },
+  reimbursement:        { abbr: "REIMB", label: "Reimbursement" },
+};
+
+/**
+ * Upsert a recurring earning Additional Salary record for a single component.
+ * amount = 0 → cancel + delete existing record.
+ * amount > 0 → cancel + delete old, insert fresh recurring record.
+ */
+async function upsertRecurringEarningAllowance(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  componentName: string,
+  from_date: string,
+  amount: number,
+): Promise<void> {
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters: [
+      ["employee", "=", employeeId],
+      ["salary_component", "=", componentName],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name", "docstatus", "to_date"],
+    limit_page_length: 20,
+  })) as Array<{ name: string; docstatus: number; to_date?: string }>;
+
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        if (!String(row.to_date ?? "").trim()) {
+          try {
+            await erp.callMethod(creds, "frappe.client.set_value", {
+              doctype: "Additional Salary", name: row.name, fieldname: "to_date", value: "2099-12-31",
+            });
+          } catch {
+            await erp.updateDoc(creds, "Additional Salary", row.name, { to_date: "2099-12-31" }).catch(() => {});
+          }
+        }
+        await erp.callMethod(creds, "frappe.client.cancel", { doctype: "Additional Salary", name: row.name });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+    } catch (e) {
+      console.log(`[payroll] Could not remove ${componentName} record ${row.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (amount <= 0) return;
+
+  await erp.callMethod(creds, "frappe.client.insert", {
+    doc: {
+      doctype: "Additional Salary",
+      employee: employeeId,
+      salary_component: componentName,
+      type: "Earning",
+      amount,
+      company,
+      is_recurring: 1,
+      from_date,
+      to_date: "2099-12-31",
+      currency: "KES",
+    },
+  });
+  console.log(`[payroll] Set ${componentName} KES ${amount}/mo from ${from_date} for ${employeeId}`);
+}
+
 // ── Route Plugin ──────────────────────────────────────────────────────────────
 
 export const payrollRoutes: FastifyPluginAsync = async (app) => {
@@ -738,7 +1145,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
     ];
 
     try {
-      const [employees, assignments, countResult] = await Promise.all([
+      const [employees, assignments, helbRows, overtimeRows, countResult] = await Promise.all([
         erp.getList(ctx.creds, "Employee", {
           filters: empFilters,
           fields: ["name", "employee_name", "designation", "department", "date_of_joining"],
@@ -751,6 +1158,26 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
           fields: ["employee", "base", "from_date", "salary_structure"],
           order_by: "from_date desc",
           limit_page_length: 500,
+        }),
+        erp.getList(ctx.creds, "Additional Salary", {
+          filters: [
+            ["company", "=", ctx.company],
+            ["salary_component", "=", "HELB"],
+            ["docstatus", "!=", 2],
+          ],
+          fields: ["employee", "amount"],
+          order_by: "modified desc",
+          limit_page_length: 1000,
+        }),
+        erp.getList(ctx.creds, "Additional Salary", {
+          filters: [
+            ["company", "=", ctx.company],
+            ["salary_component", "=", "Overtime Pay"],
+            ["docstatus", "!=", 2],
+          ],
+          fields: ["employee", "amount", "payroll_date"],
+          order_by: "payroll_date desc, modified desc",
+          limit_page_length: 1000,
         }),
         erp.callMethod(ctx.creds, "frappe.client.get_count", {
           doctype: "Employee",
@@ -770,10 +1197,33 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         const emp = String(r.employee ?? "");
         if (!latestAssignment.has(emp)) latestAssignment.set(emp, r);
       }
+      const helbByEmployee = new Map<string, number>();
+      for (const row of helbRows as Record<string, unknown>[]) {
+        const emp = String(row.employee ?? "");
+        if (!emp || helbByEmployee.has(emp)) continue;
+        const amount = Number(row.amount ?? 0);
+        helbByEmployee.set(emp, Number.isFinite(amount) ? amount : 0);
+      }
+      const overtimeByEmployee = new Map<string, number>();
+      for (const row of overtimeRows as Record<string, unknown>[]) {
+        const emp = String(row.employee ?? "");
+        if (!emp || overtimeByEmployee.has(emp)) continue;
+        const amount = Number(row.amount ?? 0);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          overtimeByEmployee.set(emp, 0);
+          continue;
+        }
+        const asgn = latestAssignment.get(emp);
+        const base = Number(asgn?.base ?? 0);
+        const hourly = base > 0 ? base / 22 / 8 : 0;
+        const estimatedHours = hourly > 0 ? amount / (hourly * 1.5) : 0;
+        overtimeByEmployee.set(emp, Math.max(0, Math.round(estimatedHours * 100) / 100));
+      }
 
       const kenyaStruct = kenyaStructureName(ctx.company);
       const data = (employees as Record<string, unknown>[]).map((emp) => {
-        const asgn = latestAssignment.get(String(emp.name ?? ""));
+        const employeeId = String(emp.name ?? "");
+        const asgn = latestAssignment.get(employeeId);
         return {
           ...emp,
           base_salary: asgn ? Number(asgn.base) : null,
@@ -781,6 +1231,8 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
           on_kenya_structure: asgn
             ? String(asgn.salary_structure ?? "") === kenyaStruct
             : false,
+          helb_monthly: helbByEmployee.get(employeeId) ?? 0,
+          overtime_hours: overtimeByEmployee.get(employeeId) ?? 0,
         };
       });
 
@@ -812,6 +1264,10 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
       /^\d{4}-\d{2}-\d{2}$/.test(String(body.date_of_joining ?? ""))
         ? String(body.date_of_joining)
         : new Date().toISOString().slice(0, 10);
+    const helb_monthly = Number(body.helb_monthly ?? 0) || 0;
+    const overtime_hours =
+      "overtime_hours" in body ? Math.max(0, Number(body.overtime_hours) || 0) : -1;
+    const overtimeProvided = overtime_hours >= 0;
 
     if (!first_name) return reply.status(400).send({ error: "first_name is required" });
     if (!gross_salary || gross_salary <= 0)
@@ -833,7 +1289,12 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
 
       const employeeId = String(empDoc.name ?? "");
 
-      // Upsert Salary Structure Assignment (idempotent — updates if already exists)
+      // HELB must run before the SSA upsert: the SSA cancel step triggers ERPNext
+      // on_cancel hooks that re-validate existing Additional Salary records. Any
+      // stuck HELB record (no to_date) must be cleaned up first to avoid a 417.
+      if (helb_monthly > 0) {
+        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, date_of_joining, helb_monthly);
+      }
       await upsertSalaryStructureAssignment(ctx.creds, {
         employeeId,
         structName,
@@ -841,12 +1302,25 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         from_date: date_of_joining,
         base: gross_salary,
       });
+      if (overtimeProvided) {
+        const hourlyRate = gross_salary > 0 ? gross_salary / 22 / 8 : 0;
+        const overtimeAmount = Math.round(overtime_hours * hourlyRate * 1.5 * 100) / 100;
+        await upsertOvertimeAdditionalSalary(
+          ctx.creds,
+          employeeId,
+          ctx.company,
+          date_of_joining,
+          overtimeAmount,
+        );
+      }
 
       return {
         ok: true,
         employee: employeeId,
         employee_name: [first_name, last_name].filter(Boolean).join(" "),
         base_salary: gross_salary,
+        ...(helb_monthly > 0 ? { helb_monthly } : {}),
+        ...(overtimeProvided ? { overtime_hours } : {}),
       };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -876,6 +1350,13 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
       /^\d{4}-\d{2}-\d{2}$/.test(String(body.from_date ?? ""))
         ? String(body.from_date)
         : new Date().toISOString().slice(0, 10);
+    // helb_monthly: undefined/absent = leave HELB unchanged; 0 = clear HELB; >0 = set/update
+    const helb_monthly = "helb_monthly" in body ? Number(body.helb_monthly) || 0 : -1;
+    const helbProvided = helb_monthly >= 0; // true if caller explicitly sent the field
+    // overtime_hours: undefined/absent = leave overtime unchanged; 0 = clear; >0 = set/update
+    const overtime_hours =
+      "overtime_hours" in body ? Math.max(0, Number(body.overtime_hours) || 0) : -1;
+    const overtimeProvided = overtime_hours >= 0;
 
     if (!gross_salary || gross_salary <= 0)
       return reply.status(400).send({ error: "gross_salary must be a positive number" });
@@ -952,7 +1433,20 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // ── Step 3: upsert + submit assignment ───────────────────────────────────
+      // ── Step 3: Clear old Additional Salary records BEFORE SSA cancel ─────────
+      // ERPNext's on_cancel hook for Salary Structure Assignment re-validates all
+      // existing Additional Salary records. If a HELB/OT record is stuck (e.g.
+      // missing to_date), the SSA cancel fails. We clear them first (amount=0 /
+      // overtimeAmount=0) so the SSA cancel hook has nothing to trip over.
+      // New employees have no existing records so this is a safe no-op for them.
+      if (helbProvided) {
+        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, 0);
+      }
+      if (overtimeProvided) {
+        await upsertOvertimeAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, 0);
+      }
+
+      // ── Step 4: SSA — now safe to cancel/recreate ────────────────────────────
       await upsertSalaryStructureAssignment(ctx.creds, {
         employeeId,
         structName,
@@ -961,7 +1455,299 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         base: gross_salary,
       });
 
-      return { ok: true, employee: employeeId, base_salary: gross_salary };
+      // ── Step 5: Insert new Additional Salary records after SSA is active ─────
+      // ERPNext requires an active (docstatus=1) SSA before Additional Salary
+      // records can be inserted/submitted for the employee.
+      if (helbProvided && helb_monthly > 0) {
+        await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, helb_monthly);
+      }
+      if (overtimeProvided && overtime_hours > 0) {
+        const hourlyRate = gross_salary > 0 ? gross_salary / 22 / 8 : 0;
+        const overtimeAmount = Math.round(overtime_hours * hourlyRate * 1.5 * 100) / 100;
+        await upsertOvertimeAdditionalSalary(
+          ctx.creds,
+          employeeId,
+          ctx.company,
+          from_date,
+          overtimeAmount,
+        );
+      }
+
+      return {
+        ok: true,
+        employee: employeeId,
+        base_salary: gross_salary,
+        ...(helbProvided ? { helb_monthly } : {}),
+        ...(overtimeProvided ? { overtime_hours } : {}),
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  // ── Recurring earning allowances — per employee write ─────────────────────
+  //
+  // PATCH /v1/payroll/team/:id/recurring-allowances
+  // Body: { house_allowance?, transport_allowance?, meal_allowance?, directors_fee?, reimbursement?, from_date? }
+  // Upserts Additional Salary (Earning, is_recurring=1) for each field supplied.
+  // 0 = clear, >0 = set/update. Idempotent — safe to call on every allowance edit.
+
+  app.patch("/v1/payroll/team/:id/recurring-allowances", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR only" });
+
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    const employeeId = String(params.id ?? "").trim();
+    if (!employeeId) return reply.status(400).send({ error: "Employee ID required" });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const from_date = String(body.from_date ?? new Date().toISOString().slice(0, 10));
+
+    // Collect only fields that were explicitly provided
+    const updates: Array<{ key: string; componentName: string; amount: number }> = [];
+    for (const [key, meta] of Object.entries(EARNING_ALLOWANCE_COMPONENTS)) {
+      if (key in body) {
+        updates.push({ key, componentName: meta.label, amount: Math.max(0, Number(body[key]) || 0) });
+      }
+    }
+
+    if (updates.length === 0)
+      return reply.status(400).send({ error: "At least one allowance field is required" });
+
+    try {
+      // Verify employee belongs to this company
+      const empDoc = await erp.getDoc(ctx.creds, "Employee", employeeId);
+      if (String(empDoc.company ?? "") !== ctx.company)
+        return reply.status(403).send({ error: "Employee not in your Company" });
+
+      // Ensure all required salary components exist in ERPNext, then upsert
+      await Promise.all(
+        updates.map(({ componentName }) => {
+          const meta = Object.values(EARNING_ALLOWANCE_COMPONENTS).find((m) => m.label === componentName);
+          return ensureSalaryComponent(ctx.creds, componentName, "Earning", meta?.abbr ?? componentName.slice(0, 5).toUpperCase());
+        }),
+      );
+
+      await Promise.all(
+        updates.map(({ componentName, amount }) =>
+          upsertRecurringEarningAllowance(ctx.creds, employeeId, ctx.company, componentName, from_date, amount),
+        ),
+      );
+
+      const result: Record<string, number> = {};
+      for (const { key, amount } of updates) result[key] = amount;
+      return { ok: true, employee: employeeId, from_date, updated: result };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  // ── HELB recurring assignments — bulk read ──────────────────────────────
+  //
+  // GET /v1/payroll/loan-deductions?employees=EMP001,EMP002,...
+  // Returns { data: { "EMP001": 5000, "EMP002": 0, ... } } — the current recurring
+  // monthly "Loan Deduction" amount per employee. Employees with no active record → 0.
+
+  app.get("/v1/payroll/loan-deductions", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR only" });
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const rawEmployees = String(q.employees ?? "").trim();
+    const employeeIds = rawEmployees
+      ? rawEmployees.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    if (employeeIds.length === 0) return { data: {} };
+
+    try {
+      const rows = (await erp.getList(ctx.creds, "Additional Salary", {
+        filters: [
+          ["employee", "in", employeeIds],
+          ["salary_component", "=", "Loan Deduction"],
+          ["is_recurring", "=", 1],
+          ["docstatus", "!=", 2],
+        ],
+        fields: ["employee", "amount"],
+        limit_page_length: (employeeIds.length * 3) + 10,
+      })) as Array<{ employee: string; amount: number }>;
+
+      // Per employee: sum all active loan deduction records (support for multiple loans).
+      const data: Record<string, number> = Object.fromEntries(employeeIds.map((id) => [id, 0]));
+      for (const row of rows) {
+        const empId = String(row.employee ?? "");
+        const amt = Number(row.amount ?? 0);
+        if (empId && empId in data) data[empId] = (data[empId] ?? 0) + amt;
+      }
+
+      return { data };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  // GET /v1/payroll/helb-assignments?employees=EMP001,EMP002,...
+  // Returns { data: { "EMP001": 2000, "EMP002": 0, ... } } keyed by employee ID.
+  // Employees with no active HELB record are returned as 0.
+
+  app.get("/v1/payroll/helb-assignments", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR only" });
+
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    const rawEmployees = String(q.employees ?? "").trim();
+    const employeeIds = rawEmployees
+      ? rawEmployees.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    if (employeeIds.length === 0) return { data: {} };
+
+    try {
+      const rows = (await erp.getList(ctx.creds, "Additional Salary", {
+        filters: [
+          ["employee", "in", employeeIds],
+          ["salary_component", "=", "HELB"],
+          ["is_recurring", "=", 1],
+          ["docstatus", "!=", 2],
+        ],
+        fields: ["employee", "amount"],
+        limit_page_length: employeeIds.length + 10,
+      })) as Array<{ employee: string; amount: number }>;
+
+      // Build lookup — if multiple records per employee (shouldn't happen after upsert),
+      // take the highest active amount.
+      const data: Record<string, number> = Object.fromEntries(employeeIds.map((id) => [id, 0]));
+      for (const row of rows) {
+        const empId = String(row.employee ?? "");
+        const amt = Number(row.amount ?? 0);
+        if (empId && amt > (data[empId] ?? 0)) data[empId] = amt;
+      }
+
+      return { data };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  // ── HELB recurring assignment — single employee write ────────────────────
+  //
+  // PATCH /v1/payroll/team/:id/helb
+  // Body: { helb_monthly: number }  (0 = clear, >0 = set/update)
+  // Uses today as from_date; idempotent.
+
+  app.patch("/v1/payroll/team/:id/helb", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR only" });
+
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    const employeeId = String(params.id ?? "").trim();
+    if (!employeeId) return reply.status(400).send({ error: "Employee ID required" });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!("helb_monthly" in body))
+      return reply.status(400).send({ error: "helb_monthly is required" });
+
+    const helb_monthly = Number(body.helb_monthly) || 0;
+    const from_date = new Date().toISOString().slice(0, 10);
+
+    try {
+      // Verify employee belongs to this company
+      const empDoc = await erp.getDoc(ctx.creds, "Employee", employeeId);
+      if (String(empDoc.company ?? "") !== ctx.company)
+        return reply.status(403).send({ error: "Employee not in your Company" });
+
+      await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, helb_monthly);
+      return { ok: true, employee: employeeId, helb_monthly };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  // ── Manual overtime — single employee write ─────────────────────────────
+  //
+  // PATCH /v1/payroll/team/:id/overtime
+  // Body: { overtime_hours, payroll_date?, overtime_rate? }
+  // Calculates amount = hours × (base/22/8) × 1.5 and upserts Additional Salary.
+  // Set overtime_hours = 0 to clear manual overtime for the period.
+
+  app.patch("/v1/payroll/team/:id/overtime", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "HR only" });
+
+    const params = (req.params ?? {}) as Record<string, unknown>;
+    const employeeId = String(params.id ?? "").trim();
+    if (!employeeId) return reply.status(400).send({ error: "Employee ID required" });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!("overtime_hours" in body))
+      return reply.status(400).send({ error: "overtime_hours is required" });
+
+    const overtime_hours = Math.max(0, Number(body.overtime_hours) || 0);
+    const payroll_date = parseDate(body.payroll_date) || new Date().toISOString().slice(0, 10);
+
+    try {
+      // Fetch employee to verify company and get base salary for rate calculation
+      const [empDoc, assignmentRows] = await Promise.all([
+        erp.getDoc(ctx.creds, "Employee", employeeId),
+        erp.getList(ctx.creds, "Salary Structure Assignment", {
+          filters: [
+            ["employee", "=", employeeId],
+            ["docstatus", "=", 1],
+          ],
+          fields: ["base"],
+          order_by: "from_date desc",
+          limit_page_length: 1,
+        }),
+      ]);
+
+      if (String(empDoc.company ?? "") !== ctx.company)
+        return reply.status(403).send({ error: "Employee not in your Company" });
+
+      // Use caller-supplied rate, or derive from latest base salary assignment
+      const base = Number((assignmentRows[0] as Record<string, unknown>)?.base ?? 0);
+      const hourly_rate = Number(body.overtime_rate) > 0
+        ? Number(body.overtime_rate)
+        : base > 0 ? base / 22 / 8 : 0;
+
+      const amount = Math.round(overtime_hours * hourly_rate * 1.5 * 100) / 100;
+
+      await upsertOvertimeAdditionalSalary(ctx.creds, employeeId, ctx.company, payroll_date, amount);
+      return { ok: true, employee: employeeId, overtime_hours, hourly_rate, amount, payroll_date };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
@@ -1128,6 +1914,33 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
               const slipStart = assignmentFrom > start_date ? assignmentFrom : start_date;
               console.log(`[payroll] slip for ${employeeId}: assignmentFrom=${assignmentFrom} slipStart=${slipStart}`);
 
+              // Look up any submitted Timesheet for this employee covering the period.
+              // If found, link it so ERPNext populates overtime_hours on the slip.
+              let timesheetLinks: unknown[] = [];
+              try {
+                const tsRows = (await erp.getList(ctx.creds, "Timesheet", {
+                  filters: [
+                    ["employee", "=", employeeId],
+                    ["docstatus", "=", 1],
+                    ["start_date", "<=", end_date],
+                    ["end_date", ">=", slipStart],
+                  ],
+                  fields: ["name"],
+                  limit_page_length: 5,
+                })) as Array<{ name: string }>;
+                timesheetLinks = tsRows.map((ts, i) => ({
+                  doctype: "Salary Slip Timesheet",
+                  time_sheet: ts.name,
+                  idx: i + 1,
+                }));
+                if (timesheetLinks.length > 0) {
+                  console.log(`[payroll] Linking ${timesheetLinks.length} timesheet(s) for ${employeeId}`);
+                }
+              } catch (tsErr) {
+                // Non-fatal: proceed without timesheet (overtime_hours = 0)
+                console.log(`[payroll] Timesheet lookup for ${employeeId}: ${tsErr instanceof Error ? tsErr.message : String(tsErr)}`);
+              }
+
               const slip = await erp.createDoc(ctx.creds, "Salary Slip", {
                 naming_series: "Sal Slip/.YYYY.-.MM.-.#####",
                 employee: employeeId,
@@ -1137,6 +1950,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
                 end_date,
                 posting_date: end_date,
                 currency: "KES",
+                ...(timesheetLinks.length > 0 ? { timesheets: timesheetLinks } : {}),
               });
               const slipName = String(slip.name ?? "");
               // createDoc returns the full document — pass it to skip the redundant
@@ -1243,6 +2057,9 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
           "currency",
           "status",
           "docstatus",
+          "gross_pay",
+          "net_pay",
+          "total_deduction",
         ],
         filters,
         order_by: "start_date desc, employee asc",
@@ -1278,11 +2095,267 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
       if (String(doc.company ?? "") !== ctx.company) {
         return reply.status(403).send({ error: "Salary Slip not in your Company" });
       }
-      return { data: doc };
+
+      // Attach employee statutory IDs (KRA PIN, NSSF, SHIF) so the payslip
+      // view/PDF can show them without a separate API call.
+      let empStatutory: Record<string, string> = {};
+      const empId = String(doc.employee ?? "").trim();
+      if (empId) {
+        try {
+          const empDoc = await erp.getDoc(ctx.creds, "Employee", empId);
+          empStatutory = {
+            _emp_national_id: String(empDoc.custom_national_id ?? "").trim(),
+            _emp_tax_id: String(empDoc.tax_id ?? empDoc.custom_kra_pin ?? "").trim(),
+            _emp_nssf_number: String(empDoc.custom_nssf_number ?? "").trim(),
+            _emp_shif_number: String(empDoc.custom_nhif__shif_number ?? empDoc.custom_shif_number ?? "").trim(),
+            _emp_designation: String(empDoc.designation ?? "").trim(),
+          };
+        } catch (e) {
+          // Non-fatal: statutory IDs are supplementary display info
+          console.log(
+            `[payroll] Could not fetch statutory IDs for employee ${empId}: ` +
+            (e instanceof Error ? e.message : String(e))
+          );
+        }
+      }
+
+      return { data: { ...doc, ...empStatutory } };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
+  });
+
+  /**
+   * POST /v1/loans/deductions
+   * Set (upsert) a recurring Loan Deduction Additional Salary for an employee.
+   * Body: { employee_id, company, from_date, monthly_amount, loan_ref? }
+   */
+  app.post("/v1/loans/deductions", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR admins can set loan deductions." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const employeeId = String(body.employee_id ?? "").trim();
+    const company = String(body.company ?? ctx.company).trim();
+    const from_date = String(body.from_date ?? "").trim();
+    const monthly_amount = Number(body.monthly_amount ?? 0);
+    const loan_ref = body.loan_ref ? String(body.loan_ref).trim() : undefined;
+
+    if (!employeeId) return reply.status(400).send({ error: "employee_id is required" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from_date)) return reply.status(400).send({ error: "from_date must be YYYY-MM-DD" });
+    // monthly_amount = 0 is allowed (clears the deduction); negative is not
+    if (monthly_amount < 0) return reply.status(400).send({ error: "monthly_amount must be 0 (to clear) or a positive number" });
+
+    try {
+      // Verify the employee exists in ERPNext and belongs to this company
+      let empDoc: Record<string, unknown>;
+      try {
+        empDoc = await erp.getDoc(ctx.creds, "Employee", employeeId) as Record<string, unknown>;
+      } catch (e) {
+        if (e instanceof ErpError && e.status === 404) {
+          return reply.status(400).send({ error: `Employee "${employeeId}" not found in ERPNext` });
+        }
+        throw e;
+      }
+      if (String(empDoc.company ?? "") !== company) {
+        return reply.status(400).send({ error: `Employee "${employeeId}" does not belong to company "${company}"` });
+      }
+      if (String(empDoc.status ?? "").toLowerCase() !== "active") {
+        return reply.status(400).send({ error: `Employee "${employeeId}" is not active (status: ${empDoc.status ?? "unknown"})` });
+      }
+
+      // Ensure the Loan Deduction salary component exists before inserting Additional Salary
+      await ensureSalaryComponent(ctx.creds, "Loan Deduction", "Deduction", "LOAN", { depends_on_payment_days: 0 });
+      await upsertLoanDeductionAdditionalSalary(ctx.creds, employeeId, company, from_date, monthly_amount, loan_ref);
+      return {
+        ok: true,
+        employee_id: employeeId,
+        employee_name: String(empDoc.employee_name ?? ""),
+        monthly_amount,
+        from_date,
+        action: monthly_amount === 0 ? "cleared" : "set",
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * POST /v1/payroll/salary-components/ensure
+   * Idempotent: register an ERPNext Salary Component master if it doesn't exist.
+   * Body: { name, type ("Earning"|"Deduction"), abbr, depends_on_payment_days? }
+   */
+  app.post("/v1/payroll/salary-components/ensure", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR admins can manage salary components." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const name = String(body.name ?? "").trim();
+    const type = String(body.type ?? "Earning").trim() as "Earning" | "Deduction";
+    const abbr = String(body.abbr ?? name.toUpperCase().replace(/\s+/g, "_").slice(0, 8)).trim();
+    const extraOptions: Record<string, unknown> = {};
+    if (body.depends_on_payment_days != null) {
+      extraOptions.depends_on_payment_days = body.depends_on_payment_days === true || body.depends_on_payment_days === 1 ? 1 : 0;
+    }
+
+    if (!name) return reply.status(400).send({ error: "name is required" });
+
+    try {
+      await ensureSalaryComponent(ctx.creds, name, type, abbr, extraOptions);
+      return { ok: true, name, type, abbr };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * GET /v1/payroll/compliance-check
+   * Returns a compliance status report for this company's Kenya salary structure:
+   * - Whether formulas are Phase 3 NSSF (cap 6,480 at 108,000 ceiling)
+   * - Whether PAYE uses taxable income basis (not raw gross_pay)
+   * - Whether deduction evaluation order is correct (NSSF→SHIF→HL→PAYE)
+   * - Whether any unsupported builtins (max/min) are present
+   * Safe to call frequently — reads from cache where possible.
+   */
+  app.get("/v1/payroll/compliance-check", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "HR admins only" });
+    }
+
+    const structName = kenyaStructureName(ctx.company);
+    const checks: Array<{ id: string; label: string; pass: boolean; detail: string }> = [];
+
+    try {
+      const existing = await erp.getDoc(ctx.creds, "Salary Structure", structName) as Record<string, unknown>;
+      const ds = Number(existing.docstatus);
+
+      checks.push({
+        id: "structure_exists",
+        label: "Salary Structure exists",
+        pass: true,
+        detail: `Found "${structName}" (docstatus=${ds})`,
+      });
+
+      checks.push({
+        id: "structure_submitted",
+        label: "Salary Structure is submitted",
+        pass: ds === 1,
+        detail: ds === 1 ? "Submitted (docstatus=1)" : `Not submitted (docstatus=${ds}) — payroll runs may fail`,
+      });
+
+      // Inspect individual components
+      const allRows: Array<Record<string, unknown>> = [];
+      for (const tableKey of ["earnings", "deductions"]) {
+        const rows = existing[tableKey];
+        if (Array.isArray(rows)) allRows.push(...rows);
+      }
+
+      let hasMax = false, nssfPhase3 = true, payeTaxable = true, deductionOrder = true;
+      let payeIdx = -1, nssfIdx = -1;
+
+      for (const r of allRows) {
+        const comp = String(r.salary_component ?? "");
+        const formula = typeof r.formula === "string" ? r.formula : "";
+        const idx = Number(r.idx ?? 0);
+
+        if (/\bmax\s*\(/.test(formula) || /\bmin\s*\(/.test(formula)) hasMax = true;
+        if (comp === "NSSF") {
+          nssfIdx = idx;
+          if (formula.includes("36000")) nssfPhase3 = false;
+        }
+        if (comp === "PAYE") {
+          payeIdx = idx;
+          if (!formula.includes("NSSF")) payeTaxable = false;
+          if (idx < 4) deductionOrder = false;
+        }
+      }
+
+      checks.push({
+        id: "no_max_min",
+        label: "No unsupported builtins (max/min)",
+        pass: !hasMax,
+        detail: hasMax
+          ? "FAIL: max() or min() found in formula — Frappe safe_eval will raise NameError"
+          : "OK: only ternary expressions used",
+      });
+
+      checks.push({
+        id: "nssf_phase3",
+        label: "NSSF Phase 3 formula (cap KES 6,480 at KES 108,000)",
+        pass: nssfPhase3,
+        detail: nssfPhase3
+          ? "OK: Phase 3 ceiling of 108,000 detected"
+          : "FAIL: Old Phase 2 ceiling of 36,000 still in formula — run a payroll to trigger auto-rebuild",
+      });
+
+      checks.push({
+        id: "paye_taxable_basis",
+        label: "PAYE computed on taxable income (gross_pay − NSSF − SHIF − HL)",
+        pass: payeTaxable,
+        detail: payeTaxable
+          ? "OK: PAYE formula references NSSF (taxable income basis)"
+          : "FAIL: PAYE formula does not reference NSSF — old gross_pay basis; run a payroll to trigger auto-rebuild",
+      });
+
+      checks.push({
+        id: "deduction_order",
+        label: "Deduction evaluation order: NSSF(1) → SHIF(2) → HL(3) → PAYE(4)",
+        pass: deductionOrder,
+        detail: deductionOrder
+          ? `OK: PAYE idx=${payeIdx}, NSSF idx=${nssfIdx}`
+          : `FAIL: PAYE idx=${payeIdx} < 4 — PAYE may evaluate before NSSF/SHIF; run a payroll to trigger auto-rebuild`,
+      });
+
+    } catch (e) {
+      if (e instanceof ErpError && e.status === 404) {
+        checks.push({
+          id: "structure_exists",
+          label: "Salary Structure exists",
+          pass: false,
+          detail: `"${structName}" not found in ERPNext — run a payroll to auto-create it`,
+        });
+      } else {
+        if (e instanceof ErpError) return replyErp(reply, e);
+        throw e;
+      }
+    }
+
+    const allPass = checks.every((c) => c.pass);
+    return {
+      ok: allPass,
+      structure_name: structName,
+      company: ctx.company,
+      checks,
+      summary: allPass
+        ? "All compliance checks passed"
+        : `${checks.filter((c) => !c.pass).length} check(s) failed — see details`,
+    };
   });
 
   /** HR: payroll entry documents (runs) overlapping the date range. */

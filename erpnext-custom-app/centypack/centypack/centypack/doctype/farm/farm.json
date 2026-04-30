@@ -1,0 +1,30 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:farm_code",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["farm_code", "farm_name", "farmer", "county", "location_note", "size_ha", "active"],
+ "fields": [
+  {"fieldname": "farm_code", "fieldtype": "Data", "in_list_view": 1, "label": "Farm Code", "reqd": 1, "unique": 1},
+  {"fieldname": "farm_name", "fieldtype": "Data", "in_list_view": 1, "label": "Farm Name", "reqd": 1},
+  {"fieldname": "farmer", "fieldtype": "Link", "in_list_view": 1, "label": "Farmer", "options": "Farmer", "reqd": 1},
+  {"fieldname": "county", "fieldtype": "Data", "label": "County"},
+  {"fieldname": "location_note", "fieldtype": "Small Text", "label": "Location (lat,lng or notes)"},
+  {"fieldname": "size_ha", "fieldtype": "Float", "label": "Size Ha", "non_negative": 1, "precision": "3"},
+  {"default": "1", "fieldname": "active", "fieldtype": "Check", "in_list_view": 1, "label": "Active"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "Farm",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

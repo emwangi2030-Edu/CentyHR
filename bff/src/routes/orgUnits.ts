@@ -15,11 +15,26 @@ const erp = defaultClient();
 const VALID_KINDS = ["department", "designation", "branch"] as const;
 type OrgKind = (typeof VALID_KINDS)[number];
 
-/** ERPNext doctype + display-name field for each org unit kind. */
-const ERP_SPEC: Record<OrgKind, { doctype: string; field: string; companyScoped: boolean }> = {
-  department:  { doctype: "Department",  field: "department_name",  companyScoped: true  },
-  designation: { doctype: "Designation", field: "designation_name", companyScoped: false },
-  branch:      { doctype: "Branch",      field: "branch",           companyScoped: false },
+/**
+ * ERPNext doctype spec for each org unit kind.
+ *
+ * - listField:   field returned in GET /org/options — must be the document `name`
+ *                because Employee.department is a Link that stores the doc name.
+ * - writeField:  field set when creating a new doc (the human-readable title field).
+ *                ERPNext auto-generates `name` from this via its naming series
+ *                (e.g. department_name "Engineering" → name "Engineering - NT").
+ * - filterField: field used to check whether a doc already exists before creating.
+ */
+const ERP_SPEC: Record<OrgKind, {
+  doctype: string;
+  listField: string;
+  writeField: string;
+  filterField: string;
+  companyScoped: boolean;
+}> = {
+  department:  { doctype: "Department",  listField: "name",             writeField: "department_name",  filterField: "department_name",  companyScoped: true  },
+  designation: { doctype: "Designation", listField: "designation_name", writeField: "designation_name", filterField: "designation_name", companyScoped: false },
+  branch:      { doctype: "Branch",      listField: "branch",           writeField: "branch",           filterField: "branch",           companyScoped: false },
 };
 
 function requireHr(ctx: ReturnType<typeof resolveHrContext>, reply: FastifyReply): boolean {
@@ -44,12 +59,12 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
       try {
         const rows = await erp.getList(ctx!.creds, spec.doctype, {
           filters: spec.companyScoped ? [["company", "=", ctx!.company]] : [],
-          fields: ["name", spec.field],
-          order_by: `${spec.field} asc`,
+          fields: ["name", spec.listField],
+          order_by: `${spec.listField} asc`,
           limit_page_length: 500,
         });
         return (rows as Record<string, unknown>[])
-          .map((r) => String(r[spec.field] ?? r.name ?? "").trim())
+          .map((r) => String(r[spec.listField] ?? r.name ?? "").trim())
           .filter(Boolean);
       } catch {
         return [];
@@ -195,8 +210,8 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
     try {
       const rows = await erp.getList(ctx.creds, spec.doctype, {
         filters: spec.companyScoped
-          ? [[spec.field, "=", rawValue], ["company", "=", ctx.company]]
-          : [[spec.field, "=", rawValue]],
+          ? [[spec.filterField, "=", rawValue], ["company", "=", ctx.company]]
+          : [[spec.filterField, "=", rawValue]],
         fields: ["name"],
         limit_page_length: 1,
       });
@@ -261,8 +276,8 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
     try {
       const rows = await erp.getList(ctx.creds, spec.doctype, {
         filters: spec.companyScoped
-          ? [[spec.field, "=", oldValue], ["company", "=", ctx.company]]
-          : [[spec.field, "=", oldValue]],
+          ? [[spec.filterField, "=", oldValue], ["company", "=", ctx.company]]
+          : [[spec.filterField, "=", oldValue]],
         fields: ["name"],
         limit_page_length: 1,
       });
@@ -275,7 +290,7 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      await erp.updateDoc(ctx.creds, spec.doctype, docName, { [spec.field]: newValue });
+      await erp.updateDoc(ctx.creds, spec.doctype, docName, { [spec.writeField]: newValue });
       return { data: { kind, oldValue, newValue, changed: true } };
     } catch (e) {
       if (e instanceof ErpError) return reply.status(e.status >= 500 ? 502 : e.status).send({ error: String(e.message) });
@@ -295,8 +310,8 @@ async function ensureOrgUnit(
   try {
     const existing = await erp.getList(ctx.creds, spec.doctype, {
       filters: spec.companyScoped
-        ? [[spec.field, "=", value], ["company", "=", ctx.company]]
-        : [[spec.field, "=", value]],
+        ? [[spec.filterField, "=", value], ["company", "=", ctx.company]]
+        : [[spec.filterField, "=", value]],
       fields: ["name"],
       limit_page_length: 1,
     });
@@ -306,7 +321,7 @@ async function ensureOrgUnit(
   } catch { /* attempt creation anyway */ }
 
   try {
-    const doc: Record<string, unknown> = { [spec.field]: value };
+    const doc: Record<string, unknown> = { [spec.writeField]: value };
     if (spec.companyScoped) doc.company = ctx.company;
     const created = await erp.createDoc(ctx.creds, spec.doctype, doc);
     const name = (created as Record<string, unknown>).name ?? value;
