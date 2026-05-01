@@ -1345,8 +1345,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           if (!activeSa) continue;
           const hSettings = holidaySettingsGet(String(activeSa.name ?? ""));
           if (!hSettings.work_on_holidays) {
+            // Always show the holiday name instead of "Present" regardless of whether
+            // the employee clocked in.
             (row as any).status = holidayName;
-            (row as any).working_hours = 0;
+            // Preserve actual working_hours if the employee did work on the holiday;
+            // only zero it out when no hours were recorded.
+            if (!((row as any).working_hours > 0)) {
+              (row as any).working_hours = 0;
+            }
+            // On a holiday all recorded time is overtime — regular hours are always 0.
             (row as any).regular_hours = 0;
           }
         }
@@ -2239,6 +2246,24 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         overtimeLateMs = Math.max(0, totalWorkedMs - fullShiftDurationMs);
       }
 
+      // Holiday override: if the employee is not expected to work on holidays and today
+      // is a public holiday, reclassify all regular hours as overtime.
+      if (!isHalfDayLeave) {
+        const hSettings = holidaySettingsGet(shift_assignment_name);
+        if (!hSettings.work_on_holidays) {
+          try {
+            const holidayYr = parseInt(shiftCalendarDay.slice(0, 4));
+            const holidayMap = await getEffectiveHolidays(ctx.creds, ctx.company, holidayYr);
+            if (holidayMap.has(shiftCalendarDay)) {
+              overtimeLateMs = regularMs + overtimeLateMs;
+              regularMs = 0;
+            }
+          } catch {
+            // best-effort — don't block clock-out if holiday check fails
+          }
+        }
+      }
+
       const regularEndMs = fromMs + regularMs;
 
       const regularActivity =
@@ -2808,6 +2833,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       // Fetch the shift type to get raw start_time / end_time strings.
       const stDoc = await erp.getDoc(ctx.creds, "Shift Type", active.shift_type_name) as any;
 
+      // Holiday info for today so the client can warn before clock-in.
+      const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+      const todayLocal = toLocalDate(now, tzOff);
+      const yr = parseInt(todayLocal.slice(0, 4));
+      const holidayMap = await getEffectiveHolidays(ctx.creds, ctx.company, yr);
+      const todayHolidayName = holidayMap.get(todayLocal) ?? null;
+      const hSettings = holidaySettingsGet(active.shift_assignment_name);
+
       return {
         data: {
           shift_type: active.shift_type_name,
@@ -2817,6 +2850,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           end_date: saDoc?.end_date ? String(saDoc.end_date).slice(0, 10) : null,
           shift_assignment_name: active.shift_assignment_name,
           shift_location: saDoc?.shift_location ?? null,
+          today_holiday_name: todayHolidayName,
+          work_on_holidays: hSettings.work_on_holidays,
         },
       };
     } catch (e) {
