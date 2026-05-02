@@ -97,3 +97,17 @@ export function hrCompanyDocumentRoles(): string[] {
   if (!raw) return [...DEFAULT_HR_COMPANY_DOCUMENT_ROLES];
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
+
+/** Default geofence radius (meters) for guard site check-in when `radius_meters` is omitted. Clamped 20–5000. */
+export const GUARD_GEOFENCE_DEFAULT_METERS: number = (() => {
+  const n = Number(process.env.GUARD_GEOFENCE_DEFAULT_METERS);
+  if (Number.isFinite(n)) return Math.min(5000, Math.max(20, Math.floor(n)));
+  return 250;
+})();
+
+/**
+ * Frappe DocType for Pay Hub → ERP attendance exception resolutions (install in `centy_guard` app).
+ * Override if your site uses a different name.
+ */
+export const GUARD_EXCEPTION_REVIEW_DOCTYPE =
+  process.env.GUARD_EXCEPTION_REVIEW_DOCTYPE?.trim() || "Centy Guard Exception Review";

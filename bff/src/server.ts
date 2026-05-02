@@ -19,6 +19,7 @@ import { documentsRoutes } from "./routes/documents.js";
 import { recruitmentRoutes } from "./routes/recruitment.js";
 import { performanceRoutes } from "./routes/performance.js";
 import { hrAnalyticsRoutes } from "./routes/hrAnalytics.js";
+import { guardRoutes } from "./routes/guard.js";
 
 async function main() {
   const prefix = config.BASE_PATH;
@@ -45,6 +46,7 @@ async function main() {
   await app.register(recruitmentRoutes, { prefix });
   await app.register(performanceRoutes, { prefix });
   await app.register(hrAnalyticsRoutes, { prefix });
+  await app.register(guardRoutes, { prefix });
   await app.listen({ port: config.PORT, host: config.HR_BFF_HOST });
 }
 

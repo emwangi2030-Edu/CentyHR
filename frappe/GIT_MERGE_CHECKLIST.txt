@@ -1,0 +1,32 @@
+Centy Guard Exception Review — merge into the canonical centy_guard app
+======================================================================
+
+This repo carries a copy of the DocType under `frappe/centy_guard_exception_review/`
+for version control. The ERP host’s bench app may not be a Git checkout (e.g. baked
+into a Docker image); treat this folder as the source of truth to copy or merge.
+
+1) Copy into bench
+   - Destination: `apps/centy_guard/centy_guard/centy_guard_ops/doctype/centy_guard_exception_review/`
+   - Files: `centy_guard_exception_review.json`, `centy_guard_exception_review.py`
+
+2) hooks.py — add inside `doc_events` (after "Guard Incident" block, before "Client Site"):
+
+	"Centy Guard Exception Review": {
+		"validate": "centy_guard.centy_guard_ops.doctype.centy_guard_exception_review.centy_guard_exception_review.validate",
+	},
+
+3) Deploy durability
+   - `centy_guard` on the current ERP container lives on the image overlay (not a bind mount).
+     Rebuilding the container without re-applying these files can remove Python/JSON from disk.
+   - The site DB (volume) still has the DocType row after migrate; re-add app files before upgrades.
+   - Prefer: bake this app revision into your ERP image build, or mount/sync from a Git checkout.
+
+4) Site
+   - `bench --site <site> migrate`
+   - Optional: `bench clear-cache`
+
+5) Permissions (already in JSON)
+   - Roles with create/write/read: System Manager, HR Manager, HR User, Centy Guard Supervisor,
+     Centy Guard Operator.
+   - Pay Hub → BFF calls use the signed-in user’s ERP API key when present, else BFF fallback keys.
+     That ERP user must hold one of the roles above (e.g. HR Manager or Administrator).

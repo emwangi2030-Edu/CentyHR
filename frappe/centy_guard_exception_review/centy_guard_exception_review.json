@@ -1,0 +1,171 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:CGEX-{YYYY}-{#####}",
+ "creation": "2026-05-01 12:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "company",
+  "employee",
+  "attendance_date",
+  "exception_key",
+  "exception_type",
+  "resolution_status",
+  "review_notes",
+  "payhub_review_id",
+  "reviewed_at",
+  "source",
+  "client_site",
+  "site_assignment",
+  "first_in_time"
+ ],
+ "fields": [
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "employee",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Employee",
+   "options": "Employee",
+   "reqd": 1
+  },
+  {
+   "fieldname": "attendance_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Attendance Date",
+   "reqd": 1
+  },
+  {
+   "fieldname": "exception_key",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Exception Key",
+   "reqd": 1
+  },
+  {
+   "default": "no_show",
+   "fieldname": "exception_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Exception Type",
+   "options": "no_show\nlate\nunscheduled_in",
+   "reqd": 1
+  },
+  {
+   "default": "pending",
+   "fieldname": "resolution_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Resolution Status",
+   "options": "pending\napproved\nrejected",
+   "reqd": 1
+  },
+  {
+   "fieldname": "review_notes",
+   "fieldtype": "Small Text",
+   "label": "Review Notes"
+  },
+  {
+   "fieldname": "payhub_review_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Pay Hub Review ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "reviewed_at",
+   "fieldtype": "Datetime",
+   "label": "Reviewed At"
+  },
+  {
+   "default": "Pay Hub",
+   "fieldname": "source",
+   "fieldtype": "Data",
+   "label": "Source"
+  },
+  {
+   "fieldname": "client_site",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Client Site",
+   "options": "Client Site"
+  },
+  {
+   "fieldname": "site_assignment",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Site Assignment",
+   "options": "Site Assignment"
+  },
+  {
+   "fieldname": "first_in_time",
+   "fieldtype": "Data",
+   "label": "First In Time"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "Centy Guard Ops",
+ "name": "Centy Guard Exception Review",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "HR Manager",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "HR User",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Centy Guard Supervisor",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Centy Guard Operator",
+   "write": 1
+  }
+ ],
+ "sort_field": "attendance_date",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
