@@ -742,7 +742,10 @@ export const leaveRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof ErpError) {
         const msg = e.message ?? "";
         if (/not a valid leave type/i.test(msg)) {
-          const lt = "selected leave type";
+          const lt =
+            typeof body.leave_type === "string" && body.leave_type.trim()
+              ? body.leave_type.trim()
+              : "leave type";
           return reply.status(422).send({
             error: `Leave type "${lt}" has not been created in ERPNext yet. Go to Settings → Leave Policy → ERP Leave Type Mappings and set this type to one that already exists in your ERPNext (e.g. "Sick Leave"), or ask your ERPNext admin to create a "${lt}" Leave Type there.`,
           });
