@@ -1,8 +1,12 @@
 /**
  * CentyGuard — security operations API (ERP `centy_guard` + HRMS).
- * Phase 0–2: attendance rollups, reconciliation, per-site views, posting vs check-in exceptions.
- * Phase 3+: site clock-in (geofence), Pay Hub exception queue; Phase 4: CSV / payroll readiness in Pay Hub.
- * Phase 5: POST exception-review-sync → Frappe DocType GUARD_EXCEPTION_REVIEW_DOCTYPE (install on site).
+ *
+ * **Phase 0** — Readiness: env + bridge + ERP connectivity; Pay Hub business flags schema; `/v1/guard/readiness`.
+ * **Phase 1** — Foundation: Hub kill-switch + beta (`centyguard_disabled` / `centyguard_beta_enabled`), eligibility parity with CentyPack pattern.
+ * **Phase 0–2 (attendance)** — Rollups, reconciliation, per-site views, posting vs check-in exceptions.
+ * **Phase 3+** — Site clock-in (geofence), Pay Hub exception queue.
+ * **Phase 4** — CSV / payroll readiness in Pay Hub.
+ * **Phase 5** — POST exception-review-sync → Frappe DocType GUARD_EXCEPTION_REVIEW_DOCTYPE (install on site).
  */
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import type { HrContext } from "../types.js";
@@ -283,7 +287,57 @@ async function listSiteAssignmentsPostingInRange(
   return rows;
 }
 
+function integrationErpCreds(): { apiKey: string; apiSecret: string } | null {
+  const k = (config.ERP_API_KEY || "").trim();
+  const s = (config.ERP_API_SECRET || "").trim();
+  if (!k || !s) return null;
+  return { apiKey: k, apiSecret: s };
+}
+
 export const guardRoutes: FastifyPluginAsync = async (app) => {
+  /**
+   * GET /v1/guard/readiness
+   * Phase 0: no auth — reports config presence (not secret values) and optionally verifies ERP DocType for exception sync.
+   */
+  app.get("/v1/guard/readiness", async (_req, reply) => {
+    const bridge = !!(config.HR_BRIDGE_SECRET || "").trim();
+    const erpCreds = integrationErpCreds();
+    const payHub = !!(config.PAY_HUB_INTERNAL_URL || "").trim();
+    let erpExceptionReviewDoctype: "ok" | "missing" | "skipped" | "error" = "skipped";
+    let erpPingError: string | undefined;
+    if (erpCreds) {
+      try {
+        const rows = await erp.getList(erpCreds, "DocType", {
+          filters: [["name", "=", config.GUARD_EXCEPTION_REVIEW_DOCTYPE]],
+          fields: ["name"],
+          limit_page_length: 1,
+        });
+        erpExceptionReviewDoctype = Array.isArray(rows) && rows.length > 0 ? "ok" : "missing";
+      } catch (e) {
+        erpExceptionReviewDoctype = "error";
+        erpPingError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    const ok = bridge && !!erpCreds;
+    return reply.send({
+      ok,
+      phase_notes: {
+        phase_0: "readiness — this endpoint + env; Pay Hub DB flags for nav gating",
+        phase_1: "foundation — centyguard_disabled / centyguard_beta_enabled on businesses",
+      },
+      checks: {
+        hr_bridge_configured: bridge,
+        erp_integration_credentials: !!erpCreds,
+        pay_hub_internal_url_configured: payHub,
+        guard_exception_review_doctype_name: config.GUARD_EXCEPTION_REVIEW_DOCTYPE,
+        erp_exception_review_doctype: erpExceptionReviewDoctype,
+        ...(erpPingError ? { erp_ping_error: erpPingError.slice(0, 240) } : {}),
+        geofence_default_meters: config.GUARD_GEOFENCE_DEFAULT_METERS,
+        dev_insecure_headers: config.DEV_INSECURE_HEADERS,
+      },
+    });
+  });
+
   /**
    * GET /v1/guard/attendance/daily-summary?date=YYYY-MM-DD
    * Company-wide when caller has HR bridge rights; otherwise self-only snapshot.
