@@ -61,6 +61,8 @@ import centypackGradingSessionsRoutes from "./centypackGradingSessions";
 import centypackPackSessionsRoutes from "./centypackPackSessions";
 import centypackLabourersRoutes from "./centypackLabourers";
 import centypackLabourAttendanceRoutes from "./centypackLabourAttendance";
+import centypackLaborRoutes from "./centypackLabor";
+import centypackStockRoutes from "./centypackStock";
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   app.use(publicMarketingRoutes);
@@ -119,6 +121,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.use(centypackPackSessionsRoutes);
   app.use(centypackLabourersRoutes);
   app.use(centypackLabourAttendanceRoutes);
+  app.use(centypackLaborRoutes);
+  app.use(centypackStockRoutes);
 
   return httpServer;
 }

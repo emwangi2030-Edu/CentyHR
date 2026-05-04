@@ -44,6 +44,11 @@ import {
   type InsertEmployeeWalletAccount,
   type EmployeeWalletLedgerEntry,
   type InsertEmployeeWalletLedgerEntry,
+  type LaborWorker, type InsertLaborWorker,
+  type LaborPieceRate, type InsertLaborPieceRate,
+  type LaborDailyEntry, type InsertLaborDailyEntry,
+  type LaborPayrollRun, type InsertLaborPayrollRun,
+  type LaborPayrollLine, type InsertLaborPayrollLine,
   type ImportedTransaction, type InsertImportedTransaction,
   bulkPaymentBatches, bulkPaymentItems, cashAdvances, investments, transactions, savedTemplates, recurringPayments, paymentLinks,
   walletTopups, quickPayRecipients, investorProfiles, notifications, mpesaAuditLogs, mpesaTransactions,
@@ -66,10 +71,11 @@ import {
   teamMembers,
   employeeWalletAccounts,
   employeeWalletLedgerEntries,
+  laborWorkers, laborPieceRates, laborDailyEntries, laborPayrollRuns, laborPayrollLines,
   importedTransactions,
   userPlatformRoles, userBusinessMemberships, salaryAdvanceApprovals,
   leavePolicies, leaveBalances, leaveApplications, compulsoryLeaves, employeeUserLinks,
-  leaveForfeitureLogs, leaveWarningLogs, overtimePolicies, centypackFarmers, centypackCrops, centypackVarieties, centypackCartonTypes, centypackWorkerCategories, centypackWarehouses, centypackGradeCodes, centypackDefectTypes, centypackIntake, centypackGdns, centypackGdnItems, centypackGradingSessions, centypackGradingLines, centypackGradingDefects, centypackPackSessions, centypackPackLines, centypackLabourers, centypackLabourAttendance, centypackPackLineLabourers,
+  leaveForfeitureLogs, leaveWarningLogs, overtimePolicies, centypackFarmers, centypackCrops, centypackVarieties, centypackCartonTypes, centypackWorkerCategories, centypackWarehouses, centypackGradeCodes, centypackDefectTypes, centypackIntake, centypackGdns, centypackGdnItems, centypackGradingSessions, centypackGradingLines, centypackGradingDefects, centypackPackSessions, centypackPackLines, centypackLabourers, centypackLabourAttendance, centypackPackLineLabourers, centypackStockLedger,
   type LeavePolicy, type InsertLeavePolicy,
   type LeaveBalance, type InsertLeaveBalance,
   type LeaveApplication, type InsertLeaveApplication,
@@ -96,6 +102,7 @@ import {
   type CentypackLabourer, type InsertCentypackLabourer,
   type CentypackLabourAttendance, type InsertCentypackLabourAttendance,
   type CentypackPackLineLabourer,
+  type CentypackStockLedger, type InsertCentypackStockLedger,
 } from "@shared/schema";
 import { desc, asc, eq, sql, and, gt, gte, lte, lt, inArray, or, like, ilike, isNull, isNotNull, type SQL } from "drizzle-orm";
 import bcrypt from "bcryptjs";
@@ -156,6 +163,30 @@ export type CompanyWalletRow = {
   currentBalance: number;
 };
 
+export type StockOnHandRow = {
+  cropId: string;
+  cropName: string;
+  varietyId: string | null;
+  varietyName: string | null;
+  gradeCodeId: string | null;
+  gradeCodeName: string | null;
+  cartonTypeId: string | null;
+  cartonTypeName: string | null;
+  warehouseId: string | null;
+  warehouseName: string | null;
+  stage: string;
+  qtyKgBalance: number;
+  cartonBalance: number;
+};
+
+export type StockMovementRow = CentypackStockLedger & {
+  cropName: string;
+  varietyName: string | null;
+  gradeCodeName: string | null;
+  cartonTypeName: string | null;
+  warehouseName: string | null;
+};
+
 export interface IStorage {
   // Auth
   createUser(
@@ -180,7 +211,18 @@ export interface IStorage {
   listUserBusinessMemberships(userId: string): Promise<Business[]>;
   /** Businesses the user can open, with effective role in each (primary, membership, or owner). */
   listAccessibleBusinessesWithRoles(userId: string): Promise<Array<Business & { accessRole: string }>>;
-  addUserToBusiness(userId: string, businessId: string, role?: string): Promise<UserBusinessMembership>;
+  addUserToBusiness(
+    userId: string,
+    businessId: string,
+    role?: string,
+    opts?: { invitePending?: boolean },
+  ): Promise<UserBusinessMembership>;
+  getMembershipForBusiness(
+    userId: string,
+    businessId: string,
+  ): Promise<{ role: string; status: string; inviteToken: string | null } | null>;
+  acceptCompanyInvite(token: string, userId: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  getCompanyInvitePreviewByToken(token: string): Promise<{ companyName: string; role: string } | null>;
   getUserBusinessMembershipRole(userId: string, businessId: string): Promise<string | null>;
   setUserBusinessMembershipRole(userId: string, businessId: string, role: string): Promise<void>;
   userHasBusinessAccess(userId: string, businessId: string): Promise<boolean>;
@@ -371,6 +413,15 @@ export interface IStorage {
     id: string,
     patch: { ok: boolean; statusCode?: number | null; error?: string | null; retryCount?: number; nextRetryAt?: Date | null },
   ): Promise<CentypackMirrorSyncLog | undefined>;
+  listLaborWorkers(businessId: string): Promise<LaborWorker[]>;
+  createLaborWorker(input: InsertLaborWorker): Promise<LaborWorker>;
+  listLaborPieceRates(businessId: string): Promise<LaborPieceRate[]>;
+  createLaborPieceRate(input: InsertLaborPieceRate): Promise<LaborPieceRate>;
+  listLaborDailyEntries(businessId: string, fromDate: string, toDate: string): Promise<Array<LaborDailyEntry & { workerName: string }>>;
+  createLaborDailyEntry(input: InsertLaborDailyEntry): Promise<LaborDailyEntry>;
+  createLaborPayrollRun(input: InsertLaborPayrollRun): Promise<LaborPayrollRun>;
+  createLaborPayrollLines(lines: InsertLaborPayrollLine[]): Promise<LaborPayrollLine[]>;
+  listLaborPayrollRuns(businessId: string, limit?: number): Promise<LaborPayrollRun[]>;
   /** Generate next account number (2 letters + B + 4-digit sequence, e.g. HEB0001) and assign to business. Returns updated business or undefined. */
   assignCompanyAccountNumber(businessId: string, businessName: string): Promise<Business | undefined>;
   /** Generate next account number (2 letters + C + 4-digit sequence, e.g. DCC0002) and assign to user (customer/employee). Returns updated user or undefined. */
@@ -477,7 +528,10 @@ export interface IStorage {
   hasCompletedBuyGoodsPayoutToTill(businessId: string, tillNumber: string): Promise<boolean>;
   /** Latest recipient name we have for this paybill (and optionally account) from past B2B callbacks, scoped to company. */
   getPaybillRecipientName(businessId: string, paybillNumber: string, accountNumber?: string): Promise<string | null>;
-  getUserWalletBalance(userId: string): Promise<{
+  getUserWalletBalance(
+    userId: string,
+    opts?: { workspaceBusinessId?: string | null },
+  ): Promise<{
     currentBalance: string;
     reservedDisbursements: string;
     availableBalance: string;
@@ -751,7 +805,7 @@ export interface IStorage {
   nextCentypackDefectTypeCode(businessId: string): Promise<string>;
 
   // CentyPack intake
-  listCentypackIntake(businessId: string, opts?: { search?: string; farmerId?: string; cropId?: string; status?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number }): Promise<{ rows: CentypackIntake[]; total: number }>;
+  listCentypackIntake(businessId: string, opts?: { search?: string; farmerId?: string; cropId?: string; status?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number; excludeGraded?: boolean; includeIntakeId?: string }): Promise<{ rows: CentypackIntake[]; total: number }>;
   getCentypackIntakeById(id: string, businessId: string): Promise<CentypackIntake | null>;
   createCentypackIntake(data: Omit<InsertCentypackIntake, "id" | "createdAt" | "updatedAt">): Promise<CentypackIntake>;
   updateCentypackIntake(id: string, businessId: string, data: Partial<Omit<InsertCentypackIntake, "id" | "businessId" | "intakeCode" | "createdAt" | "updatedAt">>): Promise<CentypackIntake | null>;
@@ -790,6 +844,10 @@ export interface IStorage {
   getLabourPackSummary(businessId: string, opts?: { dateFrom?: string; dateTo?: string; labourerId?: string; packSessionId?: string }): Promise<{ labourerId: string; labourerCode: string; firstName: string; lastName: string; packSessionId: string; packSessionCode: string; sessionDate: string; packLineId: string; gradeCodeId: string | null; cartonCount: number }[]>;
   getPackLineLabourers(packLineId: string): Promise<(CentypackPackLineLabourer & { labourerCode: string; firstName: string; lastName: string })[]>;
   upsertPackLineLabourers(packLineId: string, businessId: string, assignments: { labourerId: string; cartonCount: number }[]): Promise<void>;
+
+  // CentyPack stock ledger
+  getStockOnHand(businessId: string, opts?: { cropId?: string; stage?: string; warehouseId?: string }): Promise<StockOnHandRow[]>;
+  getStockMovements(businessId: string, opts?: { txnId?: string; txnType?: string; cropId?: string; stage?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number }): Promise<{ rows: StockMovementRow[]; total: number }>;
 
   // CentyPack crops
   listCentypackCrops(businessId: string, opts?: { search?: string; status?: string; limit?: number; offset?: number }): Promise<{ rows: CentypackCrop[]; total: number }>;
@@ -840,7 +898,10 @@ export interface IStorage {
   deletePaymentFavorite(id: string, businessId: string): Promise<void>;
 
   // Dashboard
-  getDashboardStats(userId: string, options?: { rangeDays?: number }): Promise<{
+  getDashboardStats(
+    userId: string,
+    options?: { rangeDays?: number; workspaceBusinessId?: string | null },
+  ): Promise<{
     accountBalance: string;
     totalPayments: string;
     activeCashAdvance: string;
@@ -1201,7 +1262,9 @@ export class DatabaseStorage implements IStorage {
         .select({ business: businesses })
         .from(userBusinessMemberships)
         .innerJoin(businesses, eq(userBusinessMemberships.businessId, businesses.id))
-        .where(eq(userBusinessMemberships.userId, userId));
+        .where(
+          and(eq(userBusinessMemberships.userId, userId), eq(userBusinessMemberships.membershipStatus, "active")),
+        );
       for (const row of linked) out.set(row.business.id, row.business);
     } catch (e) {
       if (isMissingRelation(e, "user_business_memberships")) {
@@ -1242,7 +1305,15 @@ export class DatabaseStorage implements IStorage {
     return result.sort((a, b) => a.businessName.localeCompare(b.businessName));
   }
 
-  async addUserToBusiness(userId: string, businessId: string, role = "viewer"): Promise<UserBusinessMembership> {
+  async addUserToBusiness(
+    userId: string,
+    businessId: string,
+    role = "viewer",
+    opts?: { invitePending?: boolean },
+  ): Promise<UserBusinessMembership> {
+    const invitePending = opts?.invitePending === true;
+    const inviteToken = invitePending ? crypto.randomBytes(32).toString("hex") : null;
+    const inviteExpiresAt = invitePending ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) : null;
     let row: UserBusinessMembership | undefined;
     try {
       [row] = await db.insert(userBusinessMemberships).values({
@@ -1250,6 +1321,9 @@ export class DatabaseStorage implements IStorage {
         userId,
         businessId,
         role,
+        membershipStatus: invitePending ? "pending" : "active",
+        inviteToken,
+        inviteExpiresAt,
       }).onConflictDoNothing().returning();
     } catch (e) {
       if (isMissingRelation(e, "user_business_memberships")) {
@@ -1273,6 +1347,33 @@ export class DatabaseStorage implements IStorage {
       throw e;
     }
     if (!existing) throw new Error("Failed to link user to business");
+
+    // Insert conflict: refresh pending invite or bump role — never downgrade active → pending.
+    if (invitePending) {
+      const st = String(existing.membershipStatus || "active").toLowerCase();
+      const hasOpenInvite = !!existing.inviteToken?.trim();
+      if (st === "active" && !hasOpenInvite) {
+        throw new Error("User is already an active member of this company");
+      }
+      const newTok = crypto.randomBytes(32).toString("hex");
+      const exp = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+      await db
+        .update(userBusinessMemberships)
+        .set({
+          membershipStatus: "pending",
+          inviteToken: newTok,
+          inviteExpiresAt: exp,
+          role,
+        })
+        .where(eq(userBusinessMemberships.id, existing.id));
+      const [refreshed] = await db
+        .select()
+        .from(userBusinessMemberships)
+        .where(eq(userBusinessMemberships.id, existing.id))
+        .limit(1);
+      return refreshed ?? existing;
+    }
+
     if (role && existing.role !== role) {
       await this.setUserBusinessMembershipRole(userId, businessId, role);
       existing.role = role;
@@ -1280,14 +1381,92 @@ export class DatabaseStorage implements IStorage {
     return existing;
   }
 
-  async getUserBusinessMembershipRole(userId: string, businessId: string): Promise<string | null> {
+  async getMembershipForBusiness(
+    userId: string,
+    businessId: string,
+  ): Promise<{ role: string; status: string; inviteToken: string | null } | null> {
     try {
       const [row] = await db
-        .select({ role: userBusinessMemberships.role })
+        .select({
+          role: userBusinessMemberships.role,
+          status: userBusinessMemberships.membershipStatus,
+          inviteToken: userBusinessMemberships.inviteToken,
+        })
         .from(userBusinessMemberships)
         .where(and(eq(userBusinessMemberships.userId, userId), eq(userBusinessMemberships.businessId, businessId)))
         .limit(1);
-      return row?.role ?? null;
+      if (!row) return null;
+      return {
+        role: row.role,
+        status: row.status || "active",
+        inviteToken: row.inviteToken ?? null,
+      };
+    } catch (e) {
+      if (isMissingRelation(e, "user_business_memberships")) return null;
+      throw e;
+    }
+  }
+
+  async acceptCompanyInvite(token: string, userId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+    try {
+      const [row] = await db
+        .select()
+        .from(userBusinessMemberships)
+        .where(eq(userBusinessMemberships.inviteToken, token))
+        .limit(1);
+      if (!row) return { ok: false, message: "Invite not found." };
+      if (row.userId !== userId) return { ok: false, message: "Wrong account for this invite." };
+      const st = row.membershipStatus || "active";
+      if (st !== "pending") return { ok: false, message: "Invite already accepted." };
+      if (row.inviteExpiresAt && new Date(row.inviteExpiresAt).getTime() < Date.now()) {
+        return { ok: false, message: "Invite expired." };
+      }
+      await db
+        .update(userBusinessMemberships)
+        .set({
+          membershipStatus: "active",
+          inviteToken: null,
+          inviteExpiresAt: null,
+        })
+        .where(eq(userBusinessMemberships.id, row.id));
+      return { ok: true };
+    } catch (e) {
+      if (isMissingRelation(e, "user_business_memberships")) {
+        return { ok: false, message: "Membership invites are unavailable." };
+      }
+      throw e;
+    }
+  }
+
+  async getCompanyInvitePreviewByToken(token: string): Promise<{ companyName: string; role: string } | null> {
+    try {
+      const [row] = await db
+        .select({
+          businessId: userBusinessMemberships.businessId,
+          role: userBusinessMemberships.role,
+          status: userBusinessMemberships.membershipStatus,
+          expires: userBusinessMemberships.inviteExpiresAt,
+        })
+        .from(userBusinessMemberships)
+        .where(eq(userBusinessMemberships.inviteToken, token))
+        .limit(1);
+      if (!row) return null;
+      if ((row.status || "active") !== "pending") return null;
+      if (row.expires && new Date(row.expires).getTime() < Date.now()) return null;
+      const biz = await this.getBusinessById(row.businessId);
+      if (!biz) return null;
+      return { companyName: biz.businessName, role: row.role };
+    } catch (e) {
+      if (isMissingRelation(e, "user_business_memberships")) return null;
+      throw e;
+    }
+  }
+
+  async getUserBusinessMembershipRole(userId: string, businessId: string): Promise<string | null> {
+    try {
+      const meta = await this.getMembershipForBusiness(userId, businessId);
+      if (!meta || meta.status !== "active") return null;
+      return meta.role;
     } catch (e) {
       if (isMissingRelation(e, "user_business_memberships")) return null;
       throw e;
@@ -1311,10 +1490,13 @@ export class DatabaseStorage implements IStorage {
     if (u?.businessId === businessId) return true;
     const [owned] = await db.select({ id: businesses.id }).from(businesses).where(and(eq(businesses.id, businessId), eq(businesses.userId, userId))).limit(1);
     if (owned) return true;
-    let linked: { id: string } | undefined;
+    let linked: { id: string; membershipStatus: string } | undefined;
     try {
       [linked] = await db
-        .select({ id: userBusinessMemberships.id })
+        .select({
+          id: userBusinessMemberships.id,
+          membershipStatus: userBusinessMemberships.membershipStatus,
+        })
         .from(userBusinessMemberships)
         .where(and(eq(userBusinessMemberships.userId, userId), eq(userBusinessMemberships.businessId, businessId)))
         .limit(1);
@@ -1325,7 +1507,9 @@ export class DatabaseStorage implements IStorage {
       }
       throw e;
     }
-    return Boolean(linked);
+    if (!linked) return false;
+    const st = linked.membershipStatus || "active";
+    return st === "active";
   }
 
   async getUsersByRole(role: string): Promise<User[]> {
@@ -2302,6 +2486,79 @@ export class DatabaseStorage implements IStorage {
       .where(eq(centypackMirrorSyncLogs.id, id))
       .returning();
     return row;
+  }
+
+  async listLaborWorkers(businessId: string): Promise<LaborWorker[]> {
+    return db
+      .select()
+      .from(laborWorkers)
+      .where(eq(laborWorkers.businessId, businessId))
+      .orderBy(desc(laborWorkers.active), asc(laborWorkers.fullName));
+  }
+
+  async createLaborWorker(input: InsertLaborWorker): Promise<LaborWorker> {
+    const [row] = await db.insert(laborWorkers).values(input).returning();
+    return row;
+  }
+
+  async listLaborPieceRates(businessId: string): Promise<LaborPieceRate[]> {
+    return db
+      .select()
+      .from(laborPieceRates)
+      .where(eq(laborPieceRates.businessId, businessId))
+      .orderBy(desc(laborPieceRates.effectiveFrom), desc(laborPieceRates.createdAt));
+  }
+
+  async createLaborPieceRate(input: InsertLaborPieceRate): Promise<LaborPieceRate> {
+    const [row] = await db.insert(laborPieceRates).values(input).returning();
+    return row;
+  }
+
+  async listLaborDailyEntries(
+    businessId: string,
+    fromDate: string,
+    toDate: string,
+  ): Promise<Array<LaborDailyEntry & { workerName: string }>> {
+    const rows = await db
+      .select({
+        entry: laborDailyEntries,
+        workerName: laborWorkers.fullName,
+      })
+      .from(laborDailyEntries)
+      .innerJoin(laborWorkers, eq(laborWorkers.id, laborDailyEntries.workerId))
+      .where(
+        and(
+          eq(laborDailyEntries.businessId, businessId),
+          gte(laborDailyEntries.workDate, fromDate),
+          lte(laborDailyEntries.workDate, toDate),
+        ),
+      )
+      .orderBy(desc(laborDailyEntries.workDate), asc(laborWorkers.fullName));
+    return rows.map((r) => ({ ...r.entry, workerName: r.workerName }));
+  }
+
+  async createLaborDailyEntry(input: InsertLaborDailyEntry): Promise<LaborDailyEntry> {
+    const [row] = await db.insert(laborDailyEntries).values(input).returning();
+    return row;
+  }
+
+  async createLaborPayrollRun(input: InsertLaborPayrollRun): Promise<LaborPayrollRun> {
+    const [row] = await db.insert(laborPayrollRuns).values(input).returning();
+    return row;
+  }
+
+  async createLaborPayrollLines(lines: InsertLaborPayrollLine[]): Promise<LaborPayrollLine[]> {
+    if (!lines.length) return [];
+    return db.insert(laborPayrollLines).values(lines).returning();
+  }
+
+  async listLaborPayrollRuns(businessId: string, limit = 12): Promise<LaborPayrollRun[]> {
+    return db
+      .select()
+      .from(laborPayrollRuns)
+      .where(eq(laborPayrollRuns.businessId, businessId))
+      .orderBy(desc(laborPayrollRuns.createdAt))
+      .limit(Math.max(1, Math.min(limit, 52)));
   }
 
   /** Two letters from name (e.g. "Haron Enterprise" -> HE, "Dennis Cheruyot" -> DC). */
@@ -3532,7 +3789,10 @@ export class DatabaseStorage implements IStorage {
     return row?.name ?? null;
   }
 
-  async getUserWalletBalance(userId: string): Promise<{
+  async getUserWalletBalance(
+    userId: string,
+    opts?: { workspaceBusinessId?: string | null },
+  ): Promise<{
     currentBalance: string;
     reservedDisbursements: string;
     availableBalance: string;
@@ -3545,12 +3805,14 @@ export class DatabaseStorage implements IStorage {
   }> {
     const actor = await this.getUserById(userId);
     const ownedBusiness = await this.getBusinessByUserId(userId);
-    const resolvedBusinessId = actor?.businessId || ownedBusiness?.id || null;
+    const ws = opts?.workspaceBusinessId?.trim();
+    const resolvedBusinessId =
+      ws && ws.length > 0 ? ws : actor?.businessId || ownedBusiness?.id || null;
     let businessOwnerUserId = ownedBusiness?.userId || null;
-    // Member users don't own the business — resolve owner from the business record
-    if (resolvedBusinessId && !businessOwnerUserId) {
+    // Workspace switch / multi-company: scope wallet to session company even when user's primary row differs.
+    if (resolvedBusinessId && (!businessOwnerUserId || ownedBusiness?.id !== resolvedBusinessId)) {
       const biz = await this.getBusinessById(resolvedBusinessId);
-      businessOwnerUserId = biz?.userId || null;
+      businessOwnerUserId = biz?.userId || businessOwnerUserId;
     }
 
     const companyUserFilter = resolvedBusinessId
@@ -8003,17 +8265,21 @@ export class DatabaseStorage implements IStorage {
     return {};
   }
 
-  async getDashboardStats(userId: string, options?: { rangeDays?: number }) {
+  async getDashboardStats(userId: string, options?: { rangeDays?: number; workspaceBusinessId?: string | null }) {
     {
-      const wallet = await this.getUserWalletBalance(userId);
+      const ws = options?.workspaceBusinessId?.trim();
+      const workspaceOpts =
+        ws && ws.length > 0 ? { workspaceBusinessId: ws } : undefined;
+      const wallet = await this.getUserWalletBalance(userId, workspaceOpts);
       const currentUser = await this.getUserById(userId);
       const ownBusiness = await this.getBusinessByUserId(userId);
-      const businessId = currentUser?.businessId || ownBusiness?.id;
+      const businessId =
+        ws && ws.length > 0 ? ws : currentUser?.businessId || ownBusiness?.id;
 
       let actorIds = [userId];
       if (businessId) {
         const members = await this.getUsersByBusinessId(businessId);
-        const ownerUserId = ownBusiness?.userId || (await this.getBusinessById(businessId))?.userId || null;
+        const ownerUserId = (await this.getBusinessById(businessId))?.userId ?? null;
         actorIds = Array.from(new Set([
           userId,
           ...members.map((m) => m.id),
@@ -8487,8 +8753,8 @@ export class DatabaseStorage implements IStorage {
     return `BT-${String(last + 1).padStart(4, "0")}`;
   }
 
-  async listCentypackIntake(businessId: string, opts: { search?: string; farmerId?: string; cropId?: string; status?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number } = {}): Promise<{ rows: CentypackIntake[]; total: number }> {
-    const { search, farmerId, cropId, status, dateFrom, dateTo, limit = 50, offset = 0 } = opts;
+  async listCentypackIntake(businessId: string, opts: { search?: string; farmerId?: string; cropId?: string; status?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number; excludeGraded?: boolean; includeIntakeId?: string } = {}): Promise<{ rows: CentypackIntake[]; total: number }> {
+    const { search, farmerId, cropId, status, dateFrom, dateTo, limit = 50, offset = 0, excludeGraded, includeIntakeId } = opts;
     const conditions: SQL[] = [eq(centypackIntake.businessId, businessId)];
     if (farmerId) conditions.push(eq(centypackIntake.farmerId, farmerId));
     if (cropId) conditions.push(eq(centypackIntake.cropId, cropId));
@@ -8502,6 +8768,19 @@ export class DatabaseStorage implements IStorage {
         ilike(centypackIntake.vehicleReg, pattern),
         ilike(centypackIntake.notes, pattern),
       ) as SQL);
+    }
+    if (excludeGraded) {
+      const notGraded = sql`NOT EXISTS (
+        SELECT 1 FROM centypack_grading_sessions gs
+        WHERE gs.intake_id = ${centypackIntake.id}
+        AND gs.business_id = ${businessId}
+        AND gs.status = 'completed'
+      )` as SQL;
+      conditions.push(
+        includeIntakeId
+          ? sql`(${notGraded} OR ${centypackIntake.id} = ${includeIntakeId})` as SQL
+          : notGraded,
+      );
     }
     const where = and(...conditions);
     const [{ total }] = await db.select({ total: sql<number>`count(*)::int` }).from(centypackIntake).where(where);
@@ -8517,13 +8796,37 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createCentypackIntake(data: Omit<InsertCentypackIntake, "id" | "createdAt" | "updatedAt">): Promise<CentypackIntake> {
-    const [row] = await db.insert(centypackIntake).values({ id: crypto.randomUUID(), ...data }).returning();
+    const id = crypto.randomUUID();
+    const [row] = await db.insert(centypackIntake).values({ id, ...data }).returning();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const entries = data.status === "cancelled" ? [] : [{
+        txnType: "intake_in", txnDate: data.intakeDate, cropId: data.cropId,
+        varietyId: data.varietyId ?? null, stage: "raw", direction: "in",
+        qtyKg: String(data.netWeightKg),
+      }];
+      await this.syncLedgerInTxn(client, id, data.businessId, entries);
+      await client.query("COMMIT");
+    } catch { await client.query("ROLLBACK"); } finally { client.release(); }
     return row;
   }
 
   async updateCentypackIntake(id: string, businessId: string, data: Partial<Omit<InsertCentypackIntake, "id" | "businessId" | "intakeCode" | "createdAt" | "updatedAt">>): Promise<CentypackIntake | null> {
     const [row] = await db.update(centypackIntake).set({ ...data, updatedAt: new Date() }).where(and(eq(centypackIntake.id, id), eq(centypackIntake.businessId, businessId))).returning();
-    return row ?? null;
+    if (!row) return null;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const entries = row.status === "cancelled" ? [] : [{
+        txnType: "intake_in", txnDate: row.intakeDate, cropId: row.cropId,
+        varietyId: row.varietyId ?? null, stage: "raw", direction: "in",
+        qtyKg: String(row.netWeightKg),
+      }];
+      await this.syncLedgerInTxn(client, id, businessId, entries);
+      await client.query("COMMIT");
+    } catch { await client.query("ROLLBACK"); } finally { client.release(); }
+    return row;
   }
 
   // CentyPack GDNs
@@ -8613,6 +8916,31 @@ export class DatabaseStorage implements IStorage {
         );
         insertedItems.push(ins);
       }
+      if (gdn.status === "confirmed") {
+        const gdnCreateEntries = insertedItems.flatMap(item =>
+          gdn.type === "transfer"
+            ? [
+                { txnType: "transfer_out", txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.from_warehouse_id ?? null, stage: "packed", direction: "out", qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null },
+                { txnType: "transfer_in",  txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.to_warehouse_id ?? null,   stage: "packed", direction: "in",  qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null },
+              ]
+            : [{ txnType: "dispatch_out", txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.from_warehouse_id ?? null, stage: "packed", direction: "out", qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null }],
+        );
+        await client.query("SAVEPOINT before_ledger");
+        try {
+          await this.syncLedgerInTxn(client, gdnId, header.businessId, gdnCreateEntries);
+        } catch (ledgerErr) {
+          console.error("[centypack] ledger sync failed on gdn create", gdnId, ledgerErr);
+          await client.query("ROLLBACK TO SAVEPOINT before_ledger");
+        }
+      } else {
+        await client.query("SAVEPOINT before_ledger");
+        try {
+          await this.syncLedgerInTxn(client, gdnId, header.businessId, []);
+        } catch (ledgerErr) {
+          console.error("[centypack] ledger sync failed on gdn create (clear)", gdnId, ledgerErr);
+          await client.query("ROLLBACK TO SAVEPOINT before_ledger");
+        }
+      }
       await client.query("COMMIT");
       return { ...gdn, items: insertedItems };
     } catch (err) {
@@ -8650,6 +8978,31 @@ export class DatabaseStorage implements IStorage {
             [itemId, id, businessId, item.cropId, item.varietyId ?? null, item.cartonTypeId ?? null, item.cartonCount ?? null, item.netWeightKg, item.gradeCodeId ?? null, item.notes ?? null],
           );
           updatedItems.push(ins);
+        }
+      }
+      if (gdn.status === "confirmed") {
+        const gdnUpdateEntries = updatedItems.flatMap(item =>
+          gdn.type === "transfer"
+            ? [
+                { txnType: "transfer_out", txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.from_warehouse_id ?? null, stage: "packed", direction: "out", qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null },
+                { txnType: "transfer_in",  txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.to_warehouse_id ?? null,   stage: "packed", direction: "in",  qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null },
+              ]
+            : [{ txnType: "dispatch_out", txnDate: gdn.gdn_date, cropId: item.crop_id, varietyId: item.variety_id ?? null, gradeCodeId: item.grade_code_id ?? null, cartonTypeId: item.carton_type_id ?? null, warehouseId: gdn.from_warehouse_id ?? null, stage: "packed", direction: "out", qtyKg: String(item.net_weight_kg), cartonCount: item.carton_count ?? null }],
+        );
+        await client.query("SAVEPOINT before_ledger");
+        try {
+          await this.syncLedgerInTxn(client, id, businessId, gdnUpdateEntries);
+        } catch (ledgerErr) {
+          console.error("[centypack] ledger sync failed on gdn update", id, ledgerErr);
+          await client.query("ROLLBACK TO SAVEPOINT before_ledger");
+        }
+      } else {
+        await client.query("SAVEPOINT before_ledger");
+        try {
+          await this.syncLedgerInTxn(client, id, businessId, []);
+        } catch (ledgerErr) {
+          console.error("[centypack] ledger sync failed on gdn update (clear)", id, ledgerErr);
+          await client.query("ROLLBACK TO SAVEPOINT before_ledger");
         }
       }
       await client.query("COMMIT");
@@ -8702,8 +9055,8 @@ export class DatabaseStorage implements IStorage {
         status: centypackGradingSessions.status,
         createdAt: centypackGradingSessions.createdAt,
         updatedAt: centypackGradingSessions.updatedAt,
-        totalGradedKg: sql<number>`coalesce((SELECT sum(gl.net_weight_kg::numeric) FROM centypack_grading_lines gl WHERE gl.session_id = ${centypackGradingSessions.id}), 0)::float`,
-        totalDefectKg: sql<number>`coalesce((SELECT sum(gd.weight_kg::numeric) FROM centypack_grading_defects gd WHERE gd.session_id = ${centypackGradingSessions.id}), 0)::float`,
+        totalGradedKg: sql<number>`coalesce((SELECT sum(gl.net_weight_kg::numeric) FROM centypack_grading_lines gl WHERE gl.session_id = "centypack_grading_sessions"."id"), 0)::float`,
+        totalDefectKg: sql<number>`coalesce((SELECT sum(gd.weight_kg::numeric) FROM centypack_grading_defects gd WHERE gd.session_id = "centypack_grading_sessions"."id"), 0)::float`,
       })
       .from(centypackGradingSessions)
       .where(where)
@@ -8751,6 +9104,20 @@ export class DatabaseStorage implements IStorage {
           [crypto.randomUUID(), sessionId, header.businessId, defect.defectTypeId, defect.weightKg, defect.notes ?? null],
         );
         insertedDefects.push(ins);
+      }
+      const gradingEntries = session.status === "completed"
+        ? [
+            { txnType: "grading_out", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, stage: "raw", direction: "out", qtyKg: String(session.input_weight_kg) },
+            ...insertedLines.map(l => ({ txnType: "grading_in", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, stage: "graded", direction: "in", qtyKg: String((l as any).net_weight_kg) })),
+            ...insertedDefects.map(d => ({ txnType: "grading_waste", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, stage: "waste", direction: "in", qtyKg: String((d as any).weight_kg) })),
+          ]
+        : [];
+      await client.query("SAVEPOINT before_ledger");
+      try {
+        await this.syncLedgerInTxn(client, sessionId, header.businessId, gradingEntries);
+      } catch (ledgerErr) {
+        console.error("[centypack] ledger sync failed on grading create", sessionId, ledgerErr);
+        await client.query("ROLLBACK TO SAVEPOINT before_ledger");
       }
       await client.query("COMMIT");
       return { ...session, lines: insertedLines, defects: insertedDefects };
@@ -8801,6 +9168,20 @@ export class DatabaseStorage implements IStorage {
           );
           updatedDefects.push(ins);
         }
+      }
+      const gradingUpdateEntries = session.status === "completed"
+        ? [
+            { txnType: "grading_out", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, stage: "raw", direction: "out", qtyKg: String(session.input_weight_kg) },
+            ...updatedLines.map(l => ({ txnType: "grading_in", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, stage: "graded", direction: "in", qtyKg: String((l as any).net_weight_kg) })),
+            ...updatedDefects.map(d => ({ txnType: "grading_waste", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, stage: "waste", direction: "in", qtyKg: String((d as any).weight_kg) })),
+          ]
+        : [];
+      await client.query("SAVEPOINT before_ledger");
+      try {
+        await this.syncLedgerInTxn(client, id, businessId, gradingUpdateEntries);
+      } catch (ledgerErr) {
+        console.error("[centypack] ledger sync failed on grading update", id, ledgerErr);
+        await client.query("ROLLBACK TO SAVEPOINT before_ledger");
       }
       await client.query("COMMIT");
       return { ...session, lines: updatedLines, defects: updatedDefects };
@@ -8902,6 +9283,19 @@ export class DatabaseStorage implements IStorage {
           }
         }
       }
+      const packCreateEntries = session.status === "completed"
+        ? insertedLines.flatMap(l => [
+            { txnType: "pack_out", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, stage: "graded", direction: "out", qtyKg: String((l as any).net_weight_kg) },
+            { txnType: "pack_in",  txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, cartonTypeId: (l as any).carton_type_id ?? null, stage: "packed", direction: "in", qtyKg: String((l as any).net_weight_kg), cartonCount: (l as any).carton_count ?? null },
+          ])
+        : [];
+      await client.query("SAVEPOINT before_ledger");
+      try {
+        await this.syncLedgerInTxn(client, sessionId, header.businessId, packCreateEntries);
+      } catch (ledgerErr) {
+        console.error("[centypack] ledger sync failed on pack create", sessionId, ledgerErr);
+        await client.query("ROLLBACK TO SAVEPOINT before_ledger");
+      }
       await client.query("COMMIT");
       return { ...session, lines: insertedLines };
     } catch (err) {
@@ -8948,6 +9342,19 @@ export class DatabaseStorage implements IStorage {
             }
           }
         }
+      }
+      const packUpdateEntries = session.status === "completed"
+        ? updatedLines.flatMap(l => [
+            { txnType: "pack_out", txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, stage: "graded", direction: "out", qtyKg: String((l as any).net_weight_kg) },
+            { txnType: "pack_in",  txnDate: session.session_date, cropId: session.crop_id, varietyId: session.variety_id ?? null, gradeCodeId: (l as any).grade_code_id ?? null, cartonTypeId: (l as any).carton_type_id ?? null, stage: "packed", direction: "in", qtyKg: String((l as any).net_weight_kg), cartonCount: (l as any).carton_count ?? null },
+          ])
+        : [];
+      await client.query("SAVEPOINT before_ledger");
+      try {
+        await this.syncLedgerInTxn(client, id, businessId, packUpdateEntries);
+      } catch (ledgerErr) {
+        console.error("[centypack] ledger sync failed on pack update", id, ledgerErr);
+        await client.query("ROLLBACK TO SAVEPOINT before_ledger");
       }
       await client.query("COMMIT");
       return { ...session, lines: updatedLines };
@@ -9115,6 +9522,112 @@ export class DatabaseStorage implements IStorage {
     } finally {
       client.release();
     }
+  }
+
+  // ── Stock ledger ─────────────────────────────────────────────────────────────
+
+  private async syncLedgerInTxn(
+    client: PoolClient,
+    txnId: string,
+    businessId: string,
+    entries: Array<{
+      txnType: string; txnDate: string; cropId: string;
+      varietyId?: string | null; gradeCodeId?: string | null;
+      cartonTypeId?: string | null; warehouseId?: string | null;
+      stage: string; direction: string;
+      qtyKg?: string | null; cartonCount?: number | null;
+    }>,
+  ): Promise<void> {
+    await client.query(`DELETE FROM centypack_stock_ledger WHERE txn_id=$1 AND business_id=$2`, [txnId, businessId]);
+    for (const e of entries) {
+      await client.query(
+        `INSERT INTO centypack_stock_ledger (id,business_id,txn_type,txn_id,txn_date,crop_id,variety_id,grade_code_id,carton_type_id,warehouse_id,stage,direction,qty_kg,carton_count)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        [crypto.randomUUID(), businessId, e.txnType, txnId, e.txnDate, e.cropId,
+         e.varietyId ?? null, e.gradeCodeId ?? null, e.cartonTypeId ?? null, e.warehouseId ?? null,
+         e.stage, e.direction, e.qtyKg ?? null, e.cartonCount ?? null],
+      );
+    }
+  }
+
+  async getStockOnHand(businessId: string, opts: { cropId?: string; stage?: string; warehouseId?: string } = {}): Promise<StockOnHandRow[]> {
+    const { cropId, stage, warehouseId } = opts;
+    const conditions = [`sl.business_id = $1`, `sl.stage != 'waste'`];
+    const params: unknown[] = [businessId];
+    if (cropId) { params.push(cropId); conditions.push(`sl.crop_id = $${params.length}`); }
+    if (stage) { params.push(stage); conditions.push(`sl.stage = $${params.length}`); }
+    if (warehouseId) { params.push(warehouseId); conditions.push(`sl.warehouse_id = $${params.length}`); }
+    const where = conditions.join(" AND ");
+    const { rows } = await pool.query<StockOnHandRow & { qty_kg_balance: string; carton_balance: string }>(
+      `SELECT
+         sl.crop_id        AS "cropId",
+         COALESCE(c.name, sl.crop_id)  AS "cropName",
+         sl.variety_id     AS "varietyId",
+         v.name            AS "varietyName",
+         sl.grade_code_id  AS "gradeCodeId",
+         g.name            AS "gradeCodeName",
+         sl.carton_type_id AS "cartonTypeId",
+         ct.name           AS "cartonTypeName",
+         sl.warehouse_id   AS "warehouseId",
+         w.name            AS "warehouseName",
+         sl.stage,
+         SUM(CASE WHEN sl.direction='in' THEN sl.qty_kg::numeric ELSE -sl.qty_kg::numeric END)          AS qty_kg_balance,
+         SUM(CASE WHEN sl.direction='in' THEN COALESCE(sl.carton_count,0) ELSE -COALESCE(sl.carton_count,0) END) AS carton_balance
+       FROM centypack_stock_ledger sl
+       LEFT JOIN centypack_crops    c  ON c.id  = sl.crop_id
+       LEFT JOIN centypack_varieties v  ON v.id  = sl.variety_id
+       LEFT JOIN centypack_grade_codes g ON g.id = sl.grade_code_id
+       LEFT JOIN centypack_carton_types ct ON ct.id = sl.carton_type_id
+       LEFT JOIN centypack_warehouses   w  ON w.id  = sl.warehouse_id
+       WHERE ${where}
+       GROUP BY sl.crop_id, c.name, sl.variety_id, v.name,
+                sl.grade_code_id, g.name, sl.carton_type_id, ct.name,
+                sl.warehouse_id, w.name, sl.stage
+       HAVING SUM(CASE WHEN sl.direction='in' THEN sl.qty_kg::numeric ELSE -sl.qty_kg::numeric END) > 0.001
+           OR SUM(CASE WHEN sl.direction='in' THEN COALESCE(sl.carton_count,0) ELSE -COALESCE(sl.carton_count,0) END) > 0
+       ORDER BY sl.stage, "cropName"`,
+      params,
+    );
+    return rows.map(r => ({
+      ...r,
+      qtyKgBalance: parseFloat((r as any).qty_kg_balance ?? "0"),
+      cartonBalance: parseInt(String((r as any).carton_balance ?? "0"), 10),
+    }));
+  }
+
+  async getStockMovements(businessId: string, opts: { txnId?: string; txnType?: string; cropId?: string; stage?: string; dateFrom?: string; dateTo?: string; limit?: number; offset?: number } = {}): Promise<{ rows: StockMovementRow[]; total: number }> {
+    const { txnId, txnType, cropId, stage, dateFrom, dateTo, limit = 100, offset = 0 } = opts;
+    const conditions = [`sl.business_id = $1`];
+    const params: unknown[] = [businessId];
+    if (txnId)   { params.push(txnId);   conditions.push(`sl.txn_id = $${params.length}`); }
+    if (txnType) { params.push(txnType); conditions.push(`sl.txn_type = $${params.length}`); }
+    if (cropId)  { params.push(cropId);  conditions.push(`sl.crop_id = $${params.length}`); }
+    if (stage)   { params.push(stage);   conditions.push(`sl.stage = $${params.length}`); }
+    if (dateFrom){ params.push(dateFrom);conditions.push(`sl.txn_date >= $${params.length}`); }
+    if (dateTo)  { params.push(dateTo);  conditions.push(`sl.txn_date <= $${params.length}`); }
+    const where = conditions.join(" AND ");
+    const countRes = await pool.query<{ total: string }>(`SELECT count(*)::text AS total FROM centypack_stock_ledger sl WHERE ${where}`, params);
+    const total = parseInt(countRes.rows[0]?.total ?? "0", 10);
+    params.push(limit, offset);
+    const { rows } = await pool.query(
+      `SELECT sl.*,
+         COALESCE(c.name, sl.crop_id) AS "cropName",
+         v.name  AS "varietyName",
+         g.name  AS "gradeCodeName",
+         ct.name AS "cartonTypeName",
+         w.name  AS "warehouseName"
+       FROM centypack_stock_ledger sl
+       LEFT JOIN centypack_crops        c  ON c.id  = sl.crop_id
+       LEFT JOIN centypack_varieties    v  ON v.id  = sl.variety_id
+       LEFT JOIN centypack_grade_codes  g  ON g.id  = sl.grade_code_id
+       LEFT JOIN centypack_carton_types ct ON ct.id = sl.carton_type_id
+       LEFT JOIN centypack_warehouses   w  ON w.id  = sl.warehouse_id
+       WHERE ${where}
+       ORDER BY sl.txn_date DESC, sl.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params,
+    );
+    return { rows: rows as StockMovementRow[], total };
   }
 }
 
