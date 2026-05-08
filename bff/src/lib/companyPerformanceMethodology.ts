@@ -1,6 +1,7 @@
 /**
  * Shared helper: resolve the canonical ERPNext Company docname from a
  * display-name / short-name that ctx.company may carry.
+ * Also resolves the performance methodology (BSC vs OKR) from ERPNext Company settings.
  */
 import { defaultClient, ErpCredentials, ErpError } from "../erpnext/client.js";
 
@@ -30,5 +31,24 @@ export async function resolveCompanyDocName(creds: ErpCredentials, company: stri
     return typeof found === "string" && found.trim() ? found.trim() : raw;
   } catch {
     return raw;
+  }
+}
+
+/**
+ * Read the performance methodology configured on the ERPNext Company doc.
+ * Falls back to "bsc" if the field is absent or unrecognised.
+ */
+export async function readPerformanceMethodology(
+  creds: ErpCredentials,
+  company: string,
+): Promise<"bsc" | "okr"> {
+  try {
+    const docName = await resolveCompanyDocName(creds, company);
+    const doc = await erp.getDoc(creds, "Company", docName) as Record<string, unknown>;
+    const raw = String(doc.custom_performance_methodology ?? doc.performance_methodology ?? "").toLowerCase().trim();
+    if (raw === "okr") return "okr";
+    return "bsc";
+  } catch {
+    return "bsc";
   }
 }

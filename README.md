@@ -1,6 +1,6 @@
 # Centy HR ↔ ERPNext integration
 
-Implementation bundle for **staging.centycapital.com** (and mobile) talking to **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
+Implementation bundle for **staging.centyhq.com** (and mobile) talking to **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
 
 **Git:** [github.com/emwangi2030-Edu/CentyHR](https://github.com/emwangi2030-Edu/CentyHR) · **Supabase + push targets:** see [`REMOTE.md`](./REMOTE.md).
 
@@ -8,8 +8,8 @@ Implementation bundle for **staging.centycapital.com** (and mobile) talking to *
 
 | Item | Value |
 |------|--------|
-| **Public base URL** | `https://staging.centycapital.com/hr-api` |
-| **Health check** | `GET https://staging.centycapital.com/hr-api/health` → `{"ok":true}` |
+| **Public base URL** | `https://staging.centyhq.com/hr-api` |
+| **Health check** | `GET https://staging.centyhq.com/hr-api/health` → `{"ok":true}` |
 | **Server path** | `/opt/centy-hr-integration/` |
 | **Process** | `pm2` app name **`centy-hr-bff`** (port **3040** on localhost) |
 | **Reverse proxy** | OpenLiteSpeed `context /hr-api` → `127.0.0.1:3040` (same vhost as Pay Hub staging) |
