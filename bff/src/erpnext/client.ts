@@ -163,11 +163,66 @@ export class ErpNextClient {
     return Array.isArray(msg) ? msg : [];
   }
 
-  /** Submit document (workflow/submit button equivalent). */
-  async submitDoc(creds: ErpCredentials, doctype: string, name: string): Promise<unknown> {
-    return this.callMethod(creds, "frappe.client.submit", {
-      doc: { doctype, name },
-    });
+  /**
+   * Strips Frappe `__*` keys (e.g. `__onload`) from a resource `GET` payload.
+   * Needed when passing a full doc into `frappe.client.submit` — Frappe's
+   * `get_doc(dict)` does **not** load from the DB, so a sparse doc omits field
+   * values (e.g. HR `Employee Advance.exchange_rate` stays 0 and validate fails).
+   */
+  private stripErpOnloadForSubmit(d: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(d)) {
+      if (k.startsWith("__")) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  /**
+   * Submit document (workflow/submit button equivalent).
+   * Fetches the doc once to read the current `modified` for optimistic locking.
+   *
+   * - **`sparse` (default)**: We pass only `{ doctype, name, modified }` to
+   *   `frappe.client.submit`. That avoids some ERPNext 403s (field/child-table
+   *   permission checks) on a few doctypes, but the server builds the document
+   *   from that dict only — it does **not** re-fetch from the DB, so any field
+   *   not in the dict is default/empty in memory.
+   * - **`full`**: Pass the full `getDoc` payload (with `__*` stripped). Use for
+   *   doctypes like HR `Employee Advance` that validate fields (e.g. exchange
+   *   rate) on the in-memory doc during submit.
+   * One automatic retry on 417 handles a rare race.
+   */
+  async submitDoc(
+    creds: ErpCredentials,
+    doctype: string,
+    name: string,
+    opts?: { mode?: "sparse" | "full" }
+  ): Promise<unknown> {
+    const mode = opts?.mode ?? "sparse";
+    const run = async () => {
+      const full = await this.getDoc(creds, doctype, name);
+      const doc =
+        mode === "full"
+          ? this.stripErpOnloadForSubmit({
+              ...full,
+              doctype: String(full.doctype ?? doctype),
+              name: String(full.name ?? name),
+            })
+          : {
+              doctype: String(full.doctype ?? doctype),
+              name: String(full.name ?? name),
+              modified: full.modified,
+            };
+      return this.callMethod(creds, "frappe.client.submit", { doc });
+    };
+    try {
+      return await run();
+    } catch (e) {
+      if (e instanceof ErpError && e.status === 417) {
+        return await run();
+      }
+      throw e;
+    }
   }
 
   /** Cancel submitted document (recall / void — ERP rules still apply). */

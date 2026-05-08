@@ -37,9 +37,26 @@ export const HR_BRIDGE_SECRET = process.env.HR_BRIDGE_SECRET ?? "";
  */
 export const DEV_INSECURE_HEADERS = process.env.DEV_INSECURE_HEADERS === "1";
 
-/** Fallback when per-user keys are not passed from the proxy */
-export const ERP_API_KEY = process.env.HR_ERP_API_KEY ?? "";
-export const ERP_API_SECRET = process.env.HR_ERP_API_SECRET ?? "";
+function firstNonEmptyEnv(...names: (string | undefined)[]): string {
+  for (const v of names) {
+    const t = String(v ?? "").trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+/**
+ * Frappe API token for integration calls (BFF .env). Prefer `HR_ERP_API_*` (bridge docs);
+ * falls back to `ERP_API_KEY` / `ERP_API_SECRET` so a single pair works everywhere.
+ */
+export const ERP_API_KEY = firstNonEmptyEnv(
+  process.env.HR_ERP_API_KEY,
+  process.env.ERP_API_KEY,
+);
+export const ERP_API_SECRET = firstNonEmptyEnv(
+  process.env.HR_ERP_API_SECRET,
+  process.env.ERP_API_SECRET,
+);
 
 /**
  * Optional: Supabase (service role) for expense policy / workflow config tables.
@@ -83,6 +100,19 @@ export const DOCUSEAL_WEBHOOK_SECRET = process.env.DOCUSEAL_WEBHOOK_SECRET ?? ""
 
 /** Dev only: skip header verification (never use in production). */
 export const DOCUSEAL_WEBHOOK_INSECURE = process.env.DOCUSEAL_WEBHOOK_INSECURE === "1";
+
+/**
+ * Optional: exact Custom Field fieldname on Employee for bank branch.
+ * If unset, BFF resolves from Custom Field list (label "Bank Branch" or fieldname pattern).
+ * Pay Hub still sends/reads JSON key `custom_bank_branch`; BFF maps to this ERP field.
+ */
+export const HR_EMPLOYEE_BANK_BRANCH_FIELD = process.env.HR_EMPLOYEE_BANK_BRANCH_FIELD?.trim() ?? "";
+
+/**
+ * When `1`, PATCH ensures a Data Custom Field `custom_bank_branch` exists on Employee (requires ERP create permission).
+ * Use when the integration user cannot read the Custom Field doctype but can create fields.
+ */
+export const HR_AUTO_SETUP_BANK_BRANCH_FIELD = process.env.HR_AUTO_SETUP_BANK_BRANCH_FIELD === "1";
 
 /** ERP method DocuSeal payload is forwarded to. */
 export const DOCUSEAL_WEBHOOK_ERP_METHOD =

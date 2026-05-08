@@ -49,6 +49,319 @@ async function resolveCompanyDocName(creds: ErpCredentials, company: string): Pr
   }
 }
 
+async function getCompanyDefaultCurrency(creds: ErpCredentials, companyDoc: string): Promise<string> {
+  try {
+    const c = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
+    return String(c.default_currency ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function resolveEmployeeAdvanceExchangeRate(
+  creds: ErpCredentials,
+  employeeCurrency: string,
+  companyCurrency: string,
+  postingDate: string
+): Promise<number> {
+  const ec = employeeCurrency.trim();
+  const cc = companyCurrency.trim();
+  if (!ec || !cc) return 1;
+  if (ec === cc) return 1;
+  try {
+    const raw = await erp.callMethod(creds, "erpnext.setup.utils.get_exchange_rate", {
+      from_currency: ec,
+      to_currency: cc,
+      transaction_date: postingDate,
+    });
+    const msg = (raw as { message?: unknown })?.message;
+    const n = typeof msg === "number" ? msg : Number(msg);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {
+    /* non-fatal; caller treats 0 as failure */
+  }
+  return 0;
+}
+
+/**
+ * HRMS v15 `Employee Advance` has a required `exchange_rate`; drafts sometimes keep 0 (same KES / copy-paste in ERP).
+ * Submit then fails. We always PATCH the draft, verify, then `frappe.client.set_value` if needed.
+ */
+async function ensureEmployeeAdvanceExchangeOnDraft(
+  creds: ErpCredentials,
+  companyDoc: string,
+  name: string,
+  employee: string,
+  postingDate: string
+): Promise<{
+  companyCurrency: string;
+  salaryCurrency: string;
+  exchangeRate: number;
+}> {
+  const companyCurrency = await getCompanyDefaultCurrency(creds, companyDoc);
+  if (!companyCurrency) {
+    throw new HttpError("Set company default currency in ERPNext.", 400);
+  }
+  const empDoc = (await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>;
+  const salaryCurrency = String(empDoc.salary_currency ?? "").trim() || companyCurrency;
+  const rate = await resolveEmployeeAdvanceExchangeRate(
+    creds,
+    salaryCurrency,
+    companyCurrency,
+    postingDate
+  );
+  if (rate <= 0) {
+    throw new HttpError("Add a currency exchange rate in ERP for this date.", 400);
+  }
+
+  const applyPatch = async () => {
+    const fresh = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
+    await erp.updateDoc(creds, "Employee Advance", name, {
+      doctype: "Employee Advance",
+      name,
+      modified: fresh.modified,
+      currency: salaryCurrency,
+      exchange_rate: rate,
+    });
+  };
+
+  await applyPatch();
+  let after = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
+  let n = Number(after.exchange_rate ?? 0);
+  if (Number.isFinite(n) && n > 0) {
+    return { companyCurrency, salaryCurrency, exchangeRate: rate };
+  }
+
+  try {
+    await erp.callMethod(creds, "frappe.client.set_value", {
+      doctype: "Employee Advance",
+      name,
+      fieldname: "exchange_rate",
+      value: rate,
+    });
+  } catch (e) {
+    console.warn("[BFF] frappe.client.set_value exchange_rate:", e);
+  }
+  after = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
+  n = Number(after.exchange_rate ?? 0);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new HttpError(
+      "Set exchange rate on this advance in ERP, save, then approve again from Pay Hub.",
+      400
+    );
+  }
+  return { companyCurrency, salaryCurrency, exchangeRate: rate };
+}
+
+type AccountHeadMeta = { account_type: string; account_currency: string };
+
+async function getAccountHeadMeta(
+  creds: ErpCredentials,
+  name: string
+): Promise<AccountHeadMeta | null> {
+  try {
+    const a = (await erp.getDoc(creds, "Account", name)) as Record<string, unknown>;
+    return {
+      account_type: String(a.account_type ?? ""),
+      account_currency: String(a.account_currency ?? "").trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveReceivableEmployeeAdvanceAccount(
+  creds: ErpCredentials,
+  companyDoc: string,
+  employee: string,
+  salaryCurrency: string
+): Promise<string | null> {
+  const sc = salaryCurrency.trim();
+  if (!sc) return null;
+
+  const comp = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
+  const fromCompany = String(comp.default_employee_advance_account ?? "").trim();
+  const emp = (await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>;
+  const fromEmployee = String(emp.employee_advance_account ?? "").trim();
+
+  const tryNames: string[] = [];
+  if (fromCompany) tryNames.push(fromCompany);
+  if (fromEmployee && fromEmployee !== fromCompany) tryNames.push(fromEmployee);
+
+  for (const accName of tryNames) {
+    const meta = await getAccountHeadMeta(creds, accName);
+    if (!meta) continue;
+    if (meta.account_type !== "Receivable") continue;
+    if (meta.account_currency !== sc) continue;
+    return accName;
+  }
+
+  const rows = await erp.getList(creds, "Account", {
+    filters: [
+      ["company", "=", companyDoc],
+      ["account_type", "=", "Receivable"],
+      ["is_group", "=", 0],
+      ["disabled", "=", 0],
+      ["account_currency", "=", sc],
+    ],
+    fields: ["name", "account_name"],
+    order_by: "name asc",
+    limit_page_length: 80,
+  });
+
+  for (const raw of rows) {
+    const r = asRecord(raw);
+    if (!r) continue;
+    const n = `${String(r.name ?? "")} ${String(r.account_name ?? "")}`.toLowerCase();
+    if (n.includes("advance") || n.includes("employee")) {
+      return String(r.name ?? "").trim() || null;
+    }
+  }
+  if (rows.length === 1) {
+    const r = asRecord(rows[0]);
+    if (r?.name) return String(r.name);
+  }
+  return null;
+}
+
+async function alignCompanyDefaultEmployeeAdvanceAccount(
+  creds: ErpCredentials,
+  companyDoc: string,
+  salaryCurrency: string,
+  resolvedAdvance: string
+): Promise<void> {
+  const comp = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
+  const cur = String(comp.default_employee_advance_account ?? "").trim();
+  if (cur === resolvedAdvance) return;
+  if (!cur) return;
+  const m = await getAccountHeadMeta(creds, cur);
+  const curOk = Boolean(
+    m && m.account_type === "Receivable" && m.account_currency === salaryCurrency
+  );
+  if (curOk) return;
+  await erp.callMethod(creds, "frappe.client.set_value", {
+    doctype: "Company",
+    name: companyDoc,
+    fieldname: "default_employee_advance_account",
+    value: resolvedAdvance,
+  });
+}
+
+async function alignEmployeeMasterAdvanceAccount(
+  creds: ErpCredentials,
+  employee: string,
+  salaryCurrency: string,
+  resolvedAdvance: string,
+  existingEmp?: Record<string, unknown>
+): Promise<void> {
+  const emp = existingEmp ?? ((await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>);
+  const cur = String(emp.employee_advance_account ?? "").trim();
+  if (cur === resolvedAdvance) return;
+  if (cur) {
+    const m = await getAccountHeadMeta(creds, cur);
+    const curOk = Boolean(
+      m && m.account_type === "Receivable" && m.account_currency === salaryCurrency
+    );
+    if (curOk) return;
+  }
+  await erp.callMethod(creds, "frappe.client.set_value", {
+    doctype: "Employee",
+    name: employee,
+    fieldname: "employee_advance_account",
+    value: resolvedAdvance,
+  });
+}
+
+/** Max advance as a share of latest Salary Structure Assignment `base` (monthly, company currency). */
+const SALARY_ADVANCE_MAX_SALARY_FRACTION = 0.5;
+
+/** Latest SSA `base` in company / payroll terms (same as GET /v1/payroll/team). */
+async function getLatestSalaryBase(
+  creds: ErpCredentials,
+  companyDoc: string,
+  employee: string
+): Promise<number | null> {
+  const rows = await erp.getList(creds, "Salary Structure Assignment", {
+    filters: [
+      ["company", "=", companyDoc],
+      ["employee", "=", employee],
+    ],
+    fields: ["base", "from_date"],
+    order_by: "from_date desc",
+    limit_page_length: 1,
+  });
+  const r = asRecord(rows[0]);
+  if (!r) return null;
+  const base = Number(r.base ?? 0);
+  if (!Number.isFinite(base) || base <= 0) return null;
+  return base;
+}
+
+/** Inclusive [start, end] for `postingDate`'s calendar month (YYYY-MM-DD). */
+function postingMonthRange(postingDate: string): { start: string; end: string } {
+  const m = String(postingDate ?? "").match(/^(\d{4})-(\d{2})/);
+  const y = m ? parseInt(m[1], 10) : new Date().getFullYear();
+  const mo = m ? parseInt(m[2], 10) : new Date().getMonth() + 1;
+  const start = `${y}-${String(mo).padStart(2, "0")}-01`;
+  const lastDay = new Date(y, mo, 0).getDate();
+  const end = `${y}-${String(mo).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+  return { start, end };
+}
+
+/** Block a second issue in the same month (non‑cancelled Employee Advance). */
+async function hasEmployeeAdvanceInSameMonth(
+  creds: ErpCredentials,
+  companyDoc: string,
+  employee: string,
+  postingDate: string
+): Promise<boolean> {
+  const { start, end } = postingMonthRange(postingDate);
+  const rows = await erp.getList(creds, "Employee Advance", {
+    filters: [
+      ["company", "=", companyDoc],
+      ["employee", "=", employee],
+      ["posting_date", ">=", start],
+      ["posting_date", "<=", end],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name"],
+    limit_page_length: 1,
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * True if a **different** (non‑cancelled) advance exists in the same calendar month
+ * (used when submitting one draft: the draft itself is excluded by name).
+ */
+async function hasAnotherEmployeeAdvanceInSameMonthExcluding(
+  creds: ErpCredentials,
+  companyDoc: string,
+  employee: string,
+  postingDate: string,
+  excludeName: string
+): Promise<boolean> {
+  const { start, end } = postingMonthRange(postingDate);
+  const rows = await erp.getList(creds, "Employee Advance", {
+    filters: [
+      ["company", "=", companyDoc],
+      ["employee", "=", employee],
+      ["posting_date", ">=", start],
+      ["posting_date", "<=", end],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name"],
+    limit_page_length: 50,
+  });
+  if (!Array.isArray(rows)) return false;
+  const ex = String(excludeName ?? "").trim();
+  for (const raw of rows) {
+    const n = String(asRecord(raw)?.name ?? "").trim();
+    if (n && n !== ex) return true;
+  }
+  return false;
+}
+
 const BULK_APPROVE_MAX = 40;
 const EXPORT_MAX_ROWS = 2000;
 
@@ -1370,6 +1683,335 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     } catch (e) {
       if (e instanceof ErpError && (e.status === 404 || e.status === 400)) {
         return { data: [], meta: { employee_advance_unavailable: true } };
+      }
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
+   * POST /v1/expenses/advances
+   * Creates **Employee Advance** in ERPNext HR.
+   * HR may pass `employee`; employees without submit-on-behalf may only create for their linked Employee row.
+   * Blocked if no SSA base, over half-salary cap, or a non‑cancelled advance already exists for that employee in the posting month.
+   */
+  app.post("/v1/expenses/advances", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    try {
+      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
+      const companyCurrency = await getCompanyDefaultCurrency(ctx.creds, companyDoc);
+      if (!companyCurrency) {
+        return reply.status(400).send({ error: "Set company default currency in ERPNext." });
+      }
+
+      const body = ((req.body ?? {}) as Record<string, unknown>) || {};
+      let employee: string;
+      if (ctx.canSubmitOnBehalf) {
+        employee = String(body.employee ?? "").trim();
+        if (!employee) {
+          const mine = await getLinkedEmployeeName(ctx);
+          if (mine) employee = mine;
+        }
+        if (!employee) return reply.status(400).send({ error: "employee is required" });
+      } else {
+        const mine = await getLinkedEmployeeName(ctx);
+        if (!mine) {
+          return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
+        }
+        const requested = String(body.employee ?? "").trim();
+        if (requested && requested !== mine) {
+          return reply.status(403).send({ error: "You can only request an advance for your own profile." });
+        }
+        employee = mine;
+      }
+      const advanceAmount = Number(body.advance_amount ?? body.amount ?? 0);
+      if (!Number.isFinite(advanceAmount) || advanceAmount <= 0) {
+        return reply.status(400).send({ error: "advance_amount must be a positive number" });
+      }
+      const postingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.posting_date ?? "").trim())
+        ? String(body.posting_date).trim()
+        : new Date().toISOString().slice(0, 10);
+      const purpose = String(body.purpose ?? body.notes ?? "Salary advance").trim() || "Salary advance";
+
+      const empDoc = (await erp.getDoc(ctx.creds, "Employee", employee)) as Record<string, unknown>;
+      const empCompany = String(empDoc.company ?? "").trim();
+      if (empCompany !== companyDoc) {
+        return reply.status(403).send({ error: "That employee is not in your company." });
+      }
+
+      const duplicateMonth = await hasEmployeeAdvanceInSameMonth(
+        ctx.creds,
+        companyDoc,
+        employee,
+        postingDate
+      );
+      if (duplicateMonth) {
+        return reply.status(400).send({
+          error: "This employee already has a salary advance this month.",
+        });
+      }
+
+      const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, employee);
+      if (monthlySalaryBase == null) {
+        return reply
+          .status(400)
+          .send({ error: "Assign a salary in payroll before salary advance." });
+      }
+
+      const salaryCurrency = String(empDoc.salary_currency ?? "").trim() || companyCurrency;
+      const exchangeRate = await resolveEmployeeAdvanceExchangeRate(
+        ctx.creds,
+        salaryCurrency,
+        companyCurrency,
+        postingDate
+      );
+      if (exchangeRate <= 0) {
+        return reply.status(400).send({ error: "Add a currency exchange rate in ERP for this date." });
+      }
+
+      const maxInCompany = monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION;
+      const advanceInCompany =
+        salaryCurrency === companyCurrency ? advanceAmount : advanceAmount * exchangeRate;
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      if (round2(advanceInCompany) > round2(maxInCompany)) {
+        return reply.status(400).send({
+          error: "Advance cannot exceed half of this employee's monthly salary.",
+        });
+      }
+
+      const advanceAccount = await resolveReceivableEmployeeAdvanceAccount(
+        ctx.creds,
+        companyDoc,
+        employee,
+        salaryCurrency
+      );
+      if (!advanceAccount) {
+        return reply
+          .status(400)
+          .send({ error: "In ERP, set a Receivable advance account for this currency." });
+      }
+
+      await alignCompanyDefaultEmployeeAdvanceAccount(
+        ctx.creds,
+        companyDoc,
+        salaryCurrency,
+        advanceAccount
+      );
+      await alignEmployeeMasterAdvanceAccount(
+        ctx.creds,
+        employee,
+        salaryCurrency,
+        advanceAccount,
+        empDoc
+      );
+
+      const doc: Record<string, unknown> = {
+        company: companyDoc,
+        employee,
+        posting_date: postingDate,
+        advance_amount: advanceAmount,
+        purpose,
+        currency: salaryCurrency,
+        exchange_rate: exchangeRate,
+        advance_account: advanceAccount,
+      };
+
+      const created = (await erp.createDoc(ctx.creds, "Employee Advance", doc)) as Record<string, unknown>;
+      return { data: created };
+    } catch (e) {
+      if (e instanceof ErpError) {
+        if (e.status === 404) {
+          return reply.status(400).send({ error: "Employee or advance type not found in payroll." });
+        }
+        return replyErp(reply, e);
+      }
+      throw e;
+    }
+  });
+
+  /**
+   * Single **Employee Advance** (must register before `/v1/expenses/:id` Expense Claim).
+   * HR: any company advance. Others: only their own employee link.
+   */
+  app.get("/v1/expenses/advances/:name", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const name = String((req.params as { name: string }).name ?? "").trim();
+    if (!name) return reply.status(400).send({ error: "Advance name is required" });
+    try {
+      // Resolve company and load the advance in parallel to cut wall-clock time on high-latency ERP.
+      const [companyDoc, cur] = await Promise.all([
+        resolveCompanyDocName(ctx.creds, ctx.company),
+        erp.getDoc(ctx.creds, "Employee Advance", name) as Promise<Record<string, unknown>>,
+      ]);
+      if (String(cur.company) !== companyDoc) {
+        return reply.status(403).send({ error: "Advance not in your company." });
+      }
+      if (!ctx.canSubmitOnBehalf) {
+        const mine = await getLinkedEmployeeName(ctx);
+        if (!mine || String(cur.employee) !== mine) {
+          return reply.status(403).send({ error: "You can only open your own advance." });
+        }
+      }
+      return { data: cur };
+    } catch (e) {
+      if (e instanceof ErpError && e.status === 404) {
+        return reply.status(404).send({ error: "Advance not found in payroll." });
+      }
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Submit draft Employee Advance (docstatus 0 → submitted). */
+  app.post("/v1/expenses/advances/:name/submit", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "HR access is required to submit this advance." });
+    }
+    const name = String((req.params as { name: string }).name ?? "").trim();
+    if (!name) return reply.status(400).send({ error: "Advance name is required" });
+    try {
+      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
+      const cur = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      if (String(cur.company) !== companyDoc) {
+        return reply.status(403).send({ error: "Advance not in your company." });
+      }
+      const ds = Number(cur.docstatus ?? 0);
+      if (ds !== 0) {
+        return reply.status(409).send({ error: "This advance is already submitted in payroll." });
+      }
+
+      // Same business rules as POST /v1/expenses/advances (no duplicate month; max half of monthly SSA base).
+      const employee = String(cur.employee ?? "").trim();
+      const postingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(cur.posting_date ?? "").trim())
+        ? String(cur.posting_date).trim()
+        : new Date().toISOString().slice(0, 10);
+      if (employee) {
+        if (
+          await hasAnotherEmployeeAdvanceInSameMonthExcluding(
+            ctx.creds,
+            companyDoc,
+            employee,
+            postingDate,
+            name
+          )
+        ) {
+          return reply.status(400).send({
+            error: "This employee already has a salary advance this month.",
+          });
+        }
+      }
+
+      let companyCurrency = "";
+      let exchangeRate = 0;
+      let salaryCurrency = "";
+      if (employee) {
+        const synced = await ensureEmployeeAdvanceExchangeOnDraft(
+          ctx.creds,
+          companyDoc,
+          name,
+          employee,
+          postingDate
+        );
+        companyCurrency = synced.companyCurrency;
+        salaryCurrency = synced.salaryCurrency;
+        exchangeRate = synced.exchangeRate;
+      }
+
+      const advanceAmount = Number(cur.advance_amount ?? 0);
+      if (employee && Number.isFinite(advanceAmount) && advanceAmount > 0) {
+        const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, employee);
+        if (monthlySalaryBase == null) {
+          return reply
+            .status(400)
+            .send({ error: "Assign a salary in payroll before salary advance." });
+        }
+        if (exchangeRate <= 0) {
+          return reply.status(400).send({ error: "Add a currency exchange rate in ERP for this date." });
+        }
+        const maxInCompany = monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION;
+        const advanceInCompany =
+          salaryCurrency === companyCurrency ? advanceAmount : advanceAmount * exchangeRate;
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        if (round2(advanceInCompany) > round2(maxInCompany)) {
+          return reply.status(400).send({
+            error: "Advance cannot exceed half of this employee's monthly salary.",
+          });
+        }
+      }
+      /* Full doc: `frappe.client.submit` uses `get_doc(sparse dict)` which does not reload from DB;
+       * omitted fields (e.g. exchange_rate) would stay at defaults and fail HR validate. */
+      await erp.submitDoc(ctx.creds, "Employee Advance", name, { mode: "full" });
+      const after = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      return { data: after };
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      if (e instanceof ErpError && e.status === 404) {
+        return reply.status(404).send({ error: "Advance not found in payroll." });
+      }
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Delete draft Employee Advance only (docstatus 0). HR: any draft in company; others: own draft only. */
+  app.delete("/v1/expenses/advances/:name", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const name = String((req.params as { name: string }).name).trim();
+    if (!name) return reply.status(400).send({ error: "Advance name is required" });
+    try {
+      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
+      const cur = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      if (String(cur.company) !== companyDoc) {
+        return reply.status(403).send({ error: "Advance not in your company." });
+      }
+      if (!ctx.canSubmitOnBehalf) {
+        const mine = await getLinkedEmployeeName(ctx);
+        if (!mine || String(cur.employee) !== mine) {
+          return reply.status(403).send({ error: "You can only remove your own draft advance." });
+        }
+      }
+      const ds = Number(cur.docstatus ?? 0);
+      if (ds !== 0) {
+        return reply
+          .status(409)
+          .send({ error: "Only draft advances can be removed; cancel it in payroll instead." });
+      }
+      const snapshot = {
+        employee: cur.employee,
+        employee_name: cur.employee_name,
+        advance_amount: cur.advance_amount,
+        posting_date: cur.posting_date,
+      };
+      await erp.deleteDoc(ctx.creds, "Employee Advance", name);
+      return { ok: true, data: snapshot };
+    } catch (e) {
+      if (e instanceof ErpError && e.status === 404) {
+        return reply.status(404).send({ error: "Advance not found in payroll." });
       }
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;

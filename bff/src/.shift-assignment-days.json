@@ -1,5 +1,16 @@
 {
-  "HR-SHA-26-04-00017": "monday,tuesday,wednesday,thursday,friday",
   "HR-SHA-26-04-00019": "monday,tuesday,wednesday,thursday,friday",
-  "HR-SHA-26-04-00018": "monday,tuesday,wednesday,thursday,friday"
+  "HR-SHA-26-04-00018": "monday,wednesday,tuesday,thursday,friday",
+  "HR-SHA-26-04-00017": "monday,wednesday,tuesday,thursday,friday",
+  "HR-SHA-26-04-00016": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-04-00020": "monday,tuesday,wednesday,friday,thursday",
+  "HR-SHA-26-04-00021": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00001": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00002": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00003": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00004": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00005": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00006": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00007": "monday,tuesday,wednesday,thursday,friday",
+  "HR-SHA-26-05-00008": "monday,tuesday,wednesday,thursday,friday"
 }

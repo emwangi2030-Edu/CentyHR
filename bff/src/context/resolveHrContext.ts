@@ -7,7 +7,8 @@ import { verifyBridgeAuth } from "../lib/bridge.js";
 export class HttpError extends Error {
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
+    public readonly code?: string
   ) {
     super(message);
     this.name = "HttpError";
@@ -34,10 +35,26 @@ export function resolveHrContext(req: FastifyRequest): HrContext {
     const verified = verifyBridgeAuth(authHeader, bridgeSecret);
     if (!verified) throw new HttpError("Invalid or expired bridge token", 401);
 
+    const useBffErp = headerOne(req, "x-hr-erp-integrate") === "1";
     const key = headerOne(req, "x-erp-api-key");
     const sec = headerOne(req, "x-erp-api-secret");
     let creds: ErpCredentials;
-    if (key && sec) {
+    if (useBffErp) {
+      /** `X-HR-ERP-Integrate: 1` = ignore `X-Erp-Api-*` and use BFF .env only (rare; Pay Hub now forwards the same keys as other HR). */
+      if (config.ERP_API_KEY && config.ERP_API_SECRET) {
+        creds = { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET };
+      } else {
+        console.error(
+          "[resolveHrContext] BFF Frappe API keys missing for integration calls. " +
+            "Set HR_ERP_API_KEY and HR_ERP_API_SECRET (or ERP_API_KEY and ERP_API_SECRET) in CentyHR/bff .env, " +
+            "using keys from an ERP user with Employee Advance access; restart the BFF."
+        );
+        throw new HttpError(
+          "Payroll for approvals is not set up, ask your admin.",
+          500
+        );
+      }
+    } else if (key && sec) {
       creds = { apiKey: key, apiSecret: sec };
     } else if (config.ERP_API_KEY && config.ERP_API_SECRET) {
       creds = { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET };
