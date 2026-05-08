@@ -12,18 +12,16 @@ import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
 
 const erp = defaultClient();
 
-const VALID_KINDS = ["department", "designation", "branch"] as const;
+const VALID_KINDS = ["department", "designation", "branch", "employment-type"] as const;
 type OrgKind = (typeof VALID_KINDS)[number];
 
 /**
  * ERPNext doctype spec for each org unit kind.
  *
- * - listField:   field returned in GET /org/options — must be the document `name`
- *                because Employee.department is a Link that stores the doc name.
- * - writeField:  field set when creating a new doc (the human-readable title field).
- *                ERPNext auto-generates `name` from this via its naming series
- *                (e.g. department_name "Engineering" → name "Engineering - NT").
- * - filterField: field used to check whether a doc already exists before creating.
+ * - listField:    field returned in GET /org/options — must be the document `name`
+ * - writeField:   field set when creating a new doc (the human-readable title field)
+ * - filterField:  field used to check whether a doc already exists before creating
+ * - employeeField: field on the Employee doctype that links to this doc (defaults to kind)
  */
 const ERP_SPEC: Record<OrgKind, {
   doctype: string;
@@ -31,10 +29,12 @@ const ERP_SPEC: Record<OrgKind, {
   writeField: string;
   filterField: string;
   companyScoped: boolean;
+  employeeField?: string;
 }> = {
-  department:  { doctype: "Department",  listField: "name",             writeField: "department_name",  filterField: "department_name",  companyScoped: true  },
-  designation: { doctype: "Designation", listField: "designation_name", writeField: "designation_name", filterField: "designation_name", companyScoped: false },
-  branch:      { doctype: "Branch",      listField: "branch",           writeField: "branch",           filterField: "branch",           companyScoped: false },
+  department:        { doctype: "Department",       listField: "name",             writeField: "department_name",       filterField: "department_name",       companyScoped: true  },
+  designation:       { doctype: "Designation",      listField: "designation_name", writeField: "designation_name",      filterField: "designation_name",      companyScoped: false },
+  branch:            { doctype: "Branch",           listField: "branch",           writeField: "branch",                filterField: "branch",                companyScoped: false },
+  "employment-type": { doctype: "Employment Type",  listField: "name",             writeField: "employee_type_name",    filterField: "employee_type_name",    companyScoped: false, employeeField: "employment_type" },
 };
 
 function requireHr(ctx: ReturnType<typeof resolveHrContext>, reply: FastifyReply): boolean {
@@ -71,13 +71,14 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
       }
     };
 
-    const [departments, designations, branches] = await Promise.all([
+    const [departments, designations, branches, employmentTypes] = await Promise.all([
       fetchKind("department"),
       fetchKind("designation"),
       fetchKind("branch"),
+      fetchKind("employment-type"),
     ]);
 
-    return { data: { department: departments, designation: designations, branch: branches } };
+    return { data: { department: departments, designation: designations, branch: branches, employmentType: employmentTypes } };
   });
 
   // ── GET /v1/org/integrity ────────────────────────────────────────────────
@@ -224,9 +225,10 @@ export const orgUnitRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // Check that no active employees reference this value
+    const empField = spec.employeeField ?? kind;
     try {
       const linked = await erp.getList(ctx.creds, "Employee", {
-        filters: [["company", "=", ctx.company], [kind, "=", docName], ["status", "=", "Active"]],
+        filters: [["company", "=", ctx.company], [empField, "=", docName], ["status", "=", "Active"]],
         fields: ["name"],
         limit_page_length: 1,
       });

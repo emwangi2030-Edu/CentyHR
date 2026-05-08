@@ -1,4 +1,6 @@
 import pg from "pg";
+import fs from "fs";
+import path from "path";
 
 export type ExpensePolicy = {
   max_total_claim?: number;
@@ -40,6 +42,40 @@ export type PolicyWarningPublic = {
 
 const TTL_MS = 60_000;
 const cache = new Map<string, { pack: CompanyRulesPack; exp: number }>();
+
+// File-based fallback store used when DATABASE_URL is not configured.
+// Stores one JSON object: { [companyKey]: CompanyRulesPack }
+const FILE_STORE_PATH = path.resolve(
+  process.env.RULES_FILE_STORE ?? path.join(process.cwd(), "data", "expense-rules.json"),
+);
+
+function fileStoreRead(): Record<string, CompanyRulesPack> {
+  try {
+    const raw = fs.readFileSync(FILE_STORE_PATH, "utf8");
+    return JSON.parse(raw) as Record<string, CompanyRulesPack>;
+  } catch {
+    return {};
+  }
+}
+
+function fileStoreWrite(all: Record<string, CompanyRulesPack>): void {
+  try {
+    fs.mkdirSync(path.dirname(FILE_STORE_PATH), { recursive: true });
+    fs.writeFileSync(FILE_STORE_PATH, JSON.stringify(all, null, 2), "utf8");
+  } catch (err: unknown) {
+    console.warn("[expense-rules] file store write failed:", (err as Error).message);
+  }
+}
+
+function fileStoreGet(companyKey: string): CompanyRulesPack | null {
+  return fileStoreRead()[companyKey] ?? null;
+}
+
+function fileStoreSet(companyKey: string, pack: CompanyRulesPack): void {
+  const all = fileStoreRead();
+  all[companyKey] = pack;
+  fileStoreWrite(all);
+}
 
 // Lazy singleton pg pool — connects to the same DATABASE_URL as the main app.
 let pool: pg.Pool | null | undefined;
@@ -108,9 +144,12 @@ export async function loadCompanyRulesPack(companyKey: string): Promise<CompanyR
 
   const db = getPool();
   if (!db) {
-    const empty = defaultPack();
-    cache.set(companyKey, { pack: empty, exp: now + TTL_MS });
-    return empty;
+    const stored = fileStoreGet(companyKey);
+    const pack: CompanyRulesPack = stored
+      ? { ...defaultPack(), ...stored, workflow: { ...defaultPack().workflow, ...stored.workflow } }
+      : defaultPack();
+    cache.set(companyKey, { pack, exp: now + TTL_MS });
+    return pack;
   }
 
   try {
@@ -251,8 +290,21 @@ export async function upsertCompanyRules(
   body: { policy?: Record<string, unknown>; workflow?: Record<string, unknown>; feature_flags?: Record<string, unknown> }
 ): Promise<CompanyRulesPack> {
   const db = getPool();
+
   if (!db) {
-    throw new Error("DATABASE_URL not configured on BFF — cannot save rules");
+    // No database — persist to local file store instead.
+    const existing = fileStoreGet(companyKey) ?? defaultPack();
+    const next: CompanyRulesPack = {
+      policy: { ...(existing.policy ?? {}), ...(body.policy ?? {}) },
+      workflow: { ...(existing.workflow ?? {}), ...(body.workflow ?? {}) },
+      feature_flags: normalizeFlags({
+        ...(existing.feature_flags ?? {}),
+        ...((body.feature_flags as ExpenseFeatureFlags) ?? {}),
+      }),
+    };
+    fileStoreSet(companyKey, next);
+    invalidateRulesCache(companyKey);
+    return next;
   }
 
   // Read current row

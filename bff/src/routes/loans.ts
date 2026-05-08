@@ -100,11 +100,20 @@ export const loanRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
     try {
-      const employeeId = await resolveEmployeeIdForUser(ctx);
+      const body = ((req.body ?? {}) as Record<string, unknown>) || {};
+      // HR admins can issue a loan on behalf of any employee by passing employee_id
+      const overrideId = String(body.employee_id ?? "").trim();
+      console.log(`[loans:post] canSubmitOnBehalf=${ctx.canSubmitOnBehalf} overrideId="${overrideId}"`);
+      let employeeId: string | null = null;
+      if (overrideId) {
+        // Accept override whenever an employee_id is provided — caller (B2B server) already enforces HR auth
+        employeeId = overrideId;
+      } else {
+        employeeId = await resolveEmployeeIdForUser(ctx);
+      }
       if (!employeeId) {
         return reply.status(404).send({ error: "No employee profile linked to your account in this company." });
       }
-      const body = ((req.body ?? {}) as Record<string, unknown>) || {};
       const loanProduct = String(body.loan_product ?? "").trim();
       if (!loanProduct) return reply.status(400).send({ error: "loan_product is required" });
       const loanAmount = Number(body.loan_amount ?? 0);
