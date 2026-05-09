@@ -1,24 +1,35 @@
 # Centy HR ↔ ERPNext integration
 
-Implementation bundle for **staging.centycapital.com** (and mobile) talking to **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
+Implementation bundle for **staging.centyhq.com** (and mobile) talking to **ERPNext** at `erp.tarakilishicloud.com`, with **tenant = Company** and **approval before payment**.
 
 **Git:** [github.com/emwangi2030-Edu/CentyHR](https://github.com/emwangi2030-Edu/CentyHR) · **Supabase + push targets:** see [`REMOTE.md`](./REMOTE.md).
 
-## Staging deployment (live)
+## Deployment paths
+
+### Staging (GitHub Actions → auto deploy)
+
+Pushes to **`staging`** by allowlisted contributors run **`.github/workflows/deploy-hr-staging-vps.yml`**, which SSHs to the app server and executes **`/opt/hr-staging-deploy-safe.sh`** (same SSH secrets as [B2B-Pay-Hub](https://github.com/emwangi2030-Edu/B2B-Pay-Hub)).
 
 | Item | Value |
 |------|--------|
-| **Public base URL** | `https://staging.centycapital.com/hr-api` |
-| **Health check** | `GET https://staging.centycapital.com/hr-api/health` → `{"ok":true}` |
+| **Public base URL** | `https://staging.centyhq.com/hr-api` |
+| **Health check** | `GET https://staging.centyhq.com/hr-api/health` → `{"ok":true}` |
+| **Server clone** | `/opt/centy-hr-integration-clean` |
+| **Process** | `pm2` **`centy-hr-bff-clean`** (listens **127.0.0.1:3041**; LiteSpeed `/hr-api` → this port) |
+
+### Production-style reference (manual / other hosts)
+
+| Item | Value |
+|------|--------|
 | **Server path** | `/opt/centy-hr-integration/` |
-| **Process** | `pm2` app name **`centy-hr-bff`** (port **3040** on localhost) |
-| **Reverse proxy** | OpenLiteSpeed `context /hr-api` → `127.0.0.1:3040` (same vhost as Pay Hub staging) |
+| **Process** | `pm2` **`centy-hr-bff`** (port **3040** on localhost) |
+| **Reverse proxy** | OpenLiteSpeed `context /hr-api` → `127.0.0.1:3040` |
 
-**Collaborators:** clone or rsync this repo, deploy under `/opt/centy-hr-integration/bff`, run `npm ci && npm run build`, `pm2 start ecosystem.config.cjs`, add `.env` with `ERP_API_KEY` / `ERP_API_SECRET` for integration tests.
+**Collaborators:** deploy under `bff/`, run `npm ci && npm run build`, `pm2 start ecosystem.config.cjs`, add `.env` with `ERP_API_KEY` / `ERP_API_SECRET` for integration tests.
 
-**Note:** If CyberPanel rewrites the staging vhost, re-apply the **`/hr-api`** `extprocessor` + `context` blocks (or add an equivalent rule in the panel) so traffic reaches port **3040**.
+**Note:** If CyberPanel rewrites the staging vhost, re-apply the **`/hr-api`** `extprocessor` + `context` blocks so traffic reaches the correct upstream (**3041** for staging-clean BFF above).
 
-Environment on the app server: `BASE_PATH=/hr-api`, `PORT=3040`, `ERP_BASE_URL=https://erp.tarakilishicloud.com` (see `bff/.env`).
+Environment on the BFF host: `BASE_PATH=/hr-api`, `PORT` per instance, `ERP_BASE_URL=https://erp.tarakilishicloud.com` (see `bff/.env`).
 
 ## Contents
 

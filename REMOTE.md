@@ -31,3 +31,5 @@ On the BFF host, set (values from **Project Settings → API** in the dashboard)
 Apply SQL: `bff/supabase/migrations/001_expense_hub_company_rules.sql` (SQL editor or CLI).
 
 After deploy: `pm2 restart centy-hr-bff --update-env` and confirm `GET /hr-api/v1/expenses/rules` returns `supabase_configured: true` when env is set.
+
+**Staging** (`staging.centyhq.com`): GitHub Actions runs **`/opt/hr-staging-deploy-safe.sh`** → restart **`centy-hr-bff-clean`** from **`/opt/centy-hr-integration-clean/bff`** — use that PM2 app name after changing env there.
