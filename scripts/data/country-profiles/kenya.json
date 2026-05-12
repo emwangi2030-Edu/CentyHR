@@ -1,0 +1,91 @@
+{
+  "country": "Kenya",
+  "currency": "KES",
+  "phone_prefix": "+254",
+  "notes": [
+    "PAYE bands and contribution rates illustrative for the 2026 demo using Finance Act 2023/2024 schedules.",
+    "HR/Finance must verify against KRA PAYE schedules, NSSF Act 2013 (tier caps), SHIF Act 2023 (replaced NHIF Oct 2024), Affordable Housing Levy (Mar 2024) and NITA gazettes before any production payroll run.",
+    "Income Tax Slab is annual (HRMS convention). Monthly bands multiplied by 12.",
+    "Compliance gap (v1): for exactness, NSSF + SHIF + AHL should reduce PAYE-able gross. Current Salary Structure applies PAYE to gross_pay (parity with TZ/UG profiles). Will be refined when the admin Payroll Template UI introduces is_income_tax_component_applicable flags.",
+    "Personal Relief KES 2,400/month modelled via standard_tax_exemption_amount (28,800 annual).",
+    "Eid dates are lunar / gazetted on the day; placeholders for HR to confirm yearly."
+  ],
+  "holiday_list": {
+    "name_template": "Kenya Public Holidays {year}",
+    "from_date": "{year}-01-01",
+    "to_date": "{year}-12-31",
+    "country": "Kenya",
+    "holidays_fixed": [
+      ["{year}-01-01", "New Year's Day"],
+      ["{year}-05-01", "Labour Day"],
+      ["{year}-06-01", "Madaraka Day"],
+      ["{year}-10-10", "Huduma Day"],
+      ["{year}-10-20", "Mashujaa Day"],
+      ["{year}-12-12", "Jamhuri Day"],
+      ["{year}-12-25", "Christmas Day"],
+      ["{year}-12-26", "Boxing Day"]
+    ],
+    "holidays_by_year": {
+      "2026": [
+        ["2026-04-03", "Good Friday"],
+        ["2026-04-06", "Easter Monday"],
+        ["2026-03-20", "Eid al-Fitr (estimated)"],
+        ["2026-05-27", "Eid al-Adha (estimated)"]
+      ]
+    }
+  },
+  "salary_components": [
+    {"name": "Basic Pay", "type": "Earning", "abbr": "BP", "reuse_existing": true, "description": "Reused (TZ & UG structures use the same component)."},
+    {"name": "PAYE KE", "type": "Deduction", "abbr": "PAYE_KE", "variable_based_on_taxable_salary": 1, "is_tax_applicable": 1, "depends_on_payment_days": 0, "description": "Slab-driven; no formula. Bands defined on Income Tax Slab (KRA monthly bands x 12). Personal relief 28,800/yr applied via standard_tax_exemption_amount."},
+    {"name": "NSSF KE", "type": "Deduction", "abbr": "NSSF_KE", "depends_on_payment_days": 0, "description": "Employee 6% of pensionable pay; Tier I (0-8,000) + Tier II (8,001-72,000). Combined cap 4,320/mo."},
+    {"name": "NSSF KE Employer", "type": "Deduction", "abbr": "NSSF_KE_E", "statistical_component": 1, "do_not_include_in_total": 1, "depends_on_payment_days": 0, "description": "Employer 6% match; statistical."},
+    {"name": "SHIF KE", "type": "Deduction", "abbr": "SHIF_KE", "depends_on_payment_days": 0, "description": "Social Health Insurance Fund 2.75% of gross, minimum KES 300/mo. Replaced NHIF Oct 2024."},
+    {"name": "AHL KE", "type": "Deduction", "abbr": "AHL_KE", "depends_on_payment_days": 0, "description": "Affordable Housing Levy 1.5% employee (Mar 2024)."},
+    {"name": "AHL KE Employer", "type": "Deduction", "abbr": "AHL_KE_E", "statistical_component": 1, "do_not_include_in_total": 1, "depends_on_payment_days": 0, "description": "Affordable Housing Levy 1.5% employer match; statistical."},
+    {"name": "NITA KE", "type": "Deduction", "abbr": "NITA_KE", "statistical_component": 1, "do_not_include_in_total": 1, "depends_on_payment_days": 0, "description": "National Industrial Training Authority KES 50/employee/mo, employer-borne; statistical."}
+  ],
+  "income_tax_slab": {
+    "name_template": "Kenya PAYE {year} - {company}",
+    "effective_from": "{year}-01-01",
+    "allow_tax_exemption": 1,
+    "standard_tax_exemption_amount": 28800,
+    "tax_relief_limit": 0,
+    "_band_basis": "annual; KE PAYE Finance Act 2023 monthly bands x 12 (10/25/30/32.5/35).",
+    "slabs": [
+      {"from_amount": 0,         "to_amount": 288000,    "percent_deduction": 10},
+      {"from_amount": 288001,    "to_amount": 387996,    "percent_deduction": 25},
+      {"from_amount": 387997,    "to_amount": 6000000,   "percent_deduction": 30},
+      {"from_amount": 6000001,   "to_amount": 9600000,   "percent_deduction": 32.5},
+      {"from_amount": 9600001,   "to_amount": 0,         "percent_deduction": 35}
+    ]
+  },
+  "payroll_period": {
+    "name_template": "{year} - {company}",
+    "start_date": "{year}-01-01",
+    "end_date": "{year}-12-31"
+  },
+  "salary_structure": {
+    "name_template": "Kenya Standard Payroll - {company}",
+    "payroll_frequency": "Monthly",
+    "_uses_income_tax_slab": true,
+    "earnings": [
+      {"salary_component": "Basic Pay", "amount_based_on_formula": 1, "formula": "base"}
+    ],
+    "deductions": [
+      {"salary_component": "NSSF KE",          "amount_based_on_formula": 1, "formula": "round((BP if BP < 72000 else 72000) * 0.06, 2)"},
+      {"salary_component": "NSSF KE Employer", "amount_based_on_formula": 1, "formula": "round((BP if BP < 72000 else 72000) * 0.06, 2)", "statistical_component": 1, "do_not_include_in_total": 1},
+      {"salary_component": "SHIF KE",          "amount_based_on_formula": 1, "formula": "300 if BP < 10909.10 else round(BP * 0.0275, 2)"},
+      {"salary_component": "AHL KE",           "amount_based_on_formula": 1, "formula": "round(BP * 0.015, 2)"},
+      {"salary_component": "AHL KE Employer",  "amount_based_on_formula": 1, "formula": "round(BP * 0.015, 2)", "statistical_component": 1, "do_not_include_in_total": 1},
+      {"salary_component": "NITA KE",          "amount_based_on_formula": 1, "formula": "50", "statistical_component": 1, "do_not_include_in_total": 1},
+      {"salary_component": "PAYE KE",          "amount_based_on_formula": 0}
+    ]
+  },
+  "sample_employees": [
+    {"first_name": "Wanjiku", "last_name": "Kamau",   "gender": "Female", "dob": "1986-05-22", "phone": "+254712345678", "designation": "Country Manager",    "base": 800000, "doj": "{year}-01-15"},
+    {"first_name": "Brian",   "last_name": "Otieno",  "gender": "Male",   "dob": "1991-08-14", "phone": "+254722333444", "designation": "Finance Lead",       "base": 250000, "doj": "{year}-01-15"},
+    {"first_name": "Aisha",   "last_name": "Hassan",  "gender": "Female", "dob": "1995-02-09", "phone": "+254733555666", "designation": "Operations Manager", "base": 120000, "doj": "{year}-02-01"},
+    {"first_name": "Kipchoge","last_name": "Rotich",  "gender": "Male",   "dob": "1997-11-03", "phone": "+254744777888", "designation": "Sales Officer",      "base": 65000,  "doj": "{year}-02-15"},
+    {"first_name": "Mercy",   "last_name": "Achieng", "gender": "Female", "dob": "2000-07-18", "phone": "+254755999000", "designation": "Customer Support",   "base": 28000,  "doj": "{year}-03-01"}
+  ]
+}

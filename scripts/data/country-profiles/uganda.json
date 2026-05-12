@@ -1,0 +1,85 @@
+{
+  "country": "Uganda",
+  "currency": "UGX",
+  "phone_prefix": "+256",
+  "notes": [
+    "PAYE bands and contribution rates are illustrative for the 2026 demo.",
+    "HR/Finance must verify against the latest URA PAYE schedules, NSSF UG rates, and LST gazettes before any production payroll run.",
+    "Income Tax Slab is annual (HRMS convention). Monthly bands multiplied by 12.",
+    "Uganda PAYE top tier (>10M monthly) has an additional 10% surcharge; modelled as 40% annual marginal.",
+    "Eid dates are lunar; update yearly."
+  ],
+  "holiday_list": {
+    "name_template": "Uganda Public Holidays {year}",
+    "from_date": "{year}-01-01",
+    "to_date": "{year}-12-31",
+    "country": "Uganda",
+    "holidays_fixed": [
+      ["{year}-01-01", "New Year's Day"],
+      ["{year}-01-26", "Liberation Day"],
+      ["{year}-02-16", "Janani Luwum Memorial Day"],
+      ["{year}-03-08", "International Women's Day"],
+      ["{year}-05-01", "Labour Day"],
+      ["{year}-06-03", "Martyrs' Day"],
+      ["{year}-06-09", "National Heroes' Day"],
+      ["{year}-10-09", "Independence Day"],
+      ["{year}-12-25", "Christmas Day"],
+      ["{year}-12-26", "Boxing Day"]
+    ],
+    "holidays_by_year": {
+      "2026": [
+        ["2026-04-03", "Good Friday"],
+        ["2026-04-06", "Easter Monday"],
+        ["2026-03-20", "Eid al-Fitr (estimated)"],
+        ["2026-05-27", "Eid al-Adha (estimated)"]
+      ]
+    }
+  },
+  "salary_components": [
+    {"name": "Basic Pay", "type": "Earning", "abbr": "BP", "reuse_existing": true, "description": "Reused (KE & TZ structures use the same component)."},
+    {"name": "PAYE UG", "type": "Deduction", "abbr": "PAYE_UG", "variable_based_on_taxable_salary": 1, "is_tax_applicable": 1, "depends_on_payment_days": 0, "description": "Slab-driven; no formula."},
+    {"name": "NSSF UG", "type": "Deduction", "abbr": "NSSF_UG", "depends_on_payment_days": 0, "description": "Employee 5% of Basic."},
+    {"name": "NSSF UG Employer", "type": "Deduction", "abbr": "NSSF_UG_E", "statistical_component": 1, "do_not_include_in_total": 1, "depends_on_payment_days": 0, "description": "Employer 10%; statistical."},
+    {"name": "LST UG", "type": "Deduction", "abbr": "LST_UG", "depends_on_payment_days": 0, "description": "Local Service Tax; flat band by gross. Simplified to monthly equivalent."}
+  ],
+  "income_tax_slab": {
+    "name_template": "Uganda PAYE {year} - {company}",
+    "effective_from": "{year}-01-01",
+    "allow_tax_exemption": 0,
+    "standard_tax_exemption_amount": 0,
+    "tax_relief_limit": 0,
+    "_band_basis": "annual; UG PAYE 2025 monthly bands x 12",
+    "slabs": [
+      {"from_amount": 0,          "to_amount": 2820000,   "percent_deduction": 0},
+      {"from_amount": 2820001,    "to_amount": 4020000,   "percent_deduction": 10},
+      {"from_amount": 4020001,    "to_amount": 4920000,   "percent_deduction": 20},
+      {"from_amount": 4920001,    "to_amount": 120000000, "percent_deduction": 30},
+      {"from_amount": 120000001,  "to_amount": 0,         "percent_deduction": 40}
+    ]
+  },
+  "payroll_period": {
+    "name_template": "{year} - {company}",
+    "start_date": "{year}-01-01",
+    "end_date": "{year}-12-31"
+  },
+  "salary_structure": {
+    "name_template": "Uganda Standard Payroll - {company}",
+    "payroll_frequency": "Monthly",
+    "_uses_income_tax_slab": true,
+    "earnings": [
+      {"salary_component": "Basic Pay", "amount_based_on_formula": 1, "formula": "base"}
+    ],
+    "deductions": [
+      {"salary_component": "NSSF UG",          "amount_based_on_formula": 1, "formula": "round(BP * 0.05, 2)"},
+      {"salary_component": "NSSF UG Employer", "amount_based_on_formula": 1, "formula": "round(BP * 0.10, 2)", "statistical_component": 1, "do_not_include_in_total": 1},
+      {"salary_component": "LST UG",           "amount_based_on_formula": 1, "formula": "8333 if gross_pay >= 833333 else (5833 if gross_pay >= 500000 else (4167 if gross_pay >= 333333 else (2500 if gross_pay >= 250000 else (1667 if gross_pay >= 166667 else (833 if gross_pay >= 83333 else 0)))))"},
+      {"salary_component": "PAYE UG",          "amount_based_on_formula": 0}
+    ]
+  },
+  "sample_employees": [
+    {"first_name": "Patrick", "last_name": "Okello",  "gender": "Male",   "dob": "1985-07-19", "phone": "+256772345678", "designation": "Country Manager",     "base": 3500000, "doj": "{year}-01-15"},
+    {"first_name": "Sarah",   "last_name": "Nabwire", "gender": "Female", "dob": "1990-03-12", "phone": "+256701223344", "designation": "Finance Lead",        "base": 1800000, "doj": "{year}-01-15"},
+    {"first_name": "Moses",   "last_name": "Kizza",   "gender": "Male",   "dob": "1993-09-25", "phone": "+256755112233", "designation": "Sales Representative","base": 950000,  "doj": "{year}-02-01"},
+    {"first_name": "Grace",   "last_name": "Akello",  "gender": "Female", "dob": "1997-01-08", "phone": "+256780998877", "designation": "Administrator",       "base": 600000,  "doj": "{year}-03-01"}
+  ]
+}
