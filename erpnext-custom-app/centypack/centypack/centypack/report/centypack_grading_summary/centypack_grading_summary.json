@@ -1,0 +1,23 @@
+{
+ "add_total_row": 0,
+ "creation": "2026-04-24 12:00:00.000000",
+ "disabled": 0,
+ "docstatus": 0,
+ "doctype": "Report",
+ "idx": 0,
+ "is_standard": "Yes",
+ "modified": "2026-04-24 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "CentyPack",
+ "name": "CentyPack Grading Summary",
+ "owner": "Administrator",
+ "query": "SELECT\n  r.name AS \"Grading Run:Link/CentyPack Grading Run:200\",\n  r.posting_date AS \"Date:Date:120\",\n  r.company AS \"Company:Link/Company:160\",\n  r.block AS \"Block:Link/Block:160\",\n  l.grade AS \"Grade:Link/CentyPack Grade:120\",\n  l.defect_type AS \"Defect:Link/CentyPack Defect Type:160\",\n  l.quantity_kg AS \"Qty kg:Float:100\",\n  l.name AS \"Line:Data:120\"\nFROM `tabCentyPack Grading Run` r\nINNER JOIN `tabCentyPack Grading Line` l ON l.parent = r.name AND l.parenttype = 'CentyPack Grading Run'\nORDER BY r.posting_date DESC, r.name, l.idx",
+ "ref_doctype": "CentyPack Grading Run",
+ "report_name": "CentyPack Grading Summary",
+ "report_type": "Query Report",
+ "roles": [
+  {"role": "System Manager"},
+  {"role": "CentyPack POC Admin"},
+  {"role": "CentyPack POC User"}
+ ]
+}

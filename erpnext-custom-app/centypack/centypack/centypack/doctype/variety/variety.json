@@ -1,0 +1,27 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:variety_name",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["variety_name", "crop", "maturity_days", "active"],
+ "fields": [
+  {"fieldname": "variety_name", "fieldtype": "Data", "in_list_view": 1, "label": "Variety Name", "reqd": 1},
+  {"fieldname": "crop", "fieldtype": "Link", "in_list_view": 1, "label": "Crop", "options": "Crop", "reqd": 1},
+  {"fieldname": "maturity_days", "fieldtype": "Int", "label": "Maturity Days", "non_negative": 1},
+  {"default": "1", "fieldname": "active", "fieldtype": "Check", "in_list_view": 1, "label": "Active"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "Variety",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

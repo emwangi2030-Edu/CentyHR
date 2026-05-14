@@ -1,0 +1,8 @@
+recursive-include centypack *.csv
+recursive-include centypack *.json
+recursive-include centypack *.py
+recursive-include centypack *.txt
+recursive-include centypack *.md
+recursive-include centypack *.xml
+recursive-include centypack *.css
+recursive-include centypack *.js

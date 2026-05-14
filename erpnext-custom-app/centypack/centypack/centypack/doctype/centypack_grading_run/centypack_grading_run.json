@@ -1,0 +1,29 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-04-24 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["company", "posting_date", "block", "harvest_batch", "remarks", "lines"],
+ "fields": [
+  {"fieldname": "company", "fieldtype": "Link", "in_list_view": 1, "label": "Company", "options": "Company", "reqd": 1},
+  {"default": "Today", "fieldname": "posting_date", "fieldtype": "Date", "in_list_view": 1, "label": "Posting Date", "reqd": 1},
+  {"fieldname": "block", "fieldtype": "Link", "in_list_view": 1, "label": "Block", "options": "Block"},
+  {"fieldname": "harvest_batch", "fieldtype": "Link", "label": "Harvest Batch", "options": "Batch"},
+  {"fieldname": "remarks", "fieldtype": "Small Text", "label": "Remarks"},
+  {"fieldname": "lines", "fieldtype": "Table", "label": "Lines", "options": "CentyPack Grading Line"}
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "module": "CentyPack",
+ "name": "CentyPack Grading Run",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "export": 1, "print": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

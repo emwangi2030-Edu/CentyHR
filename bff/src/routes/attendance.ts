@@ -17,6 +17,121 @@ import { defaultClient } from "../erpnext/client.js";
 import { ErpError } from "../erpnext/client.js";
 import { parseFrappeErrorBody, publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
+import * as config from "../config.js";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const _dowFilename = fileURLToPath(import.meta.url);
+const _dowDirname = dirname(_dowFilename);
+const DOW_STORE_PATH = join(_dowDirname, "..", ".shift-assignment-days.json");
+
+const _dowStore: Map<string, string> = (() => {
+  try {
+    if (existsSync(DOW_STORE_PATH)) {
+      const raw = readFileSync(DOW_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, string>));
+    }
+  } catch { }
+  return new Map();
+})();
+
+function dowGet(name: string): string { return _dowStore.get(name) ?? ""; }
+function dowSet(name: string, value: string): void {
+  if (value) { _dowStore.set(name, value); } else { _dowStore.delete(name); }
+  try {
+    const obj: Record<string, string> = {};
+    _dowStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(DOW_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
+
+type DayOverride = { start_time: string; end_time: string };
+type HolidaySettings = {
+  work_on_holidays: boolean;
+  holiday_shift_override: { start_time: string; end_time: string } | null;
+};
+const DAY_OVERRIDES_STORE_PATH = join(_dowDirname, "..", ".shift-day-overrides.json");
+const _dayOverridesStore: Map<string, Record<string, DayOverride>> = (() => {
+  try {
+    if (existsSync(DAY_OVERRIDES_STORE_PATH)) {
+      const raw = readFileSync(DAY_OVERRIDES_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, Record<string, DayOverride>>));
+    }
+  } catch { }
+  return new Map();
+})();
+function overridesGet(name: string): Record<string, DayOverride> { return _dayOverridesStore.get(name) ?? {}; }
+function overridesSet(name: string, overrides: Record<string, DayOverride>): void {
+  if (Object.keys(overrides).length === 0) { _dayOverridesStore.delete(name); }
+  else { _dayOverridesStore.set(name, overrides); }
+  try {
+    const obj: Record<string, Record<string, DayOverride>> = {};
+    _dayOverridesStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(DAY_OVERRIDES_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
+
+const HOLIDAY_SETTINGS_STORE_PATH = join(_dowDirname, "..", ".shift-holiday-settings.json");
+const _holidaySettingsStore: Map<string, HolidaySettings> = (() => {
+  try {
+    if (existsSync(HOLIDAY_SETTINGS_STORE_PATH)) {
+      const raw = readFileSync(HOLIDAY_SETTINGS_STORE_PATH, "utf8");
+      return new Map(Object.entries(JSON.parse(raw) as Record<string, HolidaySettings>));
+    }
+  } catch { }
+  return new Map();
+})();
+const DEFAULT_HOLIDAY_SETTINGS: HolidaySettings = { work_on_holidays: false, holiday_shift_override: null };
+function holidaySettingsGet(name: string): HolidaySettings { return _holidaySettingsStore.get(name) ?? DEFAULT_HOLIDAY_SETTINGS; }
+function holidaySettingsSet(name: string, settings: HolidaySettings): void {
+  _holidaySettingsStore.set(name, settings);
+  try {
+    const obj: Record<string, HolidaySettings> = {};
+    _holidaySettingsStore.forEach((v, k) => { obj[k] = v; });
+    writeFileSync(HOLIDAY_SETTINGS_STORE_PATH, JSON.stringify(obj, null, 2), "utf8");
+  } catch { }
+}
+
+/** Cache: company+year → { holidays: Map<date, name>, fetchedAt }. Re-fetches after 1 h. */
+const _holidayDateCache = new Map<string, { holidays: Map<string, string>; fetchedAt: number }>();
+
+/** Returns a Map of effective date → holiday name for the given company and year.
+ *  Sat holidays shift to Monday (+2), Sun holidays shift to Monday (+1). */
+async function getEffectiveHolidays(
+  creds: { apiKey: string; apiSecret: string },
+  company: string,
+  year: number,
+): Promise<Map<string, string>> {
+  const key = `${company}|${year}`;
+  const cached = _holidayDateCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < 3_600_000) return cached.holidays;
+  try {
+    const companyDoc = await erp.getDoc(creds, "Company", company);
+    const country = String((companyDoc as any).country ?? "").trim();
+    if (!country) { _holidayDateCache.set(key, { holidays: new Map(), fetchedAt: Date.now() }); return new Map(); }
+    const listName = `${country} ${year}`;
+    let listDoc: any;
+    try { listDoc = await erp.getDoc(creds, "Holiday List", listName); }
+    catch { _holidayDateCache.set(key, { holidays: new Map(), fetchedAt: Date.now() }); return new Map(); }
+    const holidays = new Map<string, string>();
+    const rows: any[] = Array.isArray(listDoc.holidays) ? listDoc.holidays : [];
+    for (const row of rows) {
+      const ds = String(row.holiday_date ?? "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) continue;
+      const name = String(row.description ?? row.holiday_date ?? "Holiday").trim() || "Holiday";
+      const d = new Date(ds + "T00:00:00Z");
+      const dow = d.getUTCDay(); // 0=Sun, 6=Sat
+      if (dow === 6) holidays.set(new Date(d.getTime() + 2 * 86_400_000).toISOString().slice(0, 10), name);
+      else if (dow === 0) holidays.set(new Date(d.getTime() + 86_400_000).toISOString().slice(0, 10), name);
+      else holidays.set(ds, name);
+    }
+    _holidayDateCache.set(key, { holidays, fetchedAt: Date.now() });
+    return holidays;
+  } catch {
+    return new Map();
+  }
+}
 
 const erp = defaultClient();
 
@@ -39,7 +154,19 @@ async function resolveSelfEmployee(ctx: HrContext): Promise<string | null> {
       limit_page_length: 1,
     });
     const empName = asRecord(mine.data?.[0])?.name;
-    if (typeof empName === "string" && empName) return empName;
+    if (typeof empName === "string" && empName) {
+      // Keep employeeUserLinks in Pay Hub current so the login-block check is always reliable.
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        fetch(`${internalUrl.replace(/\/+$/, "")}/api/internal/employee-link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+          body: JSON.stringify({ user_email: ctx.userEmail, erp_employee_id: empName }),
+        }).catch(() => { /* non-fatal */ });
+      }
+      return empName;
+    }
   }
   return null;
 }
@@ -80,6 +207,33 @@ function normalizeTime(v: unknown): string {
   return "";
 }
 
+function parseHolidaySettingsFromBody(body: Record<string, unknown>): HolidaySettings {
+  const work_on_holidays = parseBoolish(body.work_on_holidays) ?? false;
+  let holiday_shift_override: { start_time: string; end_time: string } | null = null;
+  const rawOv = body.holiday_shift_override;
+  if (rawOv && typeof rawOv === "object" && !Array.isArray(rawOv)) {
+    const st = normalizeTime((rawOv as Record<string, unknown>).start_time);
+    const et = normalizeTime((rawOv as Record<string, unknown>).end_time);
+    if (st && et) holiday_shift_override = { start_time: st, end_time: et };
+  }
+  return { work_on_holidays, holiday_shift_override };
+}
+
+const VALID_DOW_SET = new Set(["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]);
+function parseDayOverridesFromBody(raw: unknown): Record<string, DayOverride> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: Record<string, DayOverride> = {};
+  for (const [day, times] of Object.entries(raw as Record<string, unknown>)) {
+    const dayLow = String(day ?? "").trim().toLowerCase();
+    if (!VALID_DOW_SET.has(dayLow)) continue;
+    if (!times || typeof times !== "object" || Array.isArray(times)) continue;
+    const st = normalizeTime((times as Record<string, unknown>).start_time);
+    const et = normalizeTime((times as Record<string, unknown>).end_time);
+    if (st && et) result[dayLow] = { start_time: st, end_time: et };
+  }
+  return result;
+}
+
 function parseFrappeDateTime(s: string): Date | null {
   const str = String(s ?? "").trim();
   if (!str) return null;
@@ -94,6 +248,58 @@ function parseFrappeDateTime(s: string): Date | null {
 
 function toFrappeDate(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+/** Returns YYYY-MM-DD in the given timezone offset (minutes east of UTC). */
+function toLocalDate(d: Date, tzOffsetMinutes: number): string {
+  return new Date(d.getTime() + tzOffsetMinutes * 60_000).toISOString().slice(0, 10);
+}
+
+/** In-memory cache so we only fetch System Settings once per BFF process lifetime. */
+const _tzOffsetCache = new Map<string, number>();
+
+/**
+ * Fetch the ERPNext site timezone offset in minutes (east of UTC).
+ * Uses `System Settings.time_zone` and resolves via `Intl.DateTimeFormat`.
+ * Falls back to 0 (UTC) on any error.
+ */
+async function getErpTzOffsetMinutes(creds: { apiKey: string; apiSecret: string }): Promise<number> {
+  const cacheKey = `${creds.apiKey ?? ""}|${creds.apiSecret ?? ""}`;
+  const cached = _tzOffsetCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  try {
+    const doc = await erp.getDoc(creds, "System Settings", "System Settings");
+    const tz = String((doc as any)?.time_zone ?? "").trim();
+    if (!tz) {
+      _tzOffsetCache.set(cacheKey, 0);
+      return 0;
+    }
+    // Use Intl to resolve offset: format a known UTC epoch and measure local-time offset.
+    const testDate = new Date("2024-01-15T12:00:00Z");
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "numeric",
+      minute: "numeric",
+      hour12: false,
+      timeZoneName: "shortOffset",
+    }).formatToParts(testDate);
+    const tzNamePart = parts.find((p) => p.type === "timeZoneName")?.value ?? "";
+    // "GMT+3" or "GMT+5:30" etc.
+    const m = tzNamePart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    if (!m) {
+      _tzOffsetCache.set(cacheKey, 0);
+      return 0;
+    }
+    const sign = m[1] === "+" ? 1 : -1;
+    const hours = Number(m[2]);
+    const minutes = Number(m[3] ?? "0");
+    const offset = sign * (hours * 60 + minutes);
+    _tzOffsetCache.set(cacheKey, offset);
+    return offset;
+  } catch {
+    _tzOffsetCache.set(cacheKey, 0);
+    return 0;
+  }
 }
 
 function toFrappeDateTime(d: Date): string {
@@ -116,15 +322,19 @@ function shiftWindowToMs(params: {
   shift_start_date: string;
   start_time: string;
   end_time: string;
+  /** UTC offset of the ERPNext site in minutes (e.g. 180 for EAT/UTC+3). Default 0. */
+  tzOffsetMinutes?: number;
 }): { startMs: number; endMs: number } | null {
-  const { shift_start_date, start_time, end_time } = params;
+  const { shift_start_date, start_time, end_time, tzOffsetMinutes = 0 } = params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(shift_start_date ?? ""))) return null;
   const startT = parseTimeHHMMSS(start_time);
   const endT = parseTimeHHMMSS(end_time);
   if (!startT || !endT) return null;
 
-  const base = new Date(shift_start_date + "T00:00:00.000Z");
-  const baseMs = base.getTime();
+  // Anchor to LOCAL midnight: UTC midnight of the date string minus the tz offset.
+  // e.g. for EAT (UTC+3): local midnight = UTC 21:00 previous day.
+  const utcMidnightMs = new Date(shift_start_date + "T00:00:00.000Z").getTime();
+  const baseMs = utcMidnightMs - tzOffsetMinutes * 60_000;
   const startSeconds = timeToSeconds(startT);
   const endSeconds = timeToSeconds(endT);
   const startMs = baseMs + startSeconds * 1000;
@@ -252,6 +462,63 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       }
     }
     throw lastErr;
+  }
+
+  async function assignShiftToOneEmployee(
+    ctx: HrContext,
+    employee: string,
+    shift_type: string,
+    start_date: string,
+    end_date: string,
+    daysValue: string,
+    dayOverrides: Record<string, DayOverride> = {},
+    holidaySettings: HolidaySettings = DEFAULT_HOLIDAY_SETTINGS,
+  ): Promise<{ data: unknown; meta: { submitSkipped: boolean } }> {
+    const empDoc = await erp.getDoc(ctx.creds, "Employee", employee);
+    if (String(empDoc.company) !== ctx.company) throw new Error("Employee not in your Company");
+    const dateOfJoining = String(empDoc.date_of_joining ?? "").slice(0, 10);
+    if (dateOfJoining && start_date < dateOfJoining) {
+      throw Object.assign(new Error(`start before joining date (${dateOfJoining})`), { code: "HR_BEFORE_JOINING" });
+    }
+    let resolvedDepartment: string | null = null;
+    const rawDept = String((empDoc as any).department ?? "").trim();
+    if (rawDept) {
+      try {
+        try { await erp.getDoc(ctx.creds, "Department", rawDept); resolvedDepartment = rawDept; } catch { }
+        if (resolvedDepartment === null) {
+          const byName = (await erp.getList(ctx.creds, "Department", {
+            fields: ["name"], filters: [["department_name", "=", rawDept]], limit_page_length: 1,
+          })) as any[];
+          resolvedDepartment = byName.length ? String((byName[0] as any).name ?? "").trim() : null;
+        }
+        const patchDept = resolvedDepartment ?? "";
+        if (rawDept !== patchDept) {
+          try {
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Employee", name: employee, fieldname: "department", value: patchDept,
+            });
+          } catch {
+            try { await erp.updateDoc(ctx.creds, "Employee", employee, { department: patchDept }); } catch { }
+          }
+        }
+      } catch { }
+    }
+    const doc: Record<string, unknown> = {
+      employee, shift_type, start_date,
+      ...(end_date ? { end_date } : {}),
+      ...(resolvedDepartment != null ? { department: resolvedDepartment } : {}),
+    };
+    const created = await erp.createDoc(ctx.creds, "Shift Assignment", doc);
+    const name = parseBodyString((created as Record<string, unknown>)?.name);
+    if (name && daysValue) dowSet(name, daysValue);
+    if (name && Object.keys(dayOverrides).length > 0) overridesSet(name, dayOverrides);
+    if (name) holidaySettingsSet(name, holidaySettings);
+    let submitSkipped = false;
+    if (name) {
+      try { await submitShiftAssignmentWithRetry(ctx.creds, name, 3); }
+      catch { submitSkipped = true; }
+    }
+    return { data: created, meta: { submitSkipped } };
   }
 
   /**
@@ -451,13 +718,19 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         limit_page_length: 200,
       });
       // Post-filter: exclude shifts whose end_date is set and falls before `from` (shift ended before the range).
-      const rows = from
+      const filtered = from
         ? (rawRows as Record<string, unknown>[]).filter((r) => {
             const endDate = String(r.end_date ?? "").slice(0, 10);
-            if (!endDate) return true; // open-ended shift — always included
+            if (!endDate) return true;
             return endDate >= from;
           })
-        : rawRows;
+        : (rawRows as Record<string, unknown>[]);
+      const rows = filtered.map((r) => ({
+        ...r,
+        custom_days_of_week: dowGet(String(r.name ?? "")),
+        day_overrides: overridesGet(String(r.name ?? "")),
+        holiday_settings: holidaySettingsGet(String(r.name ?? "")),
+      }));
       return { data: rows };
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
@@ -793,6 +1066,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             "employee_name",
             "attendance_date",
             "status",
+            "leave_type",
             "shift",
             "in_time",
             "out_time",
@@ -880,15 +1154,22 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           let d = iterStart > saStartD ? iterStart : saStartD;
           const last = iterEnd < saEndD ? iterEnd : saEndD;
 
+          // Check days-of-week restriction from local store.
+          const saDowStr = dowGet(String(sa.name ?? ""));
+          const DOW_NAMES_D = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"] as const;
+          const saDow = saDowStr ? saDowStr.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+
           while (d <= last) {
             const dd = dateToIso(d);
+            const dayName = DOW_NAMES_D[new Date(dd + "T00:00:00").getDay()];
+            const isScheduledDay = saDow.length === 0 || saDow.includes(dayName);
             if (!byDate.has(dd)) {
               byDate.set(dd, {
                 name: `scheduled-${employeeId}-${dd}-${shiftType}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
                 employee: employeeId,
                 attendance_date: dd,
-                status: "Scheduled",
-                shift: shiftType,
+                status: isScheduledDay ? "Scheduled" : "Unscheduled",
+                shift: isScheduledDay ? shiftType : null,
                 in_time: null,
                 out_time: null,
                 working_hours: null,
@@ -907,8 +1188,10 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         return db.localeCompare(da);
       });
 
-      // Augment each row with overtime_hours by querying Timesheet Detail records
-      // (activity_type = "Overtime") for this employee in the date range.
+      // Augment each row with overtime_hours. Fetch full timesheet documents (same
+      // approach as the time-logs route) so we read time_logs from the doc body
+      // rather than querying Timesheet Detail directly (which requires child-table
+      // read permissions and can silently return empty on some Frappe installs).
       try {
         const tsFilters: unknown[] = [
           ["employee", "=", employeeId],
@@ -932,20 +1215,22 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         })) as any[];
 
         if (timesheets.length) {
-          const tsNames = timesheets.map((t) => String(t.name));
-          const tsDateMap = new Map<string, string>();
-          for (const ts of timesheets) tsDateMap.set(String(ts.name), String(ts.start_date ?? "").slice(0, 10));
-
-          const otDetails = (await erp.getList(ctx.creds, "Timesheet Detail", {
-            fields: ["parent", "hours"],
-            filters: [["parent", "IN", tsNames], ["activity_type", "=", "Overtime"]],
-            limit_page_length: 5000,
-          })) as any[];
+          // Fetch full documents in parallel so we can read the time_logs child table.
+          const docs = await Promise.all(
+            timesheets.map((t) => erp.getDoc(ctx.creds, "Timesheet", String(t.name)).catch(() => null))
+          );
 
           const dateOtMap = new Map<string, number>();
-          for (const d of otDetails) {
-            const date = tsDateMap.get(String(d.parent ?? "")) ?? "";
-            if (date) dateOtMap.set(date, (dateOtMap.get(date) ?? 0) + Number(d.hours ?? 0));
+          for (let i = 0; i < timesheets.length; i++) {
+            const doc = docs[i];
+            if (!doc) continue;
+            const date = String(timesheets[i].start_date ?? "").slice(0, 10);
+            if (!date) continue;
+            const logs = Array.isArray((doc as any).time_logs) ? ((doc as any).time_logs as any[]) : [];
+            const ot = logs
+              .filter((l) => isActivityOvertimeLabel(String(l?.activity_type ?? "")))
+              .reduce((acc, l) => acc + Number(l?.hours ?? 0), 0);
+            if (ot > 0) dateOtMap.set(date, (dateOtMap.get(date) ?? 0) + ot);
           }
 
           for (const row of merged) {
@@ -956,6 +1241,124 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         }
       } catch {
         // best-effort — don't fail the daily view if overtime query fails
+      }
+
+      // Derive regular_hours = total working_hours minus overtime for each row.
+      for (const row of merged) {
+        const total = Number((row as any).working_hours ?? 0);
+        const ot = Number((row as any).overtime_hours ?? 0);
+        (row as any).regular_hours = Number(Math.max(0, total - ot).toFixed(2));
+      }
+
+      // Enrich "Absent" rows with leave type from ERPNext Leave Applications.
+      try {
+        const absentDates = merged
+          .filter((r) => String((r as any).status ?? "").toLowerCase() === "absent" && !(r as any).leave_type)
+          .map((r) => String((r as any).attendance_date ?? "").slice(0, 10))
+          .filter(Boolean);
+        if (absentDates.length) {
+          const leaveApps = (await erp.getList(ctx.creds, "Leave Application", {
+            fields: ["from_date", "to_date", "leave_type", "status"],
+            filters: [
+              ["employee", "=", employeeId],
+              ["docstatus", "=", 1],
+              ...(from ? [["to_date", ">=", from] as [string, string, string]] : []),
+              ...(to ? [["from_date", "<=", to] as [string, string, string]] : []),
+            ],
+            limit_page_length: 200,
+          })) as any[];
+          for (const row of merged) {
+            if (String((row as any).status ?? "").toLowerCase() !== "absent") continue;
+            if ((row as any).leave_type) continue;
+            const d = String((row as any).attendance_date ?? "").slice(0, 10);
+            const app = leaveApps.find(
+              (la) => String(la.from_date ?? "").slice(0, 10) <= d && String(la.to_date ?? "").slice(0, 10) >= d,
+            );
+            if (app) {
+              (row as any).leave_type = app.leave_type;
+              (row as any).status = "On Leave";
+            }
+          }
+        }
+      } catch {
+        // best-effort — don't fail if leave application query fails
+      }
+
+      // Overlay compulsory leave status from Pay Hub for any date in range.
+      try {
+        const secret = (config.HR_BRIDGE_SECRET || "").trim();
+        const internalUrl = config.PAY_HUB_INTERNAL_URL;
+        if (secret && internalUrl && from && to) {
+          const compRes = await fetch(
+            `${internalUrl}/api/internal/compulsory-leave/range?employee=${encodeURIComponent(employeeId)}&from=${from}&to=${to}`,
+            { headers: { Authorization: `Bearer ${secret}` } },
+          );
+          if (compRes.ok) {
+            const j = (await compRes.json()) as { data?: { startDate: string; endDate: string; reason?: string }[] };
+            const compLeaves = j.data ?? [];
+            if (compLeaves.length) {
+              for (const row of merged) {
+                const d = String((row as any).attendance_date ?? "").slice(0, 10);
+                const onComp = compLeaves.some(
+                  (c) => c.startDate <= d && c.endDate >= d,
+                );
+                if (onComp) {
+                  (row as any).status = "On Leave";
+                  (row as any).leave_type = "Compulsory Leave";
+                  (row as any).working_hours = 0;
+                  (row as any).regular_hours = 0;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // best-effort — don't fail if compulsory leave check fails
+      }
+
+      // Holiday off-day overlay: mark rows with the specific holiday name when the date is
+      // an effective public holiday and the active shift assignment has work_on_holidays = false.
+      try {
+        // Collect years present in the date range to batch holiday fetches.
+        const years = new Set<number>();
+        for (const row of merged) {
+          const yr = parseInt(String((row as any).attendance_date ?? "").slice(0, 4));
+          if (yr > 2000) years.add(yr);
+        }
+        const holidaysByYear = new Map<number, Map<string, string>>();
+        for (const yr of years) {
+          holidaysByYear.set(yr, await getEffectiveHolidays(ctx.creds, ctx.company, yr));
+        }
+        for (const row of merged) {
+          const d = String((row as any).attendance_date ?? "").slice(0, 10);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+          const yr = parseInt(d.slice(0, 4));
+          const holidayName = (holidaysByYear.get(yr) ?? new Map()).get(d);
+          if (!holidayName) continue;
+          // Find the shift assignment active on this date.
+          const activeSa = (shiftRows as any[]).find((sa) => {
+            const saStart = String(sa.start_date ?? "").slice(0, 10);
+            const saEndRaw = String(sa.end_date ?? "").slice(0, 10);
+            const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : "9999-12-31";
+            return saStart <= d && saEnd >= d;
+          });
+          if (!activeSa) continue;
+          const hSettings = holidaySettingsGet(String(activeSa.name ?? ""));
+          if (!hSettings.work_on_holidays) {
+            // Always show the holiday name instead of "Present" regardless of whether
+            // the employee clocked in.
+            (row as any).status = holidayName;
+            // Preserve actual working_hours if the employee did work on the holiday;
+            // only zero it out when no hours were recorded.
+            if (!((row as any).working_hours > 0)) {
+              (row as any).working_hours = 0;
+            }
+            // On a holiday all recorded time is overtime — regular hours are always 0.
+            (row as any).regular_hours = 0;
+          }
+        }
+      } catch {
+        // best-effort — don't fail if holiday overlay check fails
       }
 
       return { data: merged };
@@ -992,6 +1395,11 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const shift_type = parseBodyString(body.shift_type);
     const start_date = parseBodyString(body.start_date);
     const end_date = parseBodyString(body.end_date);
+    const rawDaysPost = body.days_of_week;
+    const daysArrPost = Array.isArray(rawDaysPost) ? rawDaysPost.map(String) : typeof rawDaysPost === "string" ? rawDaysPost.split(",") : [];
+    const daysValuePost = daysArrPost.map((d) => d.trim().toLowerCase()).filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+    const dayOverridesPost = parseDayOverridesFromBody(body.day_overrides);
+    const holidaySettingsPost = parseHolidaySettingsFromBody(body);
 
     if (!employee || !shift_type || !start_date) {
       return reply.status(400).send({ error: "employee, shift_type, and start_date are required" });
@@ -1104,6 +1512,9 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const name = parseBodyString((created as Record<string, unknown>)?.name);
+      if (name && daysValuePost) dowSet(name, daysValuePost);
+      if (name && Object.keys(dayOverridesPost).length > 0) overridesSet(name, dayOverridesPost);
+      if (name) holidaySettingsSet(name, holidaySettingsPost);
       if (name) {
         try {
           await submitShiftAssignmentWithRetry(ctx.creds, name, 3);
@@ -1126,6 +1537,111 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
+  });
+
+  /**
+   * PATCH /v1/attendance/shift-assignments/:name — update start_date, end_date, and/or days_of_week.
+   */
+  app.patch("/v1/attendance/shift-assignments/:name", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can update shift assignments." });
+    }
+
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+
+    const rawDays = body.days_of_week;
+    const daysArr = Array.isArray(rawDays) ? rawDays.map(String) : typeof rawDays === "string" ? rawDays.split(",") : [];
+    const daysValue = daysArr.map((d) => d.trim().toLowerCase()).filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+
+    const start_date = typeof body.start_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.start_date.trim()) ? body.start_date.trim() : null;
+    const end_date = typeof body.end_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.end_date.trim()) ? body.end_date.trim() : body.end_date === "" ? "" : null;
+
+    // Validate date range.
+    if (start_date && end_date && start_date > end_date) {
+      return reply.status(400).send({ error: "Start date must not be after end date." });
+    }
+
+    // If dates are being updated, fetch the doc first so we can run the clock-in guard.
+    if (start_date !== null || end_date !== null) {
+      try {
+        const doc = await erp.getDoc(ctx.creds, "Shift Assignment", name);
+        if (String((doc as any).company) !== ctx.company) {
+          return reply.status(403).send({ error: "Shift assignment not in your Company" });
+        }
+        const docstatus = Number((doc as any).docstatus ?? 0);
+        if (docstatus === 2) {
+          return reply.status(409).send({ error: "Cannot update a cancelled shift assignment." });
+        }
+
+        // Guard: block if the employee is currently clocked in.
+        const employeeId = String((doc as any).employee ?? "").trim();
+        if (employeeId) {
+          const recentCheckins = (await erp.getList(ctx.creds, "Employee Checkin", {
+            fields: ["name", "log_type", "time"],
+            filters: [["employee", "=", employeeId]],
+            order_by: "time desc",
+            limit_page_length: 1,
+          })) as any[];
+          if (recentCheckins.length && String(recentCheckins[0].log_type ?? "").toUpperCase() === "IN") {
+            return reply.status(409).send({
+              error: "Employee is currently clocked in. They must clock out before this shift assignment can be edited.",
+              code: "HR_EMPLOYEE_CLOCKED_IN",
+            });
+          }
+        }
+
+        const updates: Record<string, string> = {};
+        if (start_date !== null) updates.start_date = start_date;
+        if (end_date !== null) updates.end_date = end_date;
+
+        if (docstatus === 0) {
+          await erp.updateDoc(ctx.creds, "Shift Assignment", name, updates);
+        } else {
+          for (const [fieldname, value] of Object.entries(updates)) {
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Shift Assignment", name, fieldname, value,
+            });
+          }
+        }
+      } catch (e) {
+        if (e instanceof ErpError) return replyErp(reply, e);
+        throw e;
+      }
+    }
+
+    // Always save days to local store (even if empty = clear restriction).
+    dowSet(name, daysValue);
+
+    // Conditionally update day overrides when the key was present in the body.
+    if ("day_overrides" in body) {
+      overridesSet(name, parseDayOverridesFromBody(body.day_overrides));
+    }
+
+    // Conditionally update holiday settings when relevant keys are present.
+    if ("work_on_holidays" in body || "holiday_shift_override" in body) {
+      const current = holidaySettingsGet(name);
+      holidaySettingsSet(name, parseHolidaySettingsFromBody({ ...current, ...body }));
+    }
+
+    return {
+      data: {
+        name,
+        days_of_week: daysValue,
+        start_date,
+        end_date,
+        day_overrides: overridesGet(name),
+        holiday_settings: holidaySettingsGet(name),
+      },
+    };
   });
 
   /**
@@ -1201,6 +1717,142 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
+   * GET /v1/attendance/shift-assignments/:name/day-overrides — fetch per-day time overrides.
+   */
+  app.get("/v1/attendance/shift-assignments/:name/day-overrides", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage day overrides." });
+    const { name } = req.params as { name: string };
+    return { data: overridesGet(name) };
+  });
+
+  /**
+   * PUT /v1/attendance/shift-assignments/:name/day-overrides — replace per-day time overrides.
+   * Body: { day_overrides: { monday?: { start_time, end_time }, saturday?: { ... }, ... } }
+   * Send an empty object or omit days to clear all overrides.
+   */
+  app.put("/v1/attendance/shift-assignments/:name/day-overrides", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage day overrides." });
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const overrides = parseDayOverridesFromBody(body.day_overrides ?? body);
+    overridesSet(name, overrides);
+    return { data: overridesGet(name) };
+  });
+
+  /** GET /v1/attendance/shift-assignments/:name/holiday-settings */
+  app.get("/v1/attendance/shift-assignments/:name/holiday-settings", async (req, reply) => {
+    let ctx: HrContext;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage holiday settings." });
+    const { name } = req.params as { name: string };
+    return { data: holidaySettingsGet(name) };
+  });
+
+  /** PUT /v1/attendance/shift-assignments/:name/holiday-settings
+   * Body: { work_on_holidays: boolean, holiday_shift_override?: { start_time, end_time } | null }
+   */
+  app.put("/v1/attendance/shift-assignments/:name/holiday-settings", async (req, reply) => {
+    let ctx: HrContext;
+    try { ctx = resolveHrContext(req); }
+    catch (e) { if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message }); throw e; }
+    if (!ctx.canSubmitOnBehalf) return reply.status(403).send({ error: "Only HR can manage holiday settings." });
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    holidaySettingsSet(name, parseHolidaySettingsFromBody(body));
+    return { data: holidaySettingsGet(name) };
+  });
+
+  /**
+   * POST /v1/attendance/shift-assignments/bulk — assign a shift to all employees
+   * or all employees in a specific department in one request.
+   */
+  app.post("/v1/attendance/shift-assignments/bulk", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    if (!ctx.canSubmitOnBehalf) {
+      return reply.status(403).send({ error: "Only HR can create bulk shift assignments." });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const shift_type = parseBodyString(body.shift_type);
+    const start_date = parseBodyString(body.start_date);
+    const end_date = parseBodyString(body.end_date);
+    const target = parseBodyString(body.target);
+    const department = parseBodyString(body.department);
+    const rawDays = body.days_of_week;
+    const daysArr = Array.isArray(rawDays) ? rawDays.map(String) : typeof rawDays === "string" ? rawDays.split(",") : [];
+    const daysValue = daysArr.map((d) => d.trim().toLowerCase())
+      .filter((d) => ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(d)).join(",");
+    const dayOverridesBulk = parseDayOverridesFromBody(body.day_overrides);
+    const holidaySettingsBulk = parseHolidaySettingsFromBody(body);
+
+    if (!shift_type || !start_date) return reply.status(400).send({ error: "shift_type and start_date are required" });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date)) return reply.status(400).send({ error: "start_date must be YYYY-MM-DD" });
+    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) return reply.status(400).send({ error: "end_date must be YYYY-MM-DD when provided" });
+    if (!["all", "department"].includes(target)) return reply.status(400).send({ error: "target must be 'all' or 'department'" });
+    if (target === "department" && !department) return reply.status(400).send({ error: "department is required when target is 'department'" });
+
+    try {
+      const filters: unknown[] = [["company", "=", ctx.company], ["status", "=", "Active"]];
+      if (target === "department") filters.push(["department", "=", department]);
+
+      const empRows = (await erp.getList(ctx.creds, "Employee", {
+        fields: ["name"],
+        filters,
+        limit_page_length: 5000,
+      })) as { name: string }[];
+
+      if (empRows.length === 0) return { assigned: [], failed: [], skipped: [] };
+
+      const results = await Promise.allSettled(
+        empRows.map((emp) =>
+          assignShiftToOneEmployee(ctx, String(emp.name), shift_type, start_date, end_date, daysValue, dayOverridesBulk, holidaySettingsBulk)
+        )
+      );
+
+      const assigned: string[] = [];
+      const failed: { employee: string; error: string }[] = [];
+
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        const empName = String(empRows[i].name);
+        if (r.status === "fulfilled") {
+          assigned.push(empName);
+        } else {
+          const errMsg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+          failed.push({ employee: empName, error: errMsg });
+        }
+      }
+
+      console.log(`[bulk-shift-assign] shift=${shift_type} target=${target}${department ? ` dept=${department}` : ""} assigned=${assigned.length} failed=${failed.length}`);
+      return { assigned, failed, skipped: [] };
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /**
    * Employee clock in/out (wire Timesheets into Time & Attendance).
    *
    * Rules:
@@ -1237,12 +1889,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     shift_type_name: string;
     shift_start_date: string; // shift-start calendar day (YYYY-MM-DD)
     shift_window: { startMs: number; endMs: number };
+    shift_start_time: string; // "HH:MM:SS"
+    shift_end_time: string;   // "HH:MM:SS"
   }> {
     const { ctx, employeeId, at, strictWindow = false } = params;
     const atMs = at.getTime();
-    const ddNow = toFrappeDate(at);
+    const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+    const ddNow = toLocalDate(at, tzOff);
     // Look back 2 days to catch overnight shifts whose start_date is yesterday.
-    const ddPrev = toFrappeDate(new Date(atMs - 24 * 3600 * 1000));
+    const ddPrev = toLocalDate(new Date(atMs - 24 * 3600 * 1000), tzOff);
 
     // Fetch all assignments that started on or before today.
     // We intentionally do NOT filter by end_date here because ERPNext cannot
@@ -1286,6 +1941,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       stByName.set(String(st.name), { start_time: String(st.start_time ?? ""), end_time: String(st.end_time ?? "") });
     }
 
+    const DOW_NAMES_RS = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"] as const;
+    function dowAllowsDate(saName: string, dateIso: string): boolean {
+      const dowStr = dowGet(String(saName ?? ""));
+      if (!dowStr) return true; // no restriction — all days allowed
+      const allowed = dowStr.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+      const dayName = DOW_NAMES_RS[new Date(dateIso + "T00:00:00").getDay()];
+      return allowed.includes(dayName);
+    }
+
     // 1) Prefer assignments whose shift window (calculated relative to TODAY or
     //    YESTERDAY for overnight shifts) covers the current timestamp.
     //    We use ddNow/ddPrev as the calendar day — NOT sa.start_date — because
@@ -1300,10 +1964,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       // Try yesterday first (overnight shift that started yesterday evening),
       // then today (normal or overnight shift starting today).
       for (const calDay of [ddPrev, ddNow]) {
+        if (!dowAllowsDate(sa.name, calDay)) continue;
         const win = shiftWindowToMs({
           shift_start_date: calDay,
           start_time: timings.start_time,
           end_time: timings.end_time,
+          tzOffsetMinutes: tzOff,
         });
         if (!win) continue;
         if (atMs >= win.startMs && atMs <= win.endMs) {
@@ -1312,6 +1978,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
             shift_type_name: shiftTypeName,
             shift_start_date: calDay,
             shift_window: win,
+            shift_start_time: timings.start_time,
+            shift_end_time: timings.end_time,
           };
         }
       }
@@ -1327,6 +1995,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       const shiftTypeName = String(sa.shift_type ?? "");
       const timings = stByName.get(shiftTypeName);
       if (!timings) continue;
+      if (!dowAllowsDate(sa.name, ddNow)) continue;
 
       const saEndRaw = sa.end_date == null ? "" : String(sa.end_date).slice(0, 10);
       const saEnd = saEndRaw && /^\d{4}-\d{2}-\d{2}$/.test(saEndRaw) ? saEndRaw : ddNow;
@@ -1335,6 +2004,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           shift_start_date: ddNow,
           start_time: timings.start_time,
           end_time: timings.end_time,
+          tzOffsetMinutes: tzOff,
         });
         if (!win) continue;
         // strictWindow: don't allow clock-in after the shift window has ended
@@ -1344,6 +2014,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           shift_type_name: shiftTypeName,
           shift_start_date: ddNow,
           shift_window: win,
+          shift_start_time: timings.start_time,
+          shift_end_time: timings.end_time,
         };
       }
     }
@@ -1409,6 +2081,34 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     };
   }
 
+  // Ensure required Activity Types exist. Called lazily before clock-out so the
+  // first clock-out on a fresh install self-heals instead of returning a 400.
+  async function ensureActivityTypes(creds: HrContext["creds"]): Promise<void> {
+    const seeds = [
+      { activity_type: "Regular Hours", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Overtime", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Night Shift", costing_rate: 0, billing_rate: 0 },
+      { activity_type: "Public Holiday", costing_rate: 0, billing_rate: 0 },
+    ];
+    try {
+      const names = seeds.map((s) => s.activity_type);
+      const existing = (await erp.getList(creds, "Activity Type", {
+        fields: ["name"],
+        filters: [["name", "IN", names]],
+        limit_page_length: 50,
+      })) as any[];
+      const existingNames = new Set(existing.map((r) => String(r.name)));
+      for (const seed of seeds) {
+        if (!existingNames.has(seed.activity_type)) {
+          await erp.createDoc(creds, "Activity Type", seed);
+        }
+      }
+    } catch {
+      // best-effort — if ERPNext rejects the creation the later resolveActivityTypeMap
+      // will still throw a descriptive 400 rather than silently missing types.
+    }
+  }
+
   /**
    * Shared clock-out / manual-time logic: split interval vs shift window and append to the daily Draft Timesheet.
    */
@@ -1424,6 +2124,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     shift_assignment: string;
     regular_hours: number;
     overtime_hours: number;
+    warnings: string[];
   }> {
     const { ctx, employeeId, from_time, to_time, shift_assignment_name } = params;
 
@@ -1434,82 +2135,177 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const toMs = to.getTime();
     if (toMs <= fromMs) throw new HttpError("to_time must be after from_time", 400);
 
-    const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", shift_assignment_name);
-    if (String((shiftAssignmentDoc as any)?.employee ?? "") !== employeeId) {
-      throw new HttpError("This shift assignment does not belong to the selected employee", 400);
-    }
-    const shiftTypeName = String(shiftAssignmentDoc?.shift_type ?? "");
-    if (!shiftTypeName) {
-      throw new HttpError("Invalid shift assignment (missing shift type)", 400);
+    // Fetch the shift assignment — it may have been deleted after the employee clocked in.
+    let shiftAssignmentDoc: Record<string, unknown> | null = null;
+    try {
+      const doc = await erp.getDoc(ctx.creds, "Shift Assignment", shift_assignment_name);
+      if (String((doc as any)?.employee ?? "") !== employeeId) {
+        throw new HttpError("This shift assignment does not belong to the selected employee", 400);
+      }
+      shiftAssignmentDoc = doc as Record<string, unknown>;
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      if (e instanceof ErpError && e.status === 404) {
+        // Shift assignment was deleted — allow clock-out with all hours as regular (no window splitting).
+        shiftAssignmentDoc = null;
+      } else {
+        throw e;
+      }
     }
 
-    const shiftTypeDoc = await erp.getDoc(ctx.creds, "Shift Type", shiftTypeName);
-
-    // Derive the shift calendar day from the clock-in time, NOT the assignment's
+    // Derive the shift calendar day from the clock-in time, NOT the assignment’s
     // start_date. The assignment start_date is when the recurring schedule began
     // (e.g. April 7); the attendance date must be the actual day worked (e.g. April 14).
     // For overnight shifts (e.g. 22:00–06:00) where clock-in is in the early hours,
     // the shift started the previous calendar day — try both.
-    const fromDateStr = toFrappeDate(from);
-    const fromDatePrevStr = toFrappeDate(new Date(fromMs - 24 * 3600 * 1000));
+    const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+    const fromDateStr = toLocalDate(from, tzOff);
+    const fromDatePrevStr = toLocalDate(new Date(fromMs - 24 * 3600 * 1000), tzOff);
     let shiftCalendarDay = fromDateStr;
-    let win = shiftWindowToMs({
-      shift_start_date: fromDateStr,
-      start_time: String(shiftTypeDoc?.start_time ?? ""),
-      end_time: String(shiftTypeDoc?.end_time ?? ""),
-    });
-    if (!win || fromMs < win.startMs) {
-      const winPrev = shiftWindowToMs({
-        shift_start_date: fromDatePrevStr,
+    let win: ReturnType<typeof shiftWindowToMs> = null;
+    let shiftTypeName = "";
+
+    if (shiftAssignmentDoc) {
+      shiftTypeName = String(shiftAssignmentDoc.shift_type ?? "");
+      if (!shiftTypeName) {
+        throw new HttpError("Invalid shift assignment (missing shift type)", 400);
+      }
+      const shiftTypeDoc = await erp.getDoc(ctx.creds, "Shift Type", shiftTypeName);
+      win = shiftWindowToMs({
+        shift_start_date: fromDateStr,
         start_time: String(shiftTypeDoc?.start_time ?? ""),
         end_time: String(shiftTypeDoc?.end_time ?? ""),
+        tzOffsetMinutes: tzOff,
       });
-      if (winPrev && fromMs >= winPrev.startMs) {
-        shiftCalendarDay = fromDatePrevStr;
-        win = winPrev;
+      if (!win || fromMs < win.startMs) {
+        const winPrev = shiftWindowToMs({
+          shift_start_date: fromDatePrevStr,
+          start_time: String(shiftTypeDoc?.start_time ?? ""),
+          end_time: String(shiftTypeDoc?.end_time ?? ""),
+          tzOffsetMinutes: tzOff,
+        });
+        if (winPrev && fromMs >= winPrev.startMs) {
+          shiftCalendarDay = fromDatePrevStr;
+          win = winPrev;
+        }
       }
+      if (!win) throw new HttpError("Invalid shift type timing", 400);
     }
-    if (!win) throw new HttpError("Invalid shift type timing", 400);
 
-    const regularStartMs = Math.max(fromMs, win.startMs);
-    const regularEndMs = Math.min(toMs, win.endMs);
-    const regularMs = Math.max(0, regularEndMs - regularStartMs);
-
-    // Overtime is only recorded when the employee stays past the end of their shift.
-    // Early clock-ins (before shift start) are not logged — regular hours begin from
-    // the shift start time, not from an early clock-in.
-    const overtimeLateMs = toMs > win.endMs ? Math.max(0, toMs - Math.max(fromMs, win.endMs)) : 0;
-
+    await ensureActivityTypes(ctx.creds);
     const activityMap = await resolveActivityTypeMap(ctx.creds);
     if (!activityMap.overtime) {
       throw new HttpError("Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup.", 400);
     }
 
-    const regularActivity =
-      String(shiftTypeName ?? "").toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
-    if (regularMs > 0 && !regularActivity) {
-      throw new HttpError(
-        "Regular or night-shift hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
-        400
-      );
+    const time_logs: Record<string, unknown>[] = [];
+
+    // Check if the employee has an approved half-day leave for this shift day.
+    // If so, the overtime threshold is halved (e.g. 8h shift → 4h regular, then overtime).
+    let isHalfDayLeave = false;
+    try {
+      const attRows = (await erp.getList(ctx.creds, "Attendance", {
+        fields: ["status"],
+        filters: [
+          ["employee", "=", employeeId],
+          ["attendance_date", "=", shiftCalendarDay],
+          ["docstatus", "!=", 2],
+        ],
+        limit_page_length: 1,
+      })) as any[];
+      if (attRows.length && String(attRows[0].status ?? "") === "Half Day") {
+        isHalfDayLeave = true;
+      }
+    } catch {
+      // best-effort — if we can't check, treat as a full shift
     }
 
-    const time_logs: Record<string, unknown>[] = [];
-    if (regularMs > 0 && regularActivity) {
+    let halfDayExceeded = false;
+    let halfDayThresholdH = 0;
+
+    if (win) {
+      const fullShiftDurationMs = win.endMs - win.startMs;
+      const totalWorkedMs = Math.max(0, toMs - fromMs);
+
+      let regularMs: number;
+      let overtimeLateMs: number;
+
+      if (isHalfDayLeave) {
+        // On half-day leave: no overtime is recorded regardless of hours worked.
+        // All time is treated as regular (unbillable beyond the half-shift threshold).
+        const halfDurationMs = fullShiftDurationMs * 0.5;
+        regularMs = totalWorkedMs;
+        overtimeLateMs = 0;
+        if (totalWorkedMs > halfDurationMs) {
+          halfDayExceeded = true;
+          halfDayThresholdH = halfDurationMs / 3600000;
+        }
+      } else {
+        // Overtime starts only after working the full shift duration from clock-in.
+        regularMs = Math.min(totalWorkedMs, fullShiftDurationMs);
+        overtimeLateMs = Math.max(0, totalWorkedMs - fullShiftDurationMs);
+      }
+
+      // Holiday override: if the employee is not expected to work on holidays and today
+      // is a public holiday, reclassify all regular hours as overtime.
+      if (!isHalfDayLeave) {
+        const hSettings = holidaySettingsGet(shift_assignment_name);
+        if (!hSettings.work_on_holidays) {
+          try {
+            const holidayYr = parseInt(shiftCalendarDay.slice(0, 4));
+            const holidayMap = await getEffectiveHolidays(ctx.creds, ctx.company, holidayYr);
+            if (holidayMap.has(shiftCalendarDay)) {
+              overtimeLateMs = regularMs + overtimeLateMs;
+              regularMs = 0;
+            }
+          } catch {
+            // best-effort — don't block clock-out if holiday check fails
+          }
+        }
+      }
+
+      const regularEndMs = fromMs + regularMs;
+
+      const regularActivity =
+        shiftTypeName.toLowerCase().includes("night") && activityMap.night ? activityMap.night : activityMap.regular;
+      if (regularMs > 0 && !regularActivity) {
+        throw new HttpError(
+          "Regular or night-shift hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
+          400
+        );
+      }
+
+      if (regularMs > 0 && regularActivity) {
+        time_logs.push({
+          activity_type: regularActivity,
+          from_time: toFrappeDateTime(new Date(fromMs)),
+          to_time: toFrappeDateTime(new Date(regularEndMs)),
+          hours: Number((regularMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+      if (overtimeLateMs > 0) {
+        time_logs.push({
+          activity_type: activityMap.overtime,
+          from_time: toFrappeDateTime(new Date(regularEndMs)),
+          to_time: toFrappeDateTime(new Date(toMs)),
+          hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+          is_billable: 0,
+        });
+      }
+    } else {
+      // Fallback: shift assignment was deleted — record all elapsed time as regular.
+      if (!activityMap.regular) {
+        throw new HttpError(
+          "Regular hours aren’t set up for time tracking yet. Please ask HR to complete work-category setup.",
+          400
+        );
+      }
       time_logs.push({
-        activity_type: regularActivity,
-        from_time: toFrappeDateTime(new Date(regularStartMs)),
-        to_time: toFrappeDateTime(new Date(regularEndMs)),
-        hours: Number((regularMs / 3600000).toFixed(2)),
-        is_billable: 0,
-      });
-    }
-    if (overtimeLateMs > 0) {
-      time_logs.push({
-        activity_type: activityMap.overtime,
-        from_time: toFrappeDateTime(new Date(win.endMs)),
+        activity_type: activityMap.regular,
+        from_time: from_time,
         to_time: toFrappeDateTime(new Date(toMs)),
-        hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+        hours: Number(((toMs - fromMs) / 3600000).toFixed(2)),
         is_billable: 0,
       });
     }
@@ -1518,8 +2314,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError("No time would be recorded — clock times did not overlap this shift’s window.", 400);
     }
 
-    const projectName = (shiftAssignmentDoc as any)?.project ?? null;
-    const shift_location = (shiftAssignmentDoc as any)?.shift_location ?? null;
+    const projectName = shiftAssignmentDoc ? ((shiftAssignmentDoc as any)?.project ?? null) : null;
+    const shift_location = shiftAssignmentDoc ? ((shiftAssignmentDoc as any)?.shift_location ?? null) : null;
     const timesheetName = await getOrCreateDraftTimesheet({
       ctx,
       employeeId,
@@ -1541,7 +2337,15 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
-    const totalHours = Number(((regularMs + overtimeLateMs) / 3600000).toFixed(2));
+    const totalHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
+    const warnings: string[] = [];
+
+    if (halfDayExceeded) {
+      warnings.push(
+        `You are on half-day leave and are only required to work ${halfDayThresholdH.toFixed(1)}h today. ` +
+        `Any hours worked beyond this are unbillable and will not be counted as overtime.`
+      );
+    }
 
     // Update the Attendance record's in_time, out_time, and working_hours.
     // ERPNext auto-attendance may have already submitted the record (docstatus=1),
@@ -1593,18 +2397,28 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           console.log("[clock-out] attendance updated (submitted via set_value)", { attName, totalHours });
         }
       } else {
+        warnings.push("No attendance record found for today — your hours are saved but the attendance entry may need manual review.");
         console.warn("[clock-out] no Attendance record found for", { employeeId, shiftCalendarDay });
       }
     } catch (e) {
+      warnings.push("Attendance record could not be updated automatically. Your hours are saved but HR may need to manually correct the attendance entry.");
       console.warn("[clock-out] attendance update failed (non-fatal):", erpMsg(e));
     }
+
+    const regularHours = time_logs
+      .filter((l) => l.activity_type !== activityMap.overtime)
+      .reduce((sum, l) => sum + Number(l.hours ?? 0), 0);
+    const overtimeHours = time_logs
+      .filter((l) => l.activity_type === activityMap.overtime)
+      .reduce((sum, l) => sum + Number(l.hours ?? 0), 0);
 
     return {
       timesheet: timesheetName,
       attendance_date: shiftCalendarDay,
       shift_assignment: shift_assignment_name,
-      regular_hours: Number((regularMs / 3600000).toFixed(2)),
-      overtime_hours: Number((overtimeLateMs / 3600000).toFixed(2)),
+      regular_hours: Number(regularHours.toFixed(2)),
+      overtime_hours: Number(overtimeHours.toFixed(2)),
+      warnings,
     };
   }
 
@@ -1811,6 +2625,55 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const employeeId = await resolveEmployeeIdForRequest(ctx, qEmp);
     if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user for this Company" });
 
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const secret = (config.HR_BRIDGE_SECRET || "").trim();
+    const internalUrl = config.PAY_HUB_INTERNAL_URL;
+
+    // Check for active compulsory leave before allowing clock-in.
+    try {
+      if (secret && internalUrl) {
+        const checkRes = await fetch(
+          `${internalUrl}/api/internal/compulsory-leave/active?employee=${encodeURIComponent(employeeId)}&date=${todayStr}`,
+          { headers: { Authorization: `Bearer ${secret}` } },
+        );
+        if (checkRes.ok) {
+          const j = (await checkRes.json()) as { active?: boolean; data?: { reason?: string }[] };
+          if (j.active) {
+            const reason = j.data?.[0]?.reason;
+            return reply.status(403).send({
+              error: reason
+                ? `You are on compulsory leave: ${reason}. Clock-in is not permitted during this period.`
+                : "You are on compulsory leave. Clock-in is not permitted during this period.",
+              code: "HR_COMPULSORY_LEAVE",
+            });
+          }
+        }
+      }
+    } catch {
+      // best-effort — do not block clock-in if the check fails
+    }
+
+    // Check for approved full-day leave before allowing clock-in.
+    try {
+      if (secret && internalUrl) {
+        const checkRes = await fetch(
+          `${internalUrl}/api/internal/approved-leave/active?employee=${encodeURIComponent(employeeId)}&date=${todayStr}`,
+          { headers: { Authorization: `Bearer ${secret}` } },
+        );
+        if (checkRes.ok) {
+          const j = (await checkRes.json()) as { active?: boolean };
+          if (j.active) {
+            return reply.status(403).send({
+              error: "You have approved leave today. Clock-in is not available during approved leave.",
+              code: "HR_ON_LEAVE",
+            });
+          }
+        }
+      }
+    } catch {
+      // best-effort — do not block clock-in if the check fails
+    }
+
     try {
       const now = new Date();
       let active: Awaited<ReturnType<typeof resolveActiveShiftForTimestamp>>;
@@ -1871,10 +2734,13 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       return {
         data: {
           from_time: toFrappeDateTime(now),
+          from_time_utc: now.toISOString(), // explicit UTC — client should prefer this
           attendance: attendanceName,
           attendance_date: active.shift_start_date,
           shift_assignment: active.shift_assignment_name,
           shift_type: active.shift_type_name,
+          shift_start_time: active.shift_start_time,
+          shift_end_time: active.shift_end_time,
           project: (shiftAssignmentDoc as any)?.project ?? null,
           shift_location: (shiftAssignmentDoc as any)?.shift_location ?? null,
         },
@@ -1967,6 +2833,14 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       // Fetch the shift type to get raw start_time / end_time strings.
       const stDoc = await erp.getDoc(ctx.creds, "Shift Type", active.shift_type_name) as any;
 
+      // Holiday info for today so the client can warn before clock-in.
+      const tzOff = await getErpTzOffsetMinutes(ctx.creds);
+      const todayLocal = toLocalDate(now, tzOff);
+      const yr = parseInt(todayLocal.slice(0, 4));
+      const holidayMap = await getEffectiveHolidays(ctx.creds, ctx.company, yr);
+      const todayHolidayName = holidayMap.get(todayLocal) ?? null;
+      const hSettings = holidaySettingsGet(active.shift_assignment_name);
+
       return {
         data: {
           shift_type: active.shift_type_name,
@@ -1976,6 +2850,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           end_date: saDoc?.end_date ? String(saDoc.end_date).slice(0, 10) : null,
           shift_assignment_name: active.shift_assignment_name,
           shift_location: saDoc?.shift_location ?? null,
+          today_holiday_name: todayHolidayName,
+          work_on_holidays: hSettings.work_on_holidays,
         },
       };
     } catch (e) {
@@ -2848,6 +3724,55 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
+    }
+  });
+
+  /**
+   * POST /api/internal/force-clock-out
+   * Called by Pay Hub when compulsory leave is issued for an employee currently clocked in.
+   * Creates an OUT Employee Checkin at the same time as the open IN checkin (zeroing worked hours).
+   * Auth: Bearer <HR_BRIDGE_SECRET>
+   */
+  app.post("/api/internal/force-clock-out", async (req, reply) => {
+    const secret = (config.HR_BRIDGE_SECRET || "").trim();
+    const auth = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+    if (!secret || auth !== secret) return reply.status(401).send({ error: "Unauthorized" });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const employeeId = String(body.employee_erp_id ?? "").trim();
+    if (!employeeId) return reply.status(400).send({ error: "employee_erp_id is required" });
+
+    if (!config.ERP_API_KEY || !config.ERP_API_SECRET) {
+      return reply.status(500).send({ error: "ERP credentials not configured" });
+    }
+    const creds = { apiKey: config.ERP_API_KEY, apiSecret: config.ERP_API_SECRET };
+
+    try {
+      // Find the most recent Employee Checkin for this employee.
+      const recent = (await erp.getList(creds, "Employee Checkin", {
+        fields: ["name", "log_type", "time"],
+        filters: [["employee", "=", employeeId]],
+        order_by: "time desc",
+        limit_page_length: 1,
+      })) as any[];
+
+      if (!recent.length || String(recent[0].log_type ?? "").toUpperCase() !== "IN") {
+        return reply.send({ data: { clocked_out: false, reason: "not_clocked_in" } });
+      }
+
+      // Create an OUT checkin at the same timestamp as the IN to zero out working hours.
+      const inTime = String(recent[0].time ?? "").trim();
+      await erp.createDoc(creds, "Employee Checkin", {
+        employee: employeeId,
+        log_type: "OUT",
+        time: inTime || toFrappeDateTime(new Date()),
+      });
+
+      return reply.send({ data: { clocked_out: true } });
+    } catch (e) {
+      // Non-fatal — compulsory leave was already saved; just report the failure.
+      const msg = e instanceof ErpError ? String((e as any).message ?? e) : String(e);
+      return reply.status(500).send({ error: msg.slice(0, 300) });
     }
   });
 };
