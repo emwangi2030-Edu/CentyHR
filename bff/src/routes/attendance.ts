@@ -2118,6 +2118,10 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     regular_hours: number;
     overtime_hours: number;
     warnings: string[];
+    /** True when the clock-out time was capped to shift end because overtime is not allowed. */
+    auto_clocked_out: boolean;
+    /** The actual to_time used after any policy-based capping. */
+    effective_to_time: string;
   }> {
     const { ctx, employeeId, from_time, to_time, shift_assignment_name } = params;
 
@@ -2125,7 +2129,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     const to = parseFrappeDateTime(to_time);
     if (!from || !to) throw new HttpError("Invalid from_time/to_time format", 400);
     const fromMs = from.getTime();
-    const toMs = to.getTime();
+    let toMs = to.getTime();
     if (toMs <= fromMs) throw new HttpError("to_time must be after from_time", 400);
 
     // Fetch the shift assignment — it may have been deleted after the employee clocked in.
@@ -2185,9 +2189,40 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       if (!win) throw new HttpError("Invalid shift type timing", 400);
     }
 
+    // Fetch the company’s overtime policy from Pay Hub. Fail-open (allow overtime)
+    // if the policy cannot be retrieved so a Pay Hub outage never blocks clock-outs.
+    let overtimeAllowed = true;
+    let autoClockOut = false;
+    try {
+      const secret = (config.HR_BRIDGE_SECRET || "").trim();
+      const internalUrl = config.PAY_HUB_INTERNAL_URL;
+      if (secret && internalUrl) {
+        const policyRes = await fetch(
+          `${internalUrl}/api/internal/overtime-policy?erp_company=${encodeURIComponent(ctx.company)}`,
+          { headers: { Authorization: `Bearer ${secret}` } },
+        );
+        if (policyRes.ok) {
+          const j = (await policyRes.json()) as { overtimeAllowed?: boolean };
+          overtimeAllowed = j.overtimeAllowed ?? true;
+        }
+      }
+    } catch {
+      // best-effort — default to allowing overtime if unreachable
+    }
+
+    // If overtime is not allowed and we have a shift window, cap to_time at shift end.
+    if (!overtimeAllowed && win) {
+      const cappedMs = fromMs + (win.endMs - win.startMs);
+      if (toMs > cappedMs) {
+        toMs = cappedMs;
+        autoClockOut = true;
+      }
+    }
+
     await ensureActivityTypes(ctx.creds);
     const activityMap = await resolveActivityTypeMap(ctx.creds);
-    if (!activityMap.overtime) {
+    // Only require the overtime activity type if overtime is actually allowed.
+    if (overtimeAllowed && !activityMap.overtime) {
       throw new HttpError("Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup.", 400);
     }
 
@@ -2210,7 +2245,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         isHalfDayLeave = true;
       }
     } catch {
-      // best-effort — if we can't check, treat as a full shift
+      // best-effort — if we can’t check, treat as a full shift
     }
 
     let halfDayExceeded = false;
@@ -2223,13 +2258,13 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       let regularMs: number;
       let overtimeLateMs: number;
 
-      if (isHalfDayLeave) {
-        // On half-day leave: no overtime is recorded regardless of hours worked.
-        // All time is treated as regular (unbillable beyond the half-shift threshold).
-        const halfDurationMs = fullShiftDurationMs * 0.5;
+      if (isHalfDayLeave || !overtimeAllowed) {
+        // On half-day leave or when overtime is disabled: no overtime is recorded.
+        // All time is treated as regular (unbillable beyond the threshold).
+        const halfDurationMs = isHalfDayLeave ? fullShiftDurationMs * 0.5 : fullShiftDurationMs;
         regularMs = totalWorkedMs;
         overtimeLateMs = 0;
-        if (totalWorkedMs > halfDurationMs) {
+        if (isHalfDayLeave && totalWorkedMs > halfDurationMs) {
           halfDayExceeded = true;
           halfDayThresholdH = halfDurationMs / 3600000;
         }
@@ -2394,6 +2429,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       regular_hours: Number(regularHours.toFixed(2)),
       overtime_hours: Number(overtimeHours.toFixed(2)),
       warnings,
+      auto_clocked_out: autoClockOut,
+      effective_to_time: toFrappeDateTime(new Date(toMs)),
     };
   }
 
@@ -2548,32 +2585,38 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Optional GPS audit: creates ERPNext `Employee Checkin` when `location` is posted.
-   * Fails soft if the site’s doctype lacks lat/long fields or permissions differ.
+   * Records an ERPNext `Employee Checkin` for every app and auto clock event.
+   * device_id distinguishes the source: "app" (manual web), "auto" (policy-capped),
+   * or "zkteco:<host>" (fingerprint terminal — handled by zktecoSync directly).
+   * GPS coordinates are included when provided, ignored otherwise.
    */
-  async function tryRecordEmployeeCheckinWithLocation(params: {
+  async function recordEmployeeCheckin(params: {
     ctx: HrContext;
     employeeId: string;
     logType: "IN" | "OUT";
     at: Date;
-    location: unknown;
+    deviceId: string;
+    location?: unknown;
   }): Promise<{ recorded: boolean; reason?: string }> {
-    const loc = asRecord(params.location);
-    if (!loc) return { recorded: false };
-    const lat = Number(loc.latitude);
-    const lng = Number(loc.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return { recorded: false };
-
     const doc: Record<string, unknown> = {
       employee: params.employeeId,
       log_type: params.logType,
       time: toFrappeDateTime(params.at),
-      latitude: lat,
-      longitude: lng,
+      device_id: params.deviceId,
     };
-    const acc = loc.accuracy_meters;
-    if (acc != null && Number.isFinite(Number(acc))) {
-      doc.accuracy = Number(acc);
+
+    const loc = asRecord(params.location);
+    if (loc) {
+      const lat = Number(loc.latitude);
+      const lng = Number(loc.longitude);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        doc.latitude = lat;
+        doc.longitude = lng;
+        const acc = loc.accuracy_meters;
+        if (acc != null && Number.isFinite(Number(acc))) {
+          doc.accuracy = Number(acc);
+        }
+      }
     }
 
     try {
@@ -2698,11 +2741,12 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
       const shiftAssignmentDoc = await erp.getDoc(ctx.creds, "Shift Assignment", active.shift_assignment_name);
 
-      const checkinMeta = await tryRecordEmployeeCheckinWithLocation({
+      const checkinMeta = await recordEmployeeCheckin({
         ctx,
         employeeId,
         logType: "IN",
         at: now,
+        deviceId: "app",
         location: body.location,
       });
 
@@ -2856,13 +2900,17 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
         to_time: toResolved,
         shift_assignment_name,
       });
-      const outAt = parseFrappeDateTime(toResolved) ?? new Date();
-      const checkinMeta = await tryRecordEmployeeCheckinWithLocation({
+      // Use the effective (possibly policy-capped) clock-out time for the checkin record.
+      // device_id "auto" signals the terminal that this OUT was system-generated so it
+      // treats the next physical scan as IN rather than OUT.
+      const outAt = parseFrappeDateTime(result.effective_to_time) ?? new Date();
+      const checkinMeta = await recordEmployeeCheckin({
         ctx,
         employeeId,
         logType: "OUT",
         at: outAt,
-        location: body.location,
+        deviceId: result.auto_clocked_out ? "auto" : "app",
+        location: result.auto_clocked_out ? undefined : body.location,
       });
       return { data: result, meta: { employee_checkin: checkinMeta } };
     } catch (e) {
