@@ -70,17 +70,7 @@ export const loanRoutes: FastifyPluginAsync = async (app) => {
           ["applicant_type", "=", "Employee"],
           ["applicant", "=", employeeId],
         ],
-        fields: [
-          "name",
-          "posting_date",
-          "loan_product",
-          "loan_amount",
-          "status",
-          "repayment_method",
-          "repayment_periods",
-          "repayment_amount",
-          "description",
-        ],
+        fields: ["name", "posting_date", "loan_product", "loan_amount", "status", "repayment_method", "repayment_periods"],
         order_by: "modified desc",
         limit_page_length: 100,
       });

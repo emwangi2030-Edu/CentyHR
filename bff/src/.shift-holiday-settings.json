@@ -38,5 +38,9 @@
   "HR-SHA-26-05-00008": {
     "work_on_holidays": false,
     "holiday_shift_override": null
+  },
+  "HR-SHA-26-05-00510": {
+    "work_on_holidays": false,
+    "holiday_shift_override": null
   }
 }

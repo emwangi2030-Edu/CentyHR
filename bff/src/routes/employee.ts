@@ -100,6 +100,16 @@ function asRecord(v: unknown): Record<string, unknown> | null {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
+function employeeRosterCacheScope(req: FastifyRequest, ctx: HrContext): string {
+  const integrateHeader = req.headers["x-hr-erp-integrate"];
+  const source = (Array.isArray(integrateHeader) ? integrateHeader[0] : integrateHeader) === "1"
+    ? "integration"
+    : "per_user";
+  const userEmail = String(ctx.userEmail ?? "").trim().toLowerCase() || "unknown";
+  const roleScope = ctx.canSubmitOnBehalf ? "admin" : "self";
+  return `${ctx.company}:${source}:${roleScope}:${userEmail}`;
+}
+
 const SUMMARY_SCAN_CAP = 5000;
 /** Max expense claim rows scanned for per-employee aggregates (snapshot + heatmap). */
 const EMPLOYEE_INSIGHTS_CLAIM_CAP = 500;
@@ -211,6 +221,10 @@ const EMPLOYEE_LIST_FIELDS = [
   "cell_number",
   "company_email",
   "prefered_email",
+  // Banking fields are needed by payroll disbursement pages that read the shared roster feed.
+  "bank_name",
+  "bank_ac_no",
+  "custom_bank_branch",
   // Identity numbers used in Pay Hub roster table "ID No." column.
   "custom_national_id",
 ];
@@ -246,7 +260,7 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   "leave_approver", "shift_request_approver",
   // Payroll & Banking
   "ctc", "payroll_cost_center", "salary_mode", "salary_currency",
-  "bank_name", "bank_ac_no", "iban", "bank_branch", "custom_bank_branch", "payroll_frequency",
+  "bank_name", "bank_ac_no", "iban", "custom_bank_branch", "payroll_frequency",
   // Biometric / project / contacts
   "attendance_device_id", "project",
   "emergency_contact_name", "custom_referee",
@@ -261,6 +275,17 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
   "leave_encashed", "reason_for_leaving", "feedback",
   // Statutory / Tax compliance
   "tax_id",                                          // KRA PIN (standard ERPNext field)
+  "custom_exemption_certificate_number",             // KRA P10 Section C (PwD)
+  // KRA P10 Sheet D — car benefit
+  "custom_p10_car_section_ref",
+  "custom_car_registration",
+  "custom_car_make",
+  "custom_car_body_type",
+  "custom_car_cc_rating",
+  "custom_car_cost_type",
+  "custom_car_owned_cost",
+  "custom_car_hire_monthly",
+  "custom_car_benefit_override",
   // Common custom field name variants for Kenya statutory numbers:
   "nssf_no", "custom_nssf_no", "nssf_number", "custom_nssf_number",
   "nhif_no", "custom_nhif_no", "nhif_number", "custom_nhif_number",
@@ -275,362 +300,6 @@ const EMPLOYEE_PATCH_WHITELIST = new Set([
 // Allow single AND double underscores between segments so fieldnames auto-generated from
 // labels like "NHIF / SHIF Number" (→ custom_nhif__shif_number) are accepted.
 const EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE = /^(custom_)?(nssf|nhif|shif|nita|kra)(_+[a-z0-9]+)*$/i;
-
-/** Cached resolved ERP fieldname (Custom Field on Employee), excluding env override. */
-let memoErpBankBranchField: string | null = null;
-/** In-flight promise so concurrent requests share one resolution instead of each firing 9 DocField queries. */
-let memoErpBankBranchFieldResolving: Promise<string> | null = null;
-/** Per-fieldname cache for employeeDocFieldExists (avoids repeated DocField 403s per request burst). */
-const memoDocFieldExists = new Map<string, boolean>();
-
-function pickBankBranchFromMetaRows(rows: { fieldname: string; label?: string }[]): string | null {
-  const exact = rows.find((r) => r.fieldname === "custom_bank_branch");
-  if (exact) return "custom_bank_branch";
-
-  const byLabel = rows.find((r) => /^bank\s*branch$/i.test(String(r.label ?? "").trim()));
-  if (byLabel) return byLabel.fieldname;
-
-  const fuzzy = rows.filter(
-    (r) =>
-      (/bank/i.test(r.fieldname) && /branch/i.test(r.fieldname)) ||
-      (/bank/i.test(String(r.label ?? "")) && /branch/i.test(String(r.label ?? ""))),
-  );
-  if (fuzzy.length === 1) return fuzzy[0]!.fieldname;
-  return null;
-}
-
-async function employeeDocFieldExists(creds: ErpCredentials, fieldname: string): Promise<boolean> {
-  if (memoDocFieldExists.has(fieldname)) return memoDocFieldExists.get(fieldname)!;
-  try {
-    const rows = await erp.getList(creds, "DocField", {
-      filters: [
-        ["parent", "=", "Employee"],
-        ["fieldname", "=", fieldname],
-      ],
-      fields: ["name"],
-      limit_page_length: 1,
-    });
-    const result = Array.isArray(rows) && rows.length > 0;
-    memoDocFieldExists.set(fieldname, result);
-    return result;
-  } catch {
-    memoDocFieldExists.set(fieldname, false);
-    return false;
-  }
-}
-
-/** Creates `custom_bank_branch` on Employee when enabled by env and missing — clears memo on success. */
-async function ensureBankBranchCustomFieldExists(creds: ErpCredentials): Promise<boolean> {
-  if (!appConfig.HR_AUTO_SETUP_BANK_BRANCH_FIELD) return false;
-  if (await employeeDocFieldExists(creds, "custom_bank_branch")) return false;
-  try {
-    await erp.createDoc(creds, "Custom Field", {
-      dt: "Employee",
-      label: "Bank Branch",
-      fieldname: "custom_bank_branch",
-      fieldtype: "Data",
-      insert_after: "iban",
-      in_list_view: 0,
-      in_standard_filter: 0,
-    });
-    memoErpBankBranchField = null;
-    memoErpBankBranchFieldResolving = null;
-    memoDocFieldExists.delete("custom_bank_branch");
-    console.warn(
-      `[hr] created Custom Field custom_bank_branch on Employee (HR_AUTO_SETUP_BANK_BRANCH_FIELD=1)`,
-    );
-    return true;
-  } catch (e) {
-    console.warn(`[hr] auto-setup custom_bank_branch failed: ${String(e).slice(0, 240)}`);
-    return false;
-  }
-}
-
-/**
- * Discover which field holds bank branch. Uses Custom Field doctype, then DocField (works when API user
- * cannot read Custom Field but can read DocField / Employee schema).
- */
-async function resolveEmployeeBankBranchFieldname(creds: ErpCredentials): Promise<string> {
-  const env = appConfig.HR_EMPLOYEE_BANK_BRANCH_FIELD?.trim();
-  if (env) {
-    console.log(`[hr] bank branch ERP field from HR_EMPLOYEE_BANK_BRANCH_FIELD=${env}`);
-    return env;
-  }
-
-  let cfRows: { fieldname: string; label: string }[] = [];
-  try {
-    cfRows = (await erp.getList(creds, "Custom Field", {
-      filters: [["dt", "=", "Employee"]],
-      fields: ["fieldname", "label"],
-      limit_page_length: 300,
-    })) as { fieldname: string; label: string }[];
-  } catch (e) {
-    // 403 is expected when the API key lacks Custom Field read permission — handled gracefully below.
-    if (e instanceof ErpError && e.status !== 403) {
-      console.warn(`[hr] Custom Field list (Employee) unavailable: ${String(e).slice(0, 160)}`);
-    }
-  }
-
-  let dfRows: { fieldname: string; label?: string }[] = [];
-  try {
-    dfRows = (await erp.getList(creds, "DocField", {
-      filters: [["parent", "=", "Employee"]],
-      fields: ["fieldname", "label"],
-      limit_page_length: 500,
-    })) as { fieldname: string; label?: string }[];
-  } catch (e) {
-    // 403 is expected when the API key lacks DocField read permission — handled gracefully below.
-    if (e instanceof ErpError && e.status !== 403) {
-      console.warn(`[hr] DocField list (Employee) unavailable: ${String(e).slice(0, 160)}`);
-    }
-  }
-
-  const seen = new Map<string, { fieldname: string; label?: string }>();
-  for (const r of [...cfRows, ...dfRows]) seen.set(r.fieldname, r);
-  const combined = [...seen.values()];
-
-  const picked = pickBankBranchFromMetaRows(combined);
-  if (picked) {
-    const fromDocFieldOnly = !cfRows.some((r) => r.fieldname === picked) && dfRows.some((r) => r.fieldname === picked);
-    if (fromDocFieldOnly) {
-      console.warn(`[hr] resolved bank branch via DocField → ${picked}`);
-    } else if (picked !== "custom_bank_branch") {
-      console.warn(`[hr] resolved bank branch → ${picked}`);
-    }
-    return picked;
-  }
-
-  const fuzzy = combined.filter(
-    (r) =>
-      (/bank/i.test(r.fieldname) && /branch/i.test(r.fieldname)) ||
-      (/bank/i.test(String(r.label ?? "")) && /branch/i.test(String(r.label ?? ""))),
-  );
-  if (fuzzy.length > 1) {
-    console.warn(
-      `[hr] multiple bank-branch fields; set HR_EMPLOYEE_BANK_BRANCH_FIELD. Candidates: ${fuzzy.map((f) => `${f.fieldname}(${f.label})`).join(", ")}`,
-    );
-  }
-
-  const bankRelated = combined.filter(
-    (r) => /bank|branch/i.test(r.fieldname) || /bank|branch/i.test(String(r.label ?? "")),
-  );
-  console.warn(
-    `[hr] no bank-branch field matched; defaulting to custom_bank_branch. custom_field_rows=${cfRows.length} docfield_rows=${dfRows.length}. Related: ${bankRelated.map((r) => `${r.fieldname}:${r.label}`).join("; ") || "(none)"}`,
-  );
-  return "custom_bank_branch";
-}
-
-async function getMemoBankBranchField(creds: ErpCredentials): Promise<string> {
-  const env = appConfig.HR_EMPLOYEE_BANK_BRANCH_FIELD?.trim();
-  if (env) return env;
-  if (memoErpBankBranchField !== null) return memoErpBankBranchField;
-  // Share one in-flight resolution so concurrent requests don't each fire DocField/CustomField queries.
-  if (memoErpBankBranchFieldResolving) return memoErpBankBranchFieldResolving;
-  memoErpBankBranchFieldResolving = resolveEmployeeBankBranchFieldname(creds).then((v) => {
-    memoErpBankBranchField = v;
-    memoErpBankBranchFieldResolving = null;
-    return v;
-  }).catch((err) => {
-    memoErpBankBranchFieldResolving = null;
-    throw err;
-  });
-  return memoErpBankBranchFieldResolving;
-}
-
-/** Many sites use `custom_bank_branch`; others use a different Custom Field fieldname (resolved via getMemoBankBranchField). */
-function readEmployeeBankBranch(rec: Record<string, unknown>, erpBranchField?: string): string {
-  if (erpBranchField) {
-    const fromErp = String(rec[erpBranchField] ?? "").trim();
-    if (fromErp) return fromErp;
-  }
-  const custom = String(rec.custom_bank_branch ?? "").trim();
-  if (custom) return custom;
-  return String(rec.bank_branch ?? "").trim();
-}
-
-function bankBranchExpectedMatchesRecord(
-  record: Record<string, unknown>,
-  expectedRaw: unknown,
-  erpBranchField: string,
-): boolean {
-  const expected =
-    typeof expectedRaw === "string" ? expectedRaw.trim() : String(expectedRaw ?? "").trim();
-  return readEmployeeBankBranch(record, erpBranchField) === expected;
-}
-
-/**
- * REST GET doc sometimes omits custom banking fields; merge explicit get_value for verification.
- * `erpBranchField` is the actual Custom Field name on this site (see resolveEmployeeBankBranchFieldname).
- */
-async function mergeEmployeeBankBranchFromGetValue(
-  creds: ErpCredentials,
-  employeeName: string,
-  record: Record<string, unknown>,
-  erpBranchField: string,
-): Promise<Record<string, unknown>> {
-  const fieldList = [...new Set([erpBranchField, "custom_bank_branch", "bank_branch"].filter(Boolean))];
-  let merged = record;
-  try {
-    const raw = (await erp.callMethod(creds, "frappe.client.get_value", {
-      doctype: "Employee",
-      fieldname: fieldList,
-      filters: [["name", "=", employeeName]],
-    })) as { message?: unknown };
-    const msg = raw?.message;
-    if (msg != null && typeof msg === "object") {
-      const row = Array.isArray(msg) ? (msg[0] as Record<string, unknown> | undefined) : (msg as Record<string, unknown>);
-      if (row && typeof row === "object") merged = { ...merged, ...row };
-    }
-  } catch {
-    /* ignore */
-  }
-  try {
-    const rows = (await erp.getList(creds, "Employee", {
-      filters: [["name", "=", employeeName]],
-      fields: fieldList,
-      limit_page_length: 1,
-    })) as Record<string, unknown>[] | undefined;
-    const row = rows?.[0];
-    if (row && typeof row === "object") merged = { ...merged, ...row };
-  } catch {
-    /* ignore */
-  }
-  return merged;
-}
-
-const HR_BANK_DIAG_CLIP = 2000;
-
-function clipBankDiag(obj: unknown, max = HR_BANK_DIAG_CLIP): string {
-  try {
-    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
-    return s.length > max ? `${s.slice(0, max)}…` : s;
-  } catch {
-    return String(obj).slice(0, max);
-  }
-}
-
-/**
- * Logs Frappe `/api/method` JSON: `_server_messages` (validation warnings) and `message` doc fields.
- * Pass resolved `erpBranchField` so we log the real Custom Field key returned by ERP.
- */
-function logFrappeRpcBankDiag(tag: string, raw: unknown, erpBranchField?: string): void {
-  if (raw == null) {
-    console.warn(`[hr:diag:${tag}] response=null`);
-    return;
-  }
-  if (typeof raw !== "object") {
-    console.warn(`[hr:diag:${tag}] response type=${typeof raw}`);
-    return;
-  }
-  const o = raw as Record<string, unknown>;
-  if (o._server_messages != null) {
-    console.warn(`[hr:diag:${tag}] _server_messages=${clipBankDiag(o._server_messages, 1200)}`);
-  }
-  if (typeof o.exc === "string" && o.exc.length > 0) {
-    console.warn(`[hr:diag:${tag}] exc present len=${o.exc.length}`);
-  }
-  const msg = o.message;
-  if (msg != null && typeof msg === "object" && !Array.isArray(msg)) {
-    const doc = msg as Record<string, unknown>;
-    const erpVal =
-      erpBranchField && Object.prototype.hasOwnProperty.call(doc, erpBranchField)
-        ? clipBankDiag(doc[erpBranchField], 120)
-        : "(no key)";
-    console.warn(
-      `[hr:diag:${tag}] message.doc erpBranch(${erpBranchField ?? "?"})=${erpVal} custom_bank_branch=${clipBankDiag(doc.custom_bank_branch, 120)} bank_branch=${clipBankDiag(doc.bank_branch, 120)} custom_national_id=${clipBankDiag(doc.custom_national_id, 120)}`,
-    );
-  } else if (msg != null) {
-    console.warn(`[hr:diag:${tag}] message=${clipBankDiag(msg, 500)}`);
-  }
-}
-
-/** Compare DB vs API reads when branch verification fails (find permission / wrong field / stripped keys). */
-async function probeEmployeeBankBranchPersistence(
-  creds: ErpCredentials,
-  employeeName: string,
-  phase: string,
-  erpBranchField: string,
-): Promise<void> {
-  const gvFields = [...new Set([erpBranchField, "bank_branch", "custom_national_id"])];
-  const listFields = ["name", ...gvFields];
-  console.warn(`[hr:diag:${phase}] --- probes ${employeeName} (erpBranchField=${erpBranchField}) ---`);
-  try {
-    const gv = await erp.callMethod(creds, "frappe.client.get_value", {
-      doctype: "Employee",
-      fieldname: gvFields,
-      filters: [["name", "=", employeeName]],
-    });
-    console.warn(`[hr:diag:${phase}] frappe.client.get_value raw=${clipBankDiag(gv)}`);
-  } catch (e) {
-    console.warn(`[hr:diag:${phase}] get_value threw ${String(e).slice(0, 500)}`);
-  }
-  try {
-    const rows = await erp.getList(creds, "Employee", {
-      filters: [["name", "=", employeeName]],
-      fields: listFields,
-      limit_page_length: 1,
-    });
-    console.warn(`[hr:diag:${phase}] frappe.client.get_list=${clipBankDiag(rows)}`);
-  } catch (e) {
-    console.warn(`[hr:diag:${phase}] get_list threw ${String(e).slice(0, 500)}`);
-  }
-  try {
-    const rawGet = await erp.callMethod(creds, "frappe.client.get", {
-      doctype: "Employee",
-      name: employeeName,
-    });
-    logFrappeRpcBankDiag(`${phase}.frappe_client_get`, rawGet, erpBranchField);
-  } catch (e) {
-    console.warn(`[hr:diag:${phase}] frappe.client.get threw ${String(e).slice(0, 500)}`);
-  }
-  try {
-    const resourceDoc = await erp.getDoc(creds, "Employee", employeeName);
-    const hasErp = Object.prototype.hasOwnProperty.call(resourceDoc, erpBranchField);
-    console.warn(
-      `[hr:diag:${phase}] REST getDoc has ${erpBranchField} key=${hasErp} value=${hasErp ? clipBankDiag(resourceDoc[erpBranchField], 160) : "n/a"}`,
-    );
-  } catch (e) {
-    console.warn(`[hr:diag:${phase}] getDoc threw ${String(e).slice(0, 500)}`);
-  }
-}
-
-/** When saving branch, defer these standard bank fields so they are not saved before the custom branch field. */
-const EMPLOYEE_BANKING_DEFER_KEYS = ["bank_name", "bank_ac_no", "iban"] as const;
-
-async function applyDeferredBankingOnly(
-  creds: ErpCredentials,
-  employeeName: string,
-  deferredBanking: Record<string, unknown>,
-  erpBranchField: string,
-): Promise<void> {
-  if (Object.keys(deferredBanking).length === 0) return;
-  try {
-    const updated = (await erp.updateDoc(creds, "Employee", employeeName, deferredBanking)) as Record<string, unknown>;
-    console.log(`[hr:patch] deferred banking updateDoc OK keys=${Object.keys(deferredBanking).join(",")}`);
-    console.warn(
-      `[hr:diag:deferred_banking_put] PUT returned doc ${erpBranchField} key=${Object.prototype.hasOwnProperty.call(updated, erpBranchField)} value=${clipBankDiag(updated[erpBranchField], 120)}`,
-    );
-  } catch (e) {
-    console.warn(`[hr:patch] deferred banking updateDoc failed: ${String(e).slice(0, 220)}`);
-  }
-}
-
-/** Must run after deferred banking PUT: combined PUT with `bank_branch` text can invalidate Link fields and drop custom branch. */
-async function setValueCustomBankBranchLast(
-  creds: ErpCredentials,
-  employeeName: string,
-  value: unknown,
-  erpFieldname: string,
-): Promise<void> {
-  const raw = await erp.callMethod(creds, "frappe.client.set_value", {
-    doctype: "Employee",
-    name: employeeName,
-    fieldname: erpFieldname,
-    value,
-  });
-  logFrappeRpcBankDiag("set_value_custom_bank_branch_after_banking", raw, erpFieldname);
-  console.log(`[hr:patch] set_value custom_bank_branch (after banking) OK`);
-}
 
 function isAllowedEmployeePatchField(field: string): boolean {
   return EMPLOYEE_PATCH_WHITELIST.has(field) || EMPLOYEE_DYNAMIC_STATUTORY_FIELD_RE.test(field);
@@ -728,12 +397,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
       // getDoc returns all fields the doctype has — no field whitelist, never throws "Field not permitted"
       const doc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
-      const { company: _c, ...rest } = doc;
-      let data = rest as Record<string, unknown>;
-      const erpBankBranch = await getMemoBankBranchField(ctx.creds);
-      data = await mergeEmployeeBankBranchFromGetValue(ctx.creds, empName, data, erpBankBranch);
-      const bb = readEmployeeBankBranch(data, erpBankBranch);
-      if (bb) data.custom_bank_branch = bb;
+      const { company: _c, ...data } = doc;
       const result = { data };
       erpCacheSet(cacheKey, result);
       return result;
@@ -1155,42 +819,6 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  /**
-   * One-time setup: creates Data Custom Field `custom_bank_branch` on Employee (after `iban`) if missing.
-   * Required when Pay Hub saves bank branch — ERP must expose this field on Employee.
-   */
-  app.post("/v1/meta/setup-bank-branch-field", async (req, reply) => {
-    let ctx;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-    try {
-      const exists = await employeeDocFieldExists(ctx.creds, "custom_bank_branch");
-      if (exists) {
-        return { status: "already_exists", fieldname: "custom_bank_branch" };
-      }
-      const created = await erp.createDoc(ctx.creds, "Custom Field", {
-        dt: "Employee",
-        label: "Bank Branch",
-        fieldname: "custom_bank_branch",
-        fieldtype: "Data",
-        insert_after: "iban",
-        in_list_view: 0,
-        in_standard_filter: 0,
-      });
-      memoErpBankBranchField = null;
-      memoErpBankBranchFieldResolving = null;
-      memoDocFieldExists.delete("custom_bank_branch");
-      return { status: "created", field: created };
-    } catch (e) {
-      if (e instanceof ErpError) return reply.status(e.status).send({ error: e.body });
-      throw e;
-    }
-  });
-
   /** Roster counts for dashboard cards (bounded scan). */
   app.get("/v1/employees/summary", async (req, reply) => {
     let ctx;
@@ -1201,7 +829,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       throw e;
     }
 
-    const summaryKey = `${ctx.company}:summary`;
+    const summaryKey = `${employeeRosterCacheScope(req, ctx)}:summary`;
     const cachedSummary = erpCacheGet<unknown>(summaryKey);
     if (cachedSummary) return cachedSummary;
 
@@ -1447,7 +1075,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
     try {
       const { page, pageSize, limitStart } = parsePageParams(req);
       const q = parseSearchQuery(req);
-      const listCacheKey = `${ctx.company}:list:p${page}:ps${pageSize}:q${q}`;
+      const listCacheKey = `${employeeRosterCacheScope(req, ctx)}:list:p${page}:ps${pageSize}:q${q}`;
       const cachedList = erpCacheGet<unknown>(listCacheKey);
       if (cachedList) return cachedList;
       const take = pageSize + 1;
@@ -1718,12 +1346,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(access.status).send({ error: access.error });
     }
     const { company: _drop, ...rest } = access.doc;
-    let data = rest as Record<string, unknown>;
-    const erpBankBranch = await getMemoBankBranchField(ctx.creds);
-    data = await mergeEmployeeBankBranchFromGetValue(ctx.creds, name, data, erpBankBranch);
-    const bb = readEmployeeBankBranch(data, erpBankBranch);
-    if (bb) data.custom_bank_branch = bb;
-    return { data };
+    return { data: rest };
   });
 
   /**
@@ -1941,37 +1564,10 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // If we're saving bank branch, do not PUT bank_name / ac / iban before branch — on many ERP sites
-      // that first save validates bank fields and clears custom branch; apply them in one doc with branch.
-      const deferredBanking: Record<string, unknown> = {};
-      if (Object.prototype.hasOwnProperty.call(statutoryPatch, "custom_bank_branch")) {
-        for (const k of EMPLOYEE_BANKING_DEFER_KEYS) {
-          if (Object.prototype.hasOwnProperty.call(standardPatch, k)) {
-            deferredBanking[k] = standardPatch[k]!;
-            delete standardPatch[k];
-          }
-        }
-        if (Object.prototype.hasOwnProperty.call(standardPatch, "bank_branch")) {
-          delete standardPatch.bank_branch;
-        }
-        if (Object.keys(deferredBanking).length > 0) {
-          console.log(
-            `[hr:patch] deferred standard bank fields (PUT before custom_bank_branch set_value): ${Object.keys(deferredBanking).join(", ")}`,
-          );
-        }
-      }
-
       const standardFields = Object.keys(standardPatch);
       const statutoryFields = Object.keys(statutoryPatch);
       console.log(`[hr:patch] standard fields (${standardFields.length}): ${standardFields.join(", ") || "(none)"}`);
       console.log(`[hr:patch] statutory/custom fields (${statutoryFields.length}): ${statutoryFields.join(", ") || "(none)"}`);
-
-      if (Object.prototype.hasOwnProperty.call(statutoryPatch, "custom_bank_branch")) {
-        await ensureBankBranchCustomFieldExists(ctx.creds);
-      }
-
-      const bankBranchErpField = await getMemoBankBranchField(ctx.creds);
-      console.log(`[hr:patch] ERP Employee bank branch fieldname=${bankBranchErpField}`);
 
       // Apply standard fields via PUT
       if (standardFields.length > 0) {
@@ -1980,41 +1576,27 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         console.log(`[hr:patch] updateDoc OK`);
       }
 
-      // Apply statutory fields except bank branch first; branch is set last after deferred banking PUT
-      // so banking validation does not clear it, and we never PUT `bank_branch` text (often Link — invalid value drops saves).
+      // Apply custom/statutory fields one-by-one via frappe.client.set_value
+      // (PUT /api/resource silently drops custom fields on some ERPNext versions)
       for (const [field, value] of Object.entries(statutoryPatch)) {
-        if (field === "custom_bank_branch") continue;
         const displayVal = String(value ?? "").slice(0, 60);
         console.log(`[hr:patch] set_value field="${field}" value="${displayVal}"`);
         try {
-          const rawSv = await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+          await erp.callMethod(ctx.creds, "frappe.client.set_value", {
             doctype: "Employee",
             name,
             fieldname: field,
             value,
           });
           console.log(`[hr:patch] set_value OK field="${field}"`);
-          if (field === "custom_national_id") {
-            logFrappeRpcBankDiag("set_value_custom_national_id_same_rpc_path", rawSv);
-          }
         } catch (svErr) {
           console.warn(`[hr:patch] set_value FAILED field="${field}": ${String(svErr).slice(0, 200)}`);
-        }
-      }
-
-      if (Object.prototype.hasOwnProperty.call(statutoryPatch, "custom_bank_branch")) {
-        await applyDeferredBankingOnly(ctx.creds, name, deferredBanking, bankBranchErpField);
-        try {
-          await setValueCustomBankBranchLast(ctx.creds, name, statutoryPatch.custom_bank_branch, bankBranchErpField);
-        } catch (svErr) {
-          console.warn(`[hr:patch] set_value custom_bank_branch (after banking) FAILED: ${String(svErr).slice(0, 220)}`);
         }
       }
 
       // Fetch the updated record and verify statutory fields were persisted
       console.log(`[hr:patch] fetching updated record for verification`);
       let record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-      record = await mergeEmployeeBankBranchFromGetValue(ctx.creds, name, record, bankBranchErpField);
 
       // Some ERP setups silently ignore nationality in updateDoc; ensure it persists.
       if (Object.prototype.hasOwnProperty.call(standardPatch, "nationality")) {
@@ -2030,7 +1612,6 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
               value: expectedNationality,
             });
             record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-            record = await mergeEmployeeBankBranchFromGetValue(ctx.creds, name, record, bankBranchErpField);
           } catch (svErr) {
             console.warn(`[hr:patch] nationality set_value FAILED: ${String(svErr).slice(0, 200)}`);
           }
@@ -2039,20 +1620,8 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
 
       // Second-pass: any statutory field still mismatched → retry set_value once more
       const stillMismatched = Object.entries(statutoryPatch).filter(([field, value]) => {
-        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
-        if (field === "custom_bank_branch") {
-          const saved = readEmployeeBankBranch(record, bankBranchErpField);
-          const mismatch = !bankBranchExpectedMatchesRecord(record, value, bankBranchErpField);
-          if (mismatch) {
-            console.warn(
-              `[hr:patch] MISMATCH field="${field}" saved="${saved}" (erp=${bankBranchErpField}="${String(record[bankBranchErpField] ?? "")}" custom_bank_branch="${String(record.custom_bank_branch ?? "")}" bank_branch="${String(record.bank_branch ?? "")}") expected="${expected}"`,
-            );
-          } else {
-            console.log(`[hr:patch] verified OK field="${field}" value="${saved}"`);
-          }
-          return mismatch;
-        }
         const saved = String(record[field] ?? "").trim();
+        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
         const mismatch = saved !== expected;
         if (mismatch) {
           console.warn(`[hr:patch] MISMATCH field="${field}" saved="${saved}" expected="${expected}"`);
@@ -2062,80 +1631,32 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         return mismatch;
       });
 
-      if (stillMismatched.some(([f]) => f === "custom_bank_branch")) {
-        await probeEmployeeBankBranchPersistence(ctx.creds, name, "verify_mismatch_before_retry", bankBranchErpField);
-      }
-
       if (stillMismatched.length > 0) {
         console.warn(`[hr:patch] ${stillMismatched.length} field(s) still mismatched — retrying`);
         for (const [field, value] of stillMismatched) {
           console.log(`[hr:patch] retry set_value field="${field}"`);
           try {
-            if (field === "custom_bank_branch") {
-              const rawRetry = await erp.callMethod(ctx.creds, "frappe.client.set_value", {
-                doctype: "Employee",
-                name,
-                fieldname: bankBranchErpField,
-                value,
-              });
-              logFrappeRpcBankDiag("retry_set_value_custom_bank_branch", rawRetry, bankBranchErpField);
-              console.log(`[hr:patch] retry set_value OK field="custom_bank_branch"`);
-            } else {
-              await erp.callMethod(ctx.creds, "frappe.client.set_value", {
-                doctype: "Employee",
-                name,
-                fieldname: field,
-                value,
-              });
-              console.log(`[hr:patch] retry set_value OK field="${field}"`);
-            }
+            await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+              doctype: "Employee",
+              name,
+              fieldname: field,
+              value,
+            });
+            console.log(`[hr:patch] retry set_value OK field="${field}"`);
           } catch (svErr) {
             console.warn(`[hr:patch] retry set_value FAILED field="${field}": ${String(svErr).slice(0, 200)}`);
           }
         }
-        if (
-          stillMismatched.some(([f]) => f === "custom_bank_branch") &&
-          Object.prototype.hasOwnProperty.call(statutoryPatch, "custom_bank_branch")
-        ) {
-          await applyDeferredBankingOnly(ctx.creds, name, deferredBanking, bankBranchErpField);
-          try {
-            await setValueCustomBankBranchLast(ctx.creds, name, statutoryPatch.custom_bank_branch, bankBranchErpField);
-          } catch (svErr) {
-            console.warn(`[hr:patch] retry set_value custom_bank_branch FAILED: ${String(svErr).slice(0, 220)}`);
-          }
-          try {
-            const putOnly = (await erp.updateDoc(ctx.creds, "Employee", name, {
-              [bankBranchErpField]: statutoryPatch.custom_bank_branch,
-            })) as Record<string, unknown>;
-            console.log(`[hr:patch] retry updateDoc custom_bank_branch only OK`);
-            console.warn(
-              `[hr:diag:retry_updateDoc_custom_only] returned ${bankBranchErpField}=${clipBankDiag(putOnly[bankBranchErpField], 120)} hasKey=${Object.prototype.hasOwnProperty.call(putOnly, bankBranchErpField)}`,
-            );
-          } catch (e) {
-            console.warn(`[hr:patch] retry updateDoc custom_bank_branch only: ${String(e).slice(0, 200)}`);
-          }
-        }
         console.log(`[hr:patch] re-fetching record after retry`);
         record = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-        record = await mergeEmployeeBankBranchFromGetValue(ctx.creds, name, record, bankBranchErpField);
       }
 
       // Build save/fail lists for the client
       const statutorySaved: string[] = [];
       const statutoryFailed: string[] = [];
       for (const [field, value] of Object.entries(statutoryPatch)) {
-        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
-        if (field === "custom_bank_branch") {
-          if (bankBranchExpectedMatchesRecord(record, value, bankBranchErpField)) {
-            statutorySaved.push(field);
-          } else {
-            const saved = readEmployeeBankBranch(record, bankBranchErpField);
-            statutoryFailed.push(field);
-            console.warn(`[hr:patch] FINAL MISMATCH field="${field}" saved="${saved}" expected="${expected}"`);
-          }
-          continue;
-        }
         const saved = String(record[field] ?? "").trim();
+        const expected = typeof value === "string" ? value.trim() : String(value ?? "").trim();
         if (saved === expected) {
           statutorySaved.push(field);
         } else {
@@ -2144,22 +1665,14 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      if (statutoryFailed.includes("custom_bank_branch")) {
-        await probeEmployeeBankBranchPersistence(ctx.creds, name, "after_final_mismatch", bankBranchErpField);
-      }
-
       console.log(`[hr:patch] done — standard_saved=${standardFields.length} statutory_saved=${statutorySaved.length} statutory_failed=${statutoryFailed.length}`);
 
       if (String(record.company) !== ctx.company) {
         return reply.status(403).send({ error: "Employee not in your Company" });
       }
       const { company: _drop, ...data } = record;
-      const dataOut = data as Record<string, unknown>;
-      const bb = readEmployeeBankBranch(dataOut, bankBranchErpField);
-      if (bb) dataOut.custom_bank_branch = bb;
-
       return {
-        data: dataOut,
+        data,
         _saved_fields: standardFields,
         _statutory_saved: statutorySaved,
         _statutory_failed: statutoryFailed,

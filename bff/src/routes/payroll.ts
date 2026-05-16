@@ -32,6 +32,148 @@ function parseDate(v: unknown): string {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : "";
 }
 
+function normalizeCompanyName(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function sameCompany(a: unknown, b: unknown): boolean {
+  const left = normalizeCompanyName(a);
+  const right = normalizeCompanyName(b);
+  return !!left && !!right && left === right;
+}
+
+/** Human-readable Frappe error (417 bodies hide under `message`, not `Upstream HTTP 417`). */
+function formatErpError(e: unknown): string {
+  if (!(e instanceof ErpError)) return e instanceof Error ? e.message : String(e);
+  const parsed = parseFrappeErrorBody(e.body);
+  let blob = "";
+  if (e.body != null) {
+    try {
+      blob = typeof e.body === "string" ? e.body.slice(0, 900) : JSON.stringify(e.body).slice(0, 900);
+    } catch {
+      blob = "";
+    }
+  }
+  return [parsed, e.message, blob].filter(Boolean).join(" | ").slice(0, 1500);
+}
+
+function extractInsertDocName(raw: unknown): string {
+  if (raw == null || typeof raw !== "object") return "";
+  const o = raw as Record<string, unknown>;
+  const msg = o.message;
+  if (msg && typeof msg === "object") {
+    const n = String((msg as Record<string, unknown>).name ?? "").trim();
+    if (n) return n;
+  }
+  const n2 = String(o.name ?? "").trim();
+  return n2;
+}
+
+async function readSalaryComponentType(
+  creds: ErpCredentials,
+  componentName: string,
+): Promise<"Earning" | "Deduction" | null> {
+  try {
+    const doc = (await erp.getDoc(creds, "Salary Component", componentName)) as Record<string, unknown>;
+    const t = String(doc.type ?? "").trim();
+    if (t === "Earning" || t === "Deduction") return t;
+  } catch {
+    /* missing or permission */
+  }
+  return null;
+}
+
+function extractUnsupportedQueryField(error: unknown): string | null {
+  if (!(error instanceof ErpError)) return null;
+  let bodyText = "";
+  try {
+    bodyText = typeof error.body === "string" ? error.body : JSON.stringify(error.body ?? "");
+  } catch {
+    bodyText = "";
+  }
+  const parsed = parseFrappeErrorBody(error.body) ?? "";
+  const combined = `${error.message} ${parsed} ${bodyText}`;
+  const match = combined.match(/field not permitted in query:\s*([a-zA-Z0-9_]+)/i);
+  return match?.[1] ? String(match[1]).trim() : null;
+}
+
+async function erpGetListWithFieldFallback<T = Record<string, unknown>>(
+  creds: ErpCredentials,
+  doctype: string,
+  opts: Omit<Parameters<typeof erp.getList>[2], "fields">,
+  requestedFields: string[],
+): Promise<T[]> {
+  let fields = [...requestedFields];
+  while (true) {
+    try {
+      return (await erp.getList(creds, doctype, {
+        ...opts,
+        fields,
+      })) as T[];
+    } catch (error) {
+      const unsupportedField = extractUnsupportedQueryField(error);
+      if (!unsupportedField || !fields.includes(unsupportedField) || fields.length <= 1) {
+        throw error;
+      }
+      fields = fields.filter((field) => field !== unsupportedField);
+      console.warn(
+        `[payroll] Employee query dropped unsupported field "${unsupportedField}" on ${doctype}; retrying with ${fields.length} field(s)`,
+      );
+    }
+  }
+}
+
+const employeeCustomFieldCache = new Map<string, { exp: number; fields: Set<string> }>();
+const EMPLOYEE_CUSTOM_FIELD_CACHE_MS = 10 * 60_000;
+
+async function getInstalledEmployeeCustomFields(
+  creds: ErpCredentials,
+  requestedFields: string[],
+): Promise<Set<string>> {
+  const customFields = requestedFields.filter((field) => field.startsWith("custom_"));
+  if (customFields.length === 0) return new Set<string>();
+
+  const cacheKey = creds.apiKey;
+  const cached = employeeCustomFieldCache.get(cacheKey);
+  if (cached && cached.exp > Date.now()) {
+    return new Set(customFields.filter((field) => cached.fields.has(field)));
+  }
+
+  const rows = (await erp.getList(creds, "Custom Field", {
+    filters: [
+      ["dt", "=", "Employee"],
+      ["fieldname", "in", customFields],
+    ],
+    fields: ["fieldname"],
+    limit_page_length: Math.max(50, customFields.length + 10),
+  })) as Array<{ fieldname?: string }>;
+
+  const installed = new Set(
+    rows
+      .map((row) => String(row.fieldname ?? "").trim())
+      .filter(Boolean),
+  );
+
+  employeeCustomFieldCache.set(cacheKey, {
+    exp: Date.now() + EMPLOYEE_CUSTOM_FIELD_CACHE_MS,
+    fields: installed,
+  });
+
+  return installed;
+}
+
+async function resolvePayrollTeamEmployeeFields(
+  creds: ErpCredentials,
+): Promise<string[]> {
+  const installedCustomFields = await getInstalledEmployeeCustomFields(creds, [...PAYROLL_TEAM_EMPLOYEE_FIELDS]);
+  return PAYROLL_TEAM_EMPLOYEE_FIELDS.filter(
+    (field) => !field.startsWith("custom_") || installedCustomFields.has(field),
+  );
+}
+
 // ── Kenya Salary Structure Constants ─────────────────────────────────────────
 
 const KE_STRUCTURE_SUFFIX = "Kenya Standard Payroll";
@@ -73,6 +215,37 @@ const PAYE_FORMULA =
  */
 const NSSF_FORMULA = "(round(gross_pay * 0.06, 2) if gross_pay < 108000 else 6480)";
 
+const PAYROLL_TEAM_EMPLOYEE_FIELDS = [
+  "name",
+  "employee_name",
+  "designation",
+  "department",
+  "date_of_joining",
+  "employment_type",
+  "bank_name",
+  "bank_ac_no",
+  "custom_bank_branch",
+  "custom_nssf_number",
+  "custom_national_id",
+  "custom_kra_pin",
+  "custom_exemption_certificate_number",
+  "custom_p10_car_section_ref",
+  "custom_car_registration",
+  "custom_car_make",
+  "custom_car_body_type",
+  "custom_car_cc_rating",
+  "custom_car_cost_type",
+  "custom_car_owned_cost",
+  "custom_car_hire_monthly",
+  "custom_car_benefit_override",
+] as const;
+
+/**
+ * NSSF Employer contribution — identical formula to employee side.
+ * Marked statistical_component=1 in the structure so ERPNext tracks and reports
+ * it without deducting it from the employee's net pay.
+ */
+const NSSF_EMPLOYER_FORMULA = NSSF_FORMULA;
 /** SHIF (Social Health Insurance Fund): 2.75% of gross */
 const SHIF_FORMULA = "round(gross_pay * 0.0275, 2)";
 
@@ -101,8 +274,19 @@ async function ensureSalaryComponent(
   opts: { depends_on_payment_days?: 0 | 1 } = {}
 ): Promise<void> {
   try {
-    await erp.getDoc(creds, "Salary Component", name);
-    return; // already exists — trust ERP's version
+    const existing = (await erp.getDoc(creds, "Salary Component", name)) as Record<string, unknown>;
+    const existingType = String(existing.type ?? "").trim();
+    if (existingType && existingType !== type) {
+      console.warn(
+        `[payroll] Salary Component "${name}" exists in ERP as ${existingType}; Pay Hub expects ${type}. Syncing type…`,
+      );
+      try {
+        await erp.updateDoc(creds, "Salary Component", name, { type });
+      } catch (syncErr) {
+        console.warn(`[payroll] Salary Component "${name}" type sync failed: ${formatErpError(syncErr)}`);
+      }
+    }
+    return;
   } catch (e) {
     if (!(e instanceof ErpError) || e.status !== 404) throw e;
   }
@@ -145,8 +329,11 @@ async function submitWithRetry(
   name: string,
   maxAttempts = 4,
   /** Pass the already-fetched/inserted doc to skip the getDoc on the first attempt. */
-  initialDoc?: Record<string, unknown>
+  initialDoc?: Record<string, unknown>,
+  /** Omit per-attempt logs (used for high-churn SSA updates). Failures still log. */
+  opts?: { quiet?: boolean },
 ): Promise<void> {
+  const quiet = opts?.quiet === true;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Use the caller-supplied doc on the first attempt to avoid a redundant getDoc
     // round-trip (~300–600 ms). Re-fetch on retries to capture the latest modified.
@@ -155,13 +342,15 @@ async function submitWithRetry(
       : await erp.getDoc(creds, doctype, name);
     const modified = current.modified;
     const docstatus = Number(current.docstatus);
-    console.log(
-      `[payroll] submit attempt ${attempt + 1}/${maxAttempts} — ${doctype} "${name}" ` +
-      `docstatus=${docstatus} modified=${modified}`
-    );
+    if (!quiet) {
+      console.log(
+        `[payroll] submit attempt ${attempt + 1}/${maxAttempts} — ${doctype} "${name}" ` +
+          `docstatus=${docstatus} modified=${modified}`,
+      );
+    }
 
     if (docstatus === 1) {
-      console.log(`[payroll] ${doctype} "${name}" is already submitted — skipping`);
+      if (!quiet) console.log(`[payroll] ${doctype} "${name}" is already submitted — skipping`);
       return;
     }
 
@@ -172,7 +361,7 @@ async function submitWithRetry(
       await erp.callMethod(creds, "frappe.client.submit", {
         doc: current,
       });
-      console.log(`[payroll] ${doctype} "${name}" submitted OK on attempt ${attempt + 1}`);
+      if (!quiet) console.log(`[payroll] ${doctype} "${name}" submitted OK on attempt ${attempt + 1}`);
       return;
     } catch (e) {
       const is417 = e instanceof ErpError && e.status === 417;
@@ -181,11 +370,11 @@ async function submitWithRetry(
         : String(e);
       console.log(
         `[payroll] submit attempt ${attempt + 1} failed` +
-        ` (status=${e instanceof ErpError ? e.status : "?"} is417=${is417}): ${bodySnippet}`
+        ` (status=${e instanceof ErpError ? e.status : "?"} is417=${is417}): ${bodySnippet}`,
       );
       if (is417 && attempt < maxAttempts - 1) {
         const delay = 500 * (attempt + 1); // 500 ms, 1 s, 1.5 s
-        console.log(`[payroll] waiting ${delay} ms before retry…`);
+        if (!quiet) console.log(`[payroll] waiting ${delay} ms before retry…`);
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
@@ -332,9 +521,12 @@ async function ensureKenyaStructure(
   try {
     const existing = await erp.getDoc(creds, "Salary Structure", structName);
     const ds = Number(existing.docstatus);
-    console.log(
-      `[payroll] Salary Structure "${structName}" exists: docstatus=${ds} modified=${existing.modified}`
-    );
+    // Routine submitted structures are noisy on every assign; log only non-submitted states.
+    if (ds !== 1) {
+      console.log(
+        `[payroll] Salary Structure "${structName}" exists: docstatus=${ds} modified=${existing.modified}`,
+      );
+    }
 
     if (ds === 1) {
       // Submitted — but check if formulas use max()/min() which Frappe's sandbox
@@ -654,6 +846,7 @@ async function upsertSalaryStructureAssignment(
   }
 ): Promise<void> {
   const { employeeId, structName, company, from_date, base } = opts;
+  let replacedSubmitted = false;
 
   // Check for existing assignment on the same date (any docstatus)
   const existing = await erp.getList(creds, "Salary Structure Assignment", {
@@ -670,7 +863,7 @@ async function upsertSalaryStructureAssignment(
 
     if (ds === 1) {
       // Already submitted — amend isn't needed; cancel + resubmit to change base.
-      console.log(`[payroll] Assignment ${assignName} already submitted — cancel/resubmit to update`);
+      replacedSubmitted = true;
       await erp.callMethod(creds, "frappe.client.cancel", { doctype: "Salary Structure Assignment", name: assignName });
       await erp.deleteDoc(creds, "Salary Structure Assignment", assignName);
       assignName = ""; // fall through to fresh insert below
@@ -714,9 +907,11 @@ async function upsertSalaryStructureAssignment(
   }
 
   // Submit so Frappe's payroll query (which filters on docstatus=1) can find it
-  console.log(`[payroll] Submitting assignment ${assignName}`);
-  await submitWithRetry(creds, "Salary Structure Assignment", assignName, 4, insertedDoc);
-  console.log(`[payroll] Assignment ${assignName} submitted`);
+  await submitWithRetry(creds, "Salary Structure Assignment", assignName, 4, insertedDoc, { quiet: true });
+  console.log(
+    `[payroll] SSA ${assignName} submitted for ${employeeId} from=${from_date} base=${base}` +
+      (replacedSubmitted ? " (replaced prior submitted row)" : ""),
+  );
 }
 
 /**
@@ -1017,6 +1212,165 @@ async function upsertRecurringEarningAllowance(
         if (!String(row.to_date ?? "").trim()) {
           try {
             await erp.callMethod(creds, "frappe.client.set_value", {
+              doctype: "Additional Salary",
+              name: row.name,
+              fieldname: "to_date",
+              value: "2099-12-31",
+            });
+          } catch {
+            await erp.updateDoc(creds, "Additional Salary", row.name, { to_date: "2099-12-31" }).catch(() => {});
+          }
+        }
+        await erp.callMethod(creds, "frappe.client.cancel", { doctype: "Additional Salary", name: row.name });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+    } catch (e) {
+      console.log(`[payroll] Could not remove ${componentName} record ${row.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (amount <= 0) return;
+
+  await erp.callMethod(creds, "frappe.client.insert", {
+    doc: {
+      doctype: "Additional Salary",
+      employee: employeeId,
+      salary_component: componentName,
+      type: "Earning",
+      amount,
+      company,
+      is_recurring: 1,
+      overwrite_salary_structure_amount: 0,
+      from_date,
+      currency: "KES",
+    },
+  });
+}
+
+async function upsertCustomAdditionalSalary(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  componentName: string,
+  type: "Earning" | "Deduction",
+  payroll_date: string,
+  amount: number,
+): Promise<void> {
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters: [
+      ["employee", "=", employeeId],
+      ["salary_component", "=", componentName],
+      ["payroll_date", "=", payroll_date],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name", "docstatus"],
+    limit_page_length: 10,
+  })) as Array<{ name: string; docstatus: number }>;
+
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        await erp.callMethod(creds, "frappe.client.cancel", {
+          doctype: "Additional Salary",
+          name: row.name,
+        });
+      }
+      await erp.deleteDoc(creds, "Additional Salary", row.name);
+      console.log(`[payroll] Removed ${componentName} Additional Salary ${row.name} for ${employeeId}`);
+    } catch (e) {
+      console.log(
+        `[payroll] Could not remove ${componentName} record ${row.name}: ` +
+        (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
+
+  if (amount <= 0) {
+    console.log(`[payroll] ${componentName} cleared for ${employeeId} on ${payroll_date}`);
+    return;
+  }
+
+  const resolvedType = (await readSalaryComponentType(creds, componentName)) ?? type;
+  if (resolvedType !== type) {
+    console.warn(
+      `[payroll] Additional Salary "${componentName}" uses ERP Salary Component type ${resolvedType} ` +
+      `(Pay Hub sent ${type}) — aligning Additional Salary row.`,
+    );
+  }
+
+  const doc = {
+    doctype: "Additional Salary",
+    employee: employeeId,
+    salary_component: componentName,
+    type: resolvedType,
+    amount,
+    company,
+    is_recurring: 0,
+    payroll_date,
+    currency: "KES",
+  };
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  let rawInsert: unknown;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      rawInsert = await erp.callMethod(creds, "frappe.client.insert", { doc });
+      break;
+    } catch (e) {
+      const retry = e instanceof ErpError && e.status === 417 && attempt < 4;
+      if (!retry) throw e;
+      await sleep(100 * attempt);
+    }
+  }
+
+  const newName = extractInsertDocName(rawInsert);
+  const insertedDoc =
+    rawInsert && typeof rawInsert === "object"
+      ? ((rawInsert as Record<string, unknown>).message as Record<string, unknown> | undefined)
+      : undefined;
+  const docstatus = Number(insertedDoc?.docstatus ?? 0);
+  if (newName && docstatus === 0) {
+    try {
+      await erp.submitDoc(creds, "Additional Salary", newName);
+    } catch (subErr) {
+      console.warn(
+        `[payroll] Additional Salary "${newName}" (${componentName}) created draft but submit failed: ` +
+        formatErpError(subErr),
+      );
+    }
+  }
+
+  console.log(`[payroll] Set ${componentName} (${resolvedType}) KES ${amount} on ${payroll_date} for ${employeeId}`);
+}
+
+/**
+ * Recurring custom deduction — same pattern as loan deduction: is_recurring:1, from_date..to_date.
+ * Only targets Additional Salary rows for this component + employee with recurring flag (best-effort list).
+ */
+async function upsertRecurringCustomDeductionAdditionalSalary(
+  creds: ErpCredentials,
+  employeeId: string,
+  company: string,
+  componentName: string,
+  from_date: string,
+  amount: number,
+): Promise<void> {
+  const existing = (await erp.getList(creds, "Additional Salary", {
+    filters: [
+      ["employee", "=", employeeId],
+      ["salary_component", "=", componentName],
+      ["docstatus", "!=", 2],
+    ],
+    fields: ["name", "docstatus", "to_date"],
+    limit_page_length: 20,
+  })) as Array<{ name: string; docstatus: number; to_date?: string }>;
+
+  for (const row of existing) {
+    try {
+      if (Number(row.docstatus) === 1) {
+        if (!String(row.to_date ?? "").trim()) {
+          try {
+            await erp.callMethod(creds, "frappe.client.set_value", {
               doctype: "Additional Salary", name: row.name, fieldname: "to_date", value: "2099-12-31",
             });
           } catch {
@@ -1050,6 +1404,43 @@ async function upsertRecurringEarningAllowance(
   console.log(`[payroll] Set ${componentName} KES ${amount}/mo from ${from_date} for ${employeeId}`);
 }
 
+/**
+ * Latest Salary Structure Assignment per employee (`from_date` desc).
+ * Must page through SSA — the first 500 rows may only cover a few employees if history is large.
+ */
+async function fetchLatestSalaryAssignmentPerEmployee(
+  creds: ErpCredentials,
+  company: string,
+): Promise<Map<string, Record<string, unknown>>> {
+  const latestAssignment = new Map<string, Record<string, unknown>>();
+  let limitStart = 0;
+  const pageLen = 500;
+  for (;;) {
+    // Only submitted SSAs — cancelled/draft rows must not win "first seen per employee"
+    // when paging globally by from_date (would hide the live salary on the salary-rates page).
+    const rows = await erp.getList(creds, "Salary Structure Assignment", {
+      filters: [
+        ["company", "=", company],
+        ["docstatus", "=", 1],
+      ],
+      fields: ["employee", "base", "from_date", "salary_structure"],
+      order_by: "from_date desc, modified desc",
+      limit_start: limitStart,
+      limit_page_length: pageLen,
+    });
+    if (!rows.length) break;
+    for (const a of rows) {
+      const r = a as Record<string, unknown>;
+      const emp = String(r.employee ?? "").trim();
+      if (emp && !latestAssignment.has(emp)) latestAssignment.set(emp, r);
+    }
+    if (rows.length < pageLen) break;
+    limitStart += pageLen;
+    if (limitStart > 200_000) break;
+  }
+  return latestAssignment;
+}
+
 // ── Route Plugin ──────────────────────────────────────────────────────────────
 
 export const payrollRoutes: FastifyPluginAsync = async (app) => {
@@ -1072,7 +1463,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
     if (ctx.canSubmitOnBehalf) {
       if (!qEmp) return null;
       const empDoc = await erp.getDoc(ctx.creds, "Employee", qEmp);
-      if (String(empDoc.company) !== ctx.company) return null;
+      if (!sameCompany(empDoc.company, ctx.company)) return null;
       return qEmp;
     }
     return resolveSelfEmployee(ctx);
@@ -1145,20 +1536,175 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
     ];
 
     try {
-      const [employees, assignments, helbRows, overtimeRows, countResult] = await Promise.all([
-        erp.getList(ctx.creds, "Employee", {
+      if (withSalaryOnly) {
+        const payrollTeamEmployeeFields = await resolvePayrollTeamEmployeeFields(ctx.creds);
+        // Only Active employees with a latest Salary Structure Assignment (skip "no base" fetches for lists like Gross Report).
+        const [latestAssignment, helbRows, overtimeRows, activeCountRes] = await Promise.all([
+          fetchLatestSalaryAssignmentPerEmployee(ctx.creds, ctx.company),
+          erp.getList(ctx.creds, "Additional Salary", {
+            filters: [
+              ["company", "=", ctx.company],
+              ["salary_component", "=", "HELB"],
+              ["docstatus", "!=", 2],
+            ],
+            fields: ["employee", "amount"],
+            order_by: "modified desc",
+            limit_page_length: 1000,
+          }),
+          erp.getList(ctx.creds, "Additional Salary", {
+            filters: [
+              ["company", "=", ctx.company],
+              ["salary_component", "=", "Overtime Pay"],
+              ["docstatus", "!=", 2],
+            ],
+            fields: ["employee", "amount", "payroll_date"],
+            order_by: "payroll_date desc, modified desc",
+            limit_page_length: 1000,
+          }),
+          erp
+            .callMethod(ctx.creds, "frappe.client.get_count", {
+              doctype: "Employee",
+              filters: JSON.stringify(empFilters),
+              debug: false,
+            })
+            .catch(() => null),
+        ]);
+
+        const activeEmployeeCount = Number(
+          (activeCountRes as { message?: number } | null)?.message ?? 0
+        );
+
+        const salaryNames = Array.from(latestAssignment.keys());
+        if (salaryNames.length === 0) {
+          return {
+            data: [],
+            total: 0,
+            page,
+            page_size,
+            meta: {
+              active_employee_count: activeEmployeeCount,
+              with_salary_count: 0,
+              pending_salary: Math.max(0, activeEmployeeCount),
+            },
+          };
+        }
+
+        const empWithSalaryFilters: unknown[] = [
+          ["company", "=", ctx.company],
+          ["status", "=", "Active"],
+          ["name", "in", salaryNames],
+        ];
+
+        const listOpts: Parameters<typeof erp.getList>[2] = {
+          filters: empWithSalaryFilters,
+          fields: payrollTeamEmployeeFields,
+          order_by: "date_of_joining desc, name desc",
+        };
+        if (or_filters) listOpts.or_filters = or_filters;
+
+        const [countUnflRows, countFlRows, employees] = or_filters
+          ? await Promise.all([
+              erp.getList(ctx.creds, "Employee", {
+                filters: empWithSalaryFilters,
+                fields: ["name"],
+                limit_start: 0,
+                limit_page_length: 0,
+              }),
+              erp.getList(ctx.creds, "Employee", {
+                ...listOpts,
+                fields: ["name"],
+                limit_start: 0,
+                limit_page_length: 0,
+              }),
+              erpGetListWithFieldFallback(ctx.creds, "Employee", {
+                ...listOpts,
+                limit_start,
+                limit_page_length: page_size,
+              }, payrollTeamEmployeeFields),
+            ])
+          : await (async () => {
+              const c = await erp.getList(ctx.creds, "Employee", {
+                filters: empWithSalaryFilters,
+                fields: ["name"],
+                limit_start: 0,
+                limit_page_length: 0,
+              });
+              return [
+                c,
+                c,
+                await erpGetListWithFieldFallback(ctx.creds, "Employee", {
+                  ...listOpts,
+                  limit_start,
+                  limit_page_length: page_size,
+                }, payrollTeamEmployeeFields),
+              ] as [unknown, unknown, unknown];
+            })();
+
+        const withSalaryUnfiltered = Array.isArray(countUnflRows) ? countUnflRows.length : 0;
+        const total = Array.isArray(countFlRows) ? countFlRows.length : 0;
+
+        const helbByEmployee = new Map<string, number>();
+        for (const row of helbRows as Record<string, unknown>[]) {
+          const emp = String(row.employee ?? "");
+          if (!emp || helbByEmployee.has(emp)) continue;
+          const amount = Number(row.amount ?? 0);
+          helbByEmployee.set(emp, Number.isFinite(amount) ? amount : 0);
+        }
+        const overtimeByEmployee = new Map<string, number>();
+        for (const row of overtimeRows as Record<string, unknown>[]) {
+          const emp = String(row.employee ?? "");
+          if (!emp || overtimeByEmployee.has(emp)) continue;
+          const amount = Number(row.amount ?? 0);
+          if (!Number.isFinite(amount) || amount <= 0) {
+            overtimeByEmployee.set(emp, 0);
+            continue;
+          }
+          const asgn = latestAssignment.get(emp);
+          const base = Number(asgn?.base ?? 0);
+          const hourly = base > 0 ? base / 22 / 8 : 0;
+          const estimatedHours = hourly > 0 ? amount / (hourly * 1.5) : 0;
+          overtimeByEmployee.set(emp, Math.max(0, Math.round(estimatedHours * 100) / 100));
+        }
+
+        const kenyaStructW = kenyaStructureName(ctx.company);
+        const data = (employees as Record<string, unknown>[]).map((emp) => {
+          const employeeId = String(emp.name ?? "");
+          const asgn = latestAssignment.get(employeeId);
+          return {
+            ...emp,
+            base_salary: asgn ? Number(asgn.base) : null,
+            salary_structure: asgn ? String(asgn.salary_structure ?? "") : null,
+            on_kenya_structure: asgn
+              ? String(asgn.salary_structure ?? "") === kenyaStructW
+              : false,
+            helb_monthly: helbByEmployee.get(employeeId) ?? 0,
+            overtime_hours: overtimeByEmployee.get(employeeId) ?? 0,
+          };
+        });
+
+        return {
+          data,
+          total,
+          page,
+          page_size,
+          meta: {
+            active_employee_count: activeEmployeeCount,
+            with_salary_count: withSalaryUnfiltered,
+            pending_salary: Math.max(0, activeEmployeeCount - withSalaryUnfiltered),
+          },
+        };
+      }
+
+      const payrollTeamEmployeeFields = await resolvePayrollTeamEmployeeFields(ctx.creds);
+      const [employees, latestAssignment, helbRows, overtimeRows, countResult] = await Promise.all([
+        erpGetListWithFieldFallback(ctx.creds, "Employee", {
           filters: empFilters,
-          fields: ["name", "employee_name", "designation", "department", "date_of_joining"],
+          ...(or_filters ? { or_filters } : {}),
           order_by: "date_of_joining desc, name desc",
           limit_start,
           limit_page_length: page_size,
-        }),
-        erp.getList(ctx.creds, "Salary Structure Assignment", {
-          filters: [["company", "=", ctx.company]],
-          fields: ["employee", "base", "from_date", "salary_structure"],
-          order_by: "from_date desc",
-          limit_page_length: 500,
-        }),
+        }, payrollTeamEmployeeFields),
+        fetchLatestSalaryAssignmentPerEmployee(ctx.creds, ctx.company),
         erp.getList(ctx.creds, "Additional Salary", {
           filters: [
             ["company", "=", ctx.company],
@@ -1190,13 +1736,6 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         (countResult as { message?: number } | null)?.message ?? employees.length + limit_start
       );
 
-      // Latest assignment per employee (list is ordered desc, first hit wins)
-      const latestAssignment = new Map<string, Record<string, unknown>>();
-      for (const a of assignments) {
-        const r = a as Record<string, unknown>;
-        const emp = String(r.employee ?? "");
-        if (!latestAssignment.has(emp)) latestAssignment.set(emp, r);
-      }
       const helbByEmployee = new Map<string, number>();
       for (const row of helbRows as Record<string, unknown>[]) {
         const emp = String(row.employee ?? "");
@@ -1346,6 +1885,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const gross_salary = Number(body.gross_salary);
+    const allowCompanyRehome = body.allow_company_rehome === true;
     const from_date =
       /^\d{4}-\d{2}-\d{2}$/.test(String(body.from_date ?? ""))
         ? String(body.from_date)
@@ -1372,8 +1912,21 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         ensureKenyaStructure(ctx.creds, ctx.company),
       ]);
 
-      if (String(empDoc.company ?? "") !== ctx.company)
-        return reply.status(403).send({ error: "Employee not in your Company" });
+      if (!sameCompany(empDoc.company, ctx.company)) {
+        if (!allowCompanyRehome) {
+          return reply.status(403).send({ error: "Employee not in your Company" });
+        }
+        console.warn(
+          `[payroll] Rehoming employee ${employeeId} company from "${String(empDoc.company ?? "")}" to "${ctx.company}" before salary assignment`,
+        );
+        await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+          doctype: "Employee",
+          name: employeeId,
+          fieldname: "company",
+          value: ctx.company,
+        });
+        empDoc.company = ctx.company;
+      }
 
       // ── Step 2: fix department if needed (single getList — no wasted 404) ──
       // Frappe HRMS validates the department link when creating an SSA. The
@@ -1745,7 +2298,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
     try {
       // Verify employee belongs to this company
       const empDoc = await erp.getDoc(ctx.creds, "Employee", employeeId);
-      if (String(empDoc.company ?? "") !== ctx.company)
+      if (!sameCompany(empDoc.company, ctx.company))
         return reply.status(403).send({ error: "Employee not in your Company" });
 
       await upsertHelbAdditionalSalary(ctx.creds, employeeId, ctx.company, from_date, helb_monthly);
@@ -1799,7 +2352,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         }),
       ]);
 
-      if (String(empDoc.company ?? "") !== ctx.company)
+      if (!sameCompany(empDoc.company, ctx.company))
         return reply.status(403).send({ error: "Employee not in your Company" });
 
       // Use caller-supplied rate, or derive from latest base salary assignment
@@ -1838,6 +2391,24 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
     if (!end_date) return reply.status(400).send({ error: "end_date required (YYYY-MM-DD)" });
 
     const employeeFilter = String(body.employee ?? "").trim();
+    const requestedEmployeeIds = Array.isArray(body.employee_ids)
+      ? Array.from(
+          new Set(
+            (body.employee_ids as unknown[])
+              .map((value) => String(value ?? "").trim())
+              .filter(Boolean),
+          ),
+        )
+      : [];
+    // When true: cancel + delete existing submitted slips and recreate them fresh with updated inputs
+    const forceRegenerate = body.force_regenerate === true;
+    // Per-employee custom allowances and deductions injected by the Hub server from the DB
+    const customPerEmployee = (body.custom_per_employee ?? {}) as Record<string, {
+      allowances?: Record<string, number>;
+      deductions?: Record<string, number>;
+      /** Custom deduction names that use recurring Additional Salary (is_recurring:1). */
+      deductions_recurring?: Record<string, number>;
+    }>;
 
     try {
       const runYear = new Date(start_date).getFullYear();
@@ -1895,11 +2466,59 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
 
       // Deduplicate by employee (an employee may have multiple assignments; use the latest)
       const seen = new Set<string>();
-      const toProcess = (assignmentRows as Record<string, unknown>[]).filter((a) => {
+      const dedupedAssignments = (assignmentRows as Record<string, unknown>[]).filter((a) => {
         const id = String(a.employee ?? "");
         if (seen.has(id)) return false;
         seen.add(id);
         return true;
+      });
+
+      const lifecycleFilteredAssignments =
+        requestedEmployeeIds.length > 0
+          ? dedupedAssignments.filter((assignment) =>
+              requestedEmployeeIds.includes(String(assignment.employee ?? "").trim()),
+            )
+          : dedupedAssignments;
+
+      if (dedupedAssignments.length > 0 && lifecycleFilteredAssignments.length === 0) {
+        return reply.status(409).send({
+          error: "No active or probation employees are eligible for this payroll run.",
+        });
+      }
+
+      const dedupedEmployeeIds = lifecycleFilteredAssignments
+        .map((a) => String(a.employee ?? "").trim())
+        .filter(Boolean);
+      const activeEmployeeIds = new Set<string>();
+      for (let i = 0; i < dedupedEmployeeIds.length; i += 200) {
+        const chunk = dedupedEmployeeIds.slice(i, i + 200);
+        if (chunk.length === 0) continue;
+        const activeRows = await erp.getList(ctx.creds, "Employee", {
+          filters: [
+            ["company", "=", ctx.company],
+            ["status", "=", "Active"],
+            ["name", "in", chunk],
+          ],
+          fields: ["name"],
+          limit_page_length: chunk.length + 10,
+        });
+        for (const row of activeRows as Record<string, unknown>[]) {
+          const id = String(row.name ?? "").trim();
+          if (id) activeEmployeeIds.add(id);
+        }
+      }
+
+      const inactiveAssignments = lifecycleFilteredAssignments.filter((a) => {
+        const id = String(a.employee ?? "").trim();
+        return !!id && !activeEmployeeIds.has(id);
+      });
+      if (inactiveAssignments.length > 0) {
+        console.log(`[payroll] Skipping ${inactiveAssignments.length} inactive employee(s) during payroll run`);
+      }
+
+      const toProcess = lifecycleFilteredAssignments.filter((a) => {
+        const id = String(a.employee ?? "").trim();
+        return !!id && activeEmployeeIds.has(id);
       });
 
       // Map employee → existing slip info (name + docstatus) so we can submit drafts
@@ -1918,6 +2537,13 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         skip_reason?: string;
         error?: string;
       };
+
+      const skippedInactiveResults: RunResult[] = inactiveAssignments.map((emp) => ({
+        employee: String(emp.employee ?? emp.name ?? ""),
+        employee_name: String(emp.employee_name ?? emp.employee ?? emp.name ?? ""),
+        skipped: true,
+        skip_reason: "inactive_employee",
+      }));
 
       // Auto-submit any draft assignments (docstatus=0) so Frappe's payroll query
       // (which filters WHERE ssa.docstatus = 1) can find them.
@@ -1944,7 +2570,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
       // cutting total time to ~(ceil(n/6) × 4 s) instead of n × 4 s.
       const CONCURRENCY = 6;
       const queue = [...toProcess];
-      const results: RunResult[] = [];
+      const results: RunResult[] = [...skippedInactiveResults];
 
       while (queue.length > 0) {
         const batch = queue.splice(0, CONCURRENCY);
@@ -1972,6 +2598,46 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
             }
 
             try {
+              // Upsert custom allowances and deductions as Additional Salary records
+              // BEFORE creating the slip so ERPNext picks them up automatically.
+              const empCustom = customPerEmployee[employeeId];
+              if (empCustom) {
+                for (const [compName, amount] of Object.entries(empCustom.allowances ?? {})) {
+                  try {
+                    await upsertCustomAdditionalSalary(ctx.creds, employeeId, ctx.company, compName, "Earning", end_date, amount);
+                  } catch (e) {
+                    console.log(
+                      `[payroll] Custom allowance "${compName}" for ${employeeId}: ${formatErpError(e)}`,
+                    );
+                  }
+                }
+                for (const [compName, amount] of Object.entries(empCustom.deductions ?? {})) {
+                  try {
+                    await upsertCustomAdditionalSalary(ctx.creds, employeeId, ctx.company, compName, "Deduction", end_date, amount);
+                  } catch (e) {
+                    console.log(
+                      `[payroll] Custom deduction "${compName}" for ${employeeId}: ${formatErpError(e)}`,
+                    );
+                  }
+                }
+                for (const [compName, amount] of Object.entries(empCustom.deductions_recurring ?? {})) {
+                  try {
+                    await upsertRecurringCustomDeductionAdditionalSalary(
+                      ctx.creds,
+                      employeeId,
+                      ctx.company,
+                      compName,
+                      start_date,
+                      amount,
+                    );
+                  } catch (e) {
+                    console.log(
+                      `[payroll] Recurring custom deduction "${compName}" for ${employeeId}: ` +
+                      (e instanceof Error ? e.message : String(e)),
+                    );
+                  }
+                }
+              }
               // If the employee's assignment starts after the period start (mid-month
               // joiner), use their assignment from_date so Frappe can find the structure.
               const assignmentFrom = String(emp.from_date ?? "");
@@ -2156,7 +2822,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
 
     try {
       const doc = await erp.getDoc(ctx.creds, "Salary Slip", name);
-      if (String(doc.company ?? "") !== ctx.company) {
+      if (!sameCompany(doc.company, ctx.company)) {
         return reply.status(403).send({ error: "Salary Slip not in your Company" });
       }
 
@@ -2230,7 +2896,7 @@ export const payrollRoutes: FastifyPluginAsync = async (app) => {
         }
         throw e;
       }
-      if (String(empDoc.company ?? "") !== company) {
+      if (!sameCompany(empDoc.company, company)) {
         return reply.status(400).send({ error: `Employee "${employeeId}" does not belong to company "${company}"` });
       }
       if (String(empDoc.status ?? "").toLowerCase() !== "active") {

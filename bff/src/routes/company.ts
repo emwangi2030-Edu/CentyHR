@@ -2,12 +2,6 @@ import type { FastifyPluginAsync } from "fastify";
 import { defaultClient, ErpError } from "../erpnext/client.js";
 import { publicErpFailure } from "../erpnext/frappeResponse.js";
 import { resolveHrContext, HttpError } from "../context/resolveHrContext.js";
-import {
-  normalizePerformanceMethodology,
-  readPerformanceMethodology,
-  writePerformanceMethodology,
-  type PerformanceMethodology,
-} from "../lib/companyPerformanceMethodology.js";
 const erp = defaultClient();
 
 function abbrFromCompanyName(name: string): string {
@@ -19,6 +13,61 @@ function abbrFromCompanyName(name: string): string {
 }
 
 export const companyRoutes: FastifyPluginAsync = async (app) => {
+  /**
+   * Read-only mirror of ERPNext `Company` for Pay Hub (country + canonical doc name).
+   * Same bridge auth as other HR routes; any authenticated tenant user may call.
+   */
+  app.get("/v1/company/mirror", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const key = String(ctx.company || "").trim();
+    if (!key) return reply.status(400).send({ error: "Missing company context" });
+
+    let doc: Record<string, unknown> = {};
+    try {
+      doc = await erp.getDoc(ctx.creds, "Company", key);
+    } catch (e) {
+      if (!(e instanceof ErpError)) throw e;
+      try {
+        const rows = await erp.getList(ctx.creds, "Company", {
+          filters: [["company_name", "=", key]],
+          fields: ["name", "company_name", "country", "default_currency"],
+          limit_page_length: 1,
+        });
+        const first = Array.isArray(rows) && rows[0] && typeof rows[0] === "object" ? rows[0] : null;
+        const n = first && typeof (first as { name?: unknown }).name === "string" ? String((first as { name: string }).name).trim() : "";
+        if (n) {
+          doc = await erp.getDoc(ctx.creds, "Company", n);
+        }
+      } catch (e2) {
+        if (e2 instanceof ErpError) {
+          const status = e2.status >= 500 ? 502 : e2.status;
+          return reply.status(status).send(publicErpFailure(e2));
+        }
+        throw e2;
+      }
+    }
+
+    const name = String(doc.name ?? "").trim();
+    if (!name) {
+      return reply.status(404).send({ error: "Company not found in ERP" });
+    }
+
+    return {
+      data: {
+        name,
+        company_name: String(doc.company_name ?? ""),
+        country: String(doc.country ?? ""),
+        default_currency: doc.default_currency != null ? String(doc.default_currency) : "",
+      },
+    };
+  });
+
   /**
    * Ensure ERPNext Company exists for this tenant.
    *
@@ -97,68 +146,4 @@ export const companyRoutes: FastifyPluginAsync = async (app) => {
     }
     throw lastErr;
   });
-
-  /**
-   * Set tenant performance methodology (BSC vs OKR) on ERPNext `Company`.
-   * Requires HR admin (`canSubmitOnBehalf`). Custom field must exist — run `bench migrate`
-   * after updating `centy_company_guard`.
-   */
-  app.post("/v1/company/performance-methodology", async (req, reply) => {
-    let ctx;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-    if (!ctx.canSubmitOnBehalf) {
-      return reply.status(403).send({ error: "HR admin privileges required" });
-    }
-
-    const raw = (req.body as Record<string, unknown> | undefined)?.methodology;
-    const methodology = normalizePerformanceMethodology(raw) as PerformanceMethodology;
-
-    try {
-      const { companyDocName } = await writePerformanceMethodology(ctx.creds, ctx.company, methodology);
-      return {
-        data: { methodology, company: companyDocName },
-        meta: { updated: true as const },
-      };
-    } catch (e) {
-      if (e instanceof ErpError) {
-        const msg = String(e.message ?? "");
-        const hint =
-          msg.toLowerCase().includes("centy_performance") || msg.toLowerCase().includes("unknown column")
-            ? "Install/update centy_company_guard on the ERP bench and run bench migrate so Company has centy_performance_methodology."
-            : undefined;
-        const status = e.status >= 500 ? 502 : e.status;
-        return reply.status(status).send({
-          error: msg || "Could not update company",
-          ...(hint ? { hint } : {}),
-        });
-      }
-      throw e;
-    }
-  });
-
-  /** Read current methodology (same auth as other HR routes). */
-  app.get("/v1/company/performance-methodology", async (req, reply) => {
-    let ctx;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-    try {
-      const methodology = await readPerformanceMethodology(ctx.creds, ctx.company);
-      return { data: { methodology } };
-    } catch (e) {
-      if (e instanceof ErpError) {
-        return reply.status(e.status >= 500 ? 502 : e.status).send({ error: String(e.message) });
-      }
-      throw e;
-    }
-  });
 };
-

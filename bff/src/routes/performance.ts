@@ -335,4 +335,3 @@ export const performanceRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 };
-

@@ -1858,7 +1858,8 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
 
   async function resolveEmployeeIdForRequest(ctx: HrContext, qEmp: string): Promise<string | null> {
     if (ctx.canSubmitOnBehalf) {
-      if (!qEmp) return null;
+      // No target employee specified — admin is acting on their own record (self-service clock-in/out).
+      if (!qEmp) return await resolveSelfEmployee(ctx);
       const empDoc = await erp.getDoc(ctx.creds, "Employee", qEmp);
       if (String(empDoc.company) !== ctx.company) return null;
       return qEmp;
@@ -2027,7 +2028,7 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
   }): Promise<string> {
     const { ctx, employeeId, attendance_date, shift_type_name, in_time } = params;
     const existing = (await erp.getList(ctx.creds, "Attendance", {
-      fields: ["name", "docstatus"],
+      fields: ["name", "docstatus", "in_time"],
       filters: [
         ["employee", "=", employeeId],
         ["attendance_date", "=", attendance_date],
@@ -2036,10 +2037,13 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
     })) as any[];
     if (existing.length) {
       const name = String(existing[0].name);
+      const existingInTime = String(existing[0].in_time ?? "").trim();
+      // Only set in_time when the record doesn't already have one — preserves the
+      // first clock-in time across multiple segments so IN/OUT display stays correct.
       await erp.updateDoc(ctx.creds, "Attendance", name, {
         status: "Present",
         shift: shift_type_name,
-        ...(in_time ? { in_time } : {}),
+        ...(in_time && !existingInTime ? { in_time } : {}),
       });
       return name;
     }
@@ -2226,6 +2230,28 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       throw new HttpError("Overtime isn’t set up for time tracking yet. Please ask HR to complete work-category setup.", 400);
     }
 
+    // Sum previously logged hours for this calendar day so multi-segment clock-in/out
+    // correctly accumulates regular vs overtime across all segments.
+    let previousWorkedMs = 0;
+    try {
+      const existingTs = (await erp.getList(ctx.creds, "Timesheet", {
+        fields: ["name"],
+        filters: [
+          ["employee", "=", employeeId],
+          ["company", "=", ctx.company],
+          ["start_date", "=", shiftCalendarDay],
+          ["docstatus", "!=", 2],
+        ],
+        order_by: "modified desc",
+        limit_page_length: 1,
+      })) as any[];
+      if (existingTs.length) {
+        const tsDoc = await erp.getDoc(ctx.creds, "Timesheet", String(existingTs[0].name));
+        const rows = Array.isArray((tsDoc as any).time_logs) ? (tsDoc as any).time_logs as any[] : [];
+        previousWorkedMs = Math.round(rows.reduce((s: number, l: any) => s + Number(l.hours ?? 0) * 3_600_000, 0));
+      }
+    } catch { /* best-effort — fall back to single-segment calculation */ }
+
     const time_logs: Record<string, unknown>[] = [];
 
     // Check if the employee has an approved half-day leave for this shift day.
@@ -2269,9 +2295,11 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           halfDayThresholdH = halfDurationMs / 3600000;
         }
       } else {
-        // Overtime starts only after working the full shift duration from clock-in.
-        regularMs = Math.min(totalWorkedMs, fullShiftDurationMs);
-        overtimeLateMs = Math.max(0, totalWorkedMs - fullShiftDurationMs);
+        // Overtime starts only after the employee has worked the full shift duration
+        // cumulatively across all segments today, not just within the current segment.
+        const remainingRegularMs = Math.max(0, fullShiftDurationMs - previousWorkedMs);
+        regularMs = Math.min(totalWorkedMs, remainingRegularMs);
+        overtimeLateMs = totalWorkedMs - regularMs;
       }
 
       const regularEndMs = fromMs + regularMs;
@@ -2347,7 +2375,10 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
-    const totalHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
+    const currentSegmentHours = Number(time_logs.reduce((sum, l) => sum + Number(l.hours ?? 0), 0).toFixed(2));
+    // Cumulative total across all segments today — this is what gets written to the
+    // Attendance record so the HOURS column reflects all completed clock-in/out pairs.
+    const totalHours = Number((previousWorkedMs / 3_600_000 + currentSegmentHours).toFixed(2));
     const warnings: string[] = [];
 
     if (halfDayExceeded) {
@@ -2590,6 +2621,11 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
    * or "zkteco:<host>" (fingerprint terminal — handled by zktecoSync directly).
    * GPS coordinates are included when provided, ignored otherwise.
    */
+  // Always creates an Employee Checkin record so the ZKTeco alternating IN/OUT offset
+  // stays consistent when employees mix portal and fingerprint terminal on the same day.
+  // GPS coordinates are appended when provided and valid; the record is created regardless.
+  // Duplicate-timestamp errors are swallowed (can happen when auto-closing a fingerprint
+  // session that the ZKTeco sync already wrote an OUT for at the same timestamp).
   async function recordEmployeeCheckin(params: {
     ctx: HrContext;
     employeeId: string;
@@ -2705,30 +2741,6 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
           });
         }
         throw e;
-      }
-
-      // Guard: if this shift's Attendance record already has an out_time the
-      // employee has already clocked out for this shift and cannot re-clock-in
-      // until the next shift begins.
-      try {
-        const prevAtt = (await erp.getList(ctx.creds, "Attendance", {
-          fields: ["name", "out_time"],
-          filters: [
-            ["employee", "=", employeeId],
-            ["attendance_date", "=", active.shift_start_date],
-            ["shift", "=", active.shift_type_name],
-            ["docstatus", "!=", 2],
-          ],
-          limit_page_length: 1,
-        })) as any[];
-        if (prevAtt.length && prevAtt[0].out_time) {
-          return reply.status(409).send({
-            error: "You have already clocked out for this shift. You cannot clock in again until your next shift begins.",
-            code: "HR_ALREADY_CLOCKED_OUT",
-          });
-        }
-      } catch {
-        // best-effort — proceed if the check fails
       }
 
       const attendanceName = await ensureAttendancePresent({
@@ -3786,6 +3798,67 @@ export const attendanceRoutes: FastifyPluginAsync = async (app) => {
       // Non-fatal — compulsory leave was already saved; just report the failure.
       const msg = e instanceof ErpError ? String((e as any).message ?? e) : String(e);
       return reply.status(500).send({ error: msg.slice(0, 300) });
+    }
+  });
+
+  /**
+   * GET /v1/attendance/my-checkins-today
+   * Returns today's Employee Checkin records for the calling employee, sorted by time asc.
+   * Used by the clock-in UI to detect fingerprint punches from the ZKTeco terminal.
+   */
+  app.get("/v1/attendance/my-checkins-today", async (req, reply) => {
+    let ctx: HrContext;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const employeeId = await resolveSelfEmployee(ctx);
+    if (!employeeId) return reply.status(403).send({ error: "No Employee linked to this user" });
+
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      const rows = (await erp.getList(ctx.creds, "Employee Checkin", {
+        filters: [
+          ["employee", "=", employeeId],
+          ["time", ">=", `${today} 00:00:00`],
+          ["time", "<=", `${today} 23:59:59`],
+        ],
+        fields: ["name", "log_type", "time", "device_id"],
+        order_by: "time asc",
+        limit_page_length: 50,
+      })) as Record<string, unknown>[];
+
+      // Fetch today's total logged hours from the Attendance record (updated on each clock-out).
+      // Used by the client to offset the cumulative auto clock-out threshold across multiple
+      // clock-in/out segments within the same shift.
+      let total_logged_hours = 0;
+      try {
+        const attRows = (await erp.getList(ctx.creds, "Attendance", {
+          filters: [
+            ["employee", "=", employeeId],
+            ["attendance_date", "=", today],
+            ["docstatus", "!=", 2],
+          ],
+          fields: ["working_hours"],
+          limit_page_length: 1,
+        })) as Record<string, unknown>[];
+        if (attRows.length) total_logged_hours = Number(attRows[0].working_hours ?? 0);
+      } catch { /* best-effort */ }
+
+      return {
+        total_logged_hours,
+        data: rows.map((r) => ({
+          name: String(r.name ?? ""),
+          log_type: String(r.log_type ?? ""),
+          time: String(r.time ?? ""),
+          device_id: String(r.device_id ?? ""),
+        })),
+      };
+    } catch (e) {
+      if (e instanceof ErpError) return reply.status(502).send({ error: String(e.message) });
+      throw e;
     }
   });
 };

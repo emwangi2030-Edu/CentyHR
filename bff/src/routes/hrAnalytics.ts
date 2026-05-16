@@ -177,4 +177,3 @@ export const hrAnalyticsRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 };
-

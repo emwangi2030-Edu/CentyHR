@@ -9,9 +9,6 @@ function req(name: string, fallback?: string): string {
 /** Public base of the Frappe site, e.g. https://erp.tarakilishicloud.com */
 export const ERP_BASE_URL = req("ERP_BASE_URL").replace(/\/+$/, "");
 
-/** Base URL of the Pay Hub server for internal service calls (e.g. compulsory leave checks). */
-export const PAY_HUB_INTERNAL_URL = (process.env.PAY_HUB_INTERNAL_URL ?? "http://localhost:5002").replace(/\/+$/, "");
-
 /** Optional: set if your reverse proxy expects `X-Frappe-Site-Name` (usually unnecessary when Host matches the site). */
 export const ERP_SITE_NAME = process.env.ERP_SITE_NAME ?? "";
 
@@ -77,8 +74,8 @@ export const LEAVE_MANAGER_APPROVE_MAX_DAYS: number | null = (() => {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 })();
 
-/** Two-stage leave approval: line manager first, then HR finalises. Enabled by default; set to "0" to disable. */
-export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL !== "0";
+/** When `1`, leave uses a custom Check field for the first approver, then HR finalises `status`. See docs/ERP_TWO_STAGE_CUSTOM_FIELDS.md */
+export const LEAVE_TWO_STAGE_APPROVAL = process.env.LEAVE_TWO_STAGE_APPROVAL === "1";
 
 /** Custom field on Leave Application (Allow on Submit = Yes). */
 export const LEAVE_FIRST_APPROVER_FIELD =
@@ -101,19 +98,6 @@ export const DOCUSEAL_WEBHOOK_SECRET = process.env.DOCUSEAL_WEBHOOK_SECRET ?? ""
 /** Dev only: skip header verification (never use in production). */
 export const DOCUSEAL_WEBHOOK_INSECURE = process.env.DOCUSEAL_WEBHOOK_INSECURE === "1";
 
-/**
- * Optional: exact Custom Field fieldname on Employee for bank branch.
- * If unset, BFF resolves from Custom Field list (label "Bank Branch" or fieldname pattern).
- * Pay Hub still sends/reads JSON key `custom_bank_branch`; BFF maps to this ERP field.
- */
-export const HR_EMPLOYEE_BANK_BRANCH_FIELD = process.env.HR_EMPLOYEE_BANK_BRANCH_FIELD?.trim() ?? "";
-
-/**
- * When `1`, PATCH ensures a Data Custom Field `custom_bank_branch` exists on Employee (requires ERP create permission).
- * Use when the integration user cannot read the Custom Field doctype but can create fields.
- */
-export const HR_AUTO_SETUP_BANK_BRANCH_FIELD = process.env.HR_AUTO_SETUP_BANK_BRANCH_FIELD === "1";
-
 /** ERP method DocuSeal payload is forwarded to. */
 export const DOCUSEAL_WEBHOOK_ERP_METHOD =
   process.env.DOCUSEAL_WEBHOOK_ERP_METHOD?.trim() ||
@@ -127,3 +111,19 @@ export function hrCompanyDocumentRoles(): string[] {
   if (!raw) return [...DEFAULT_HR_COMPANY_DOCUMENT_ROLES];
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
+
+/** ZKTeco biometric terminal — direct TCP connection (ZKLib protocol). */
+export const ZKTECO_HOST = process.env.ZKTECO_HOST ?? "192.168.100.201";
+export const ZKTECO_PORT = Number(process.env.ZKTECO_PORT ?? "4370");
+export const ZKTECO_TIMEOUT_MS = Number(process.env.ZKTECO_TIMEOUT_MS ?? "5000");
+
+/**
+ * ERPNext company name to use for background auto-sync.
+ * When set, the BFF will pull punches from the terminal every ZKTECO_SYNC_INTERVAL_MS
+ * and write Employee Checkins automatically — no manual trigger needed.
+ * Leave blank to disable background sync (manual-only via the Devices tab).
+ */
+export const ZKTECO_COMPANY = process.env.ZKTECO_COMPANY ?? "";
+
+/** How often (ms) the background sync runs. Default: 15 minutes. */
+export const ZKTECO_SYNC_INTERVAL_MS = Number(process.env.ZKTECO_SYNC_INTERVAL_MS ?? String(15 * 60 * 1000));

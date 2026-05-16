@@ -46,6 +46,7 @@ export class ErpNextClient {
       method,
       headers,
       body: opts?.form ?? (opts?.body !== undefined ? JSON.stringify(opts.body) : undefined),
+      signal: AbortSignal.timeout(30_000),
     });
     const rawText = await res.text();
     if (!res.ok) {
@@ -215,14 +216,21 @@ export class ErpNextClient {
             };
       return this.callMethod(creds, "frappe.client.submit", { doc });
     };
-    try {
-      return await run();
-    } catch (e) {
-      if (e instanceof ErpError && e.status === 417) {
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const maxAttempts = 4;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
         return await run();
+      } catch (e) {
+        lastError = e;
+        const shouldRetry = e instanceof ErpError && e.status === 417 && attempt < maxAttempts;
+        if (!shouldRetry) break;
+        // ERP can briefly race on modified timestamps; retry with a fresh getDoc snapshot.
+        await sleep(80 * attempt);
       }
-      throw e;
     }
+    throw lastError;
   }
 
   /** Cancel submitted document (recall / void — ERP rules still apply). */
