@@ -1673,13 +1673,19 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const empDoc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
+      const [empDoc, companyDoc] = await Promise.all([
+        erp.getDoc(ctx.creds, "Employee", empName) as Promise<Record<string, unknown>>,
+        erp.getDoc(ctx.creds, "Company", ctx.company) as Promise<Record<string, unknown>>,
+      ]);
+      const companyCurrency = String(companyDoc.default_currency ?? "").trim() || "KES";
       const created = await erp.createDoc(ctx.creds, "Employee Advance", {
         employee: empName,
         employee_name: String(empDoc.employee_name ?? empDoc.name ?? empName),
         company: ctx.company,
         posting_date: postingDate,
         advance_amount: advAmt,
+        advance_currency: companyCurrency,
+        exchange_rate: 1,
         purpose,
       }) as Record<string, unknown>;
       return reply.status(201).send({ data: created });
