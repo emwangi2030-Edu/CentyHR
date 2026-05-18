@@ -74,15 +74,16 @@ async function purgeSalaryStructureAssignmentsForEmployee(creds: ErpCredentials,
 
 // ── Simple in-process cache for expensive ERPNext list/summary calls ─────────
 // Key: `${company}:${cacheKey}`, Value: { data: unknown; exp: number }
-const ERP_CACHE_TTL_MS = Number(process.env.ERP_CACHE_TTL_MS ?? 30_000); // 30 s default
+const ERP_CACHE_TTL_MS = Number(process.env.ERP_CACHE_TTL_MS ?? 30_000); // 30 s default for lists/summaries
+const ERP_EMPLOYEE_DOC_TTL_MS = Number(process.env.ERP_EMPLOYEE_DOC_TTL_MS ?? 120_000); // 2 min for individual employee docs
 const _erpCache = new Map<string, { data: unknown; exp: number }>();
 function erpCacheGet<T>(key: string): T | null {
   const entry = _erpCache.get(key);
   if (!entry || entry.exp < Date.now()) { _erpCache.delete(key); return null; }
   return entry.data as T;
 }
-function erpCacheSet(key: string, data: unknown): void {
-  _erpCache.set(key, { data, exp: Date.now() + ERP_CACHE_TTL_MS });
+function erpCacheSet(key: string, data: unknown, ttlMs = ERP_CACHE_TTL_MS): void {
+  _erpCache.set(key, { data, exp: Date.now() + ttlMs });
 }
 /** Bust all cache entries for a company (call after create/update/delete). */
 function erpCacheBust(company: string): void {
@@ -125,7 +126,10 @@ type EmployeeReadResult =
  */
 async function loadEmployeeReadableByCaller(ctx: HrContext, employeeId: string): Promise<EmployeeReadResult> {
   try {
-    const cur = (await erp.getDoc(ctx.creds, "Employee", employeeId)) as Record<string, unknown>;
+    const docCacheKey = `${ctx.company}:employee:${employeeId}`;
+    const cached = erpCacheGet<Record<string, unknown>>(docCacheKey);
+    const cur = cached ?? ((await erp.getDoc(ctx.creds, "Employee", employeeId)) as Record<string, unknown>);
+    if (!cached) erpCacheSet(docCacheKey, cur, ERP_EMPLOYEE_DOC_TTL_MS);
     if (String(cur.company) !== ctx.company) {
       return { ok: false, status: 403, error: "Employee not in your Company" };
     }
@@ -1666,6 +1670,7 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       }
 
       console.log(`[hr:patch] done — standard_saved=${standardFields.length} statutory_saved=${statutorySaved.length} statutory_failed=${statutoryFailed.length}`);
+      erpCacheBust(ctx.company);
 
       if (String(record.company) !== ctx.company) {
         return reply.status(403).send({ error: "Employee not in your Company" });

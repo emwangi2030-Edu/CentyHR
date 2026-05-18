@@ -49,312 +49,6 @@ async function resolveCompanyDocName(creds: ErpCredentials, company: string): Pr
   }
 }
 
-async function getCompanyDefaultCurrency(creds: ErpCredentials, companyDoc: string): Promise<string> {
-  try {
-    const c = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
-    return String(c.default_currency ?? "").trim();
-  } catch {
-    return "";
-  }
-}
-
-async function resolveEmployeeAdvanceExchangeRate(
-  creds: ErpCredentials,
-  employeeCurrency: string,
-  companyCurrency: string,
-  postingDate: string
-): Promise<number> {
-  const ec = employeeCurrency.trim();
-  const cc = companyCurrency.trim();
-  if (!ec || !cc) return 1;
-  if (ec === cc) return 1;
-  try {
-    const raw = await erp.callMethod(creds, "erpnext.setup.utils.get_exchange_rate", {
-      from_currency: ec,
-      to_currency: cc,
-      transaction_date: postingDate,
-    });
-    const msg = (raw as { message?: unknown })?.message;
-    const n = typeof msg === "number" ? msg : Number(msg);
-    if (Number.isFinite(n) && n > 0) return n;
-  } catch {
-    /* non-fatal; caller treats 0 as failure */
-  }
-  return 0;
-}
-
-/**
- * HRMS v15 `Employee Advance` has a required `exchange_rate`; drafts sometimes keep 0 (same KES / copy-paste in ERP).
- * Submit then fails. We always PATCH the draft, verify, then `frappe.client.set_value` if needed.
- */
-async function ensureEmployeeAdvanceExchangeOnDraft(
-  creds: ErpCredentials,
-  companyDoc: string,
-  name: string,
-  employee: string,
-  postingDate: string
-): Promise<{
-  companyCurrency: string;
-  salaryCurrency: string;
-  exchangeRate: number;
-}> {
-  const companyCurrency = await getCompanyDefaultCurrency(creds, companyDoc);
-  if (!companyCurrency) {
-    throw new HttpError("Set company default currency in ERPNext.", 400);
-  }
-  const empDoc = (await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>;
-  const salaryCurrency = String(empDoc.salary_currency ?? "").trim() || companyCurrency;
-  const rate = await resolveEmployeeAdvanceExchangeRate(
-    creds,
-    salaryCurrency,
-    companyCurrency,
-    postingDate
-  );
-  if (rate <= 0) {
-    throw new HttpError("Add a currency exchange rate in ERP for this date.", 400);
-  }
-
-  const applyPatch = async () => {
-    const fresh = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
-    await erp.updateDoc(creds, "Employee Advance", name, {
-      doctype: "Employee Advance",
-      name,
-      modified: fresh.modified,
-      currency: salaryCurrency,
-      exchange_rate: rate,
-    });
-  };
-
-  await applyPatch();
-  let after = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
-  let n = Number(after.exchange_rate ?? 0);
-  if (Number.isFinite(n) && n > 0) {
-    return { companyCurrency, salaryCurrency, exchangeRate: rate };
-  }
-
-  try {
-    await erp.callMethod(creds, "frappe.client.set_value", {
-      doctype: "Employee Advance",
-      name,
-      fieldname: "exchange_rate",
-      value: rate,
-    });
-  } catch (e) {
-    console.warn("[BFF] frappe.client.set_value exchange_rate:", e);
-  }
-  after = (await erp.getDoc(creds, "Employee Advance", name)) as Record<string, unknown>;
-  n = Number(after.exchange_rate ?? 0);
-  if (!Number.isFinite(n) || n <= 0) {
-    throw new HttpError(
-      "Set exchange rate on this advance in ERP, save, then approve again from Pay Hub.",
-      400
-    );
-  }
-  return { companyCurrency, salaryCurrency, exchangeRate: rate };
-}
-
-type AccountHeadMeta = { account_type: string; account_currency: string };
-
-async function getAccountHeadMeta(
-  creds: ErpCredentials,
-  name: string
-): Promise<AccountHeadMeta | null> {
-  try {
-    const a = (await erp.getDoc(creds, "Account", name)) as Record<string, unknown>;
-    return {
-      account_type: String(a.account_type ?? ""),
-      account_currency: String(a.account_currency ?? "").trim(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function resolveReceivableEmployeeAdvanceAccount(
-  creds: ErpCredentials,
-  companyDoc: string,
-  employee: string,
-  salaryCurrency: string
-): Promise<string | null> {
-  const sc = salaryCurrency.trim();
-  if (!sc) return null;
-
-  const comp = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
-  const fromCompany = String(comp.default_employee_advance_account ?? "").trim();
-  const emp = (await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>;
-  const fromEmployee = String(emp.employee_advance_account ?? "").trim();
-
-  const tryNames: string[] = [];
-  if (fromCompany) tryNames.push(fromCompany);
-  if (fromEmployee && fromEmployee !== fromCompany) tryNames.push(fromEmployee);
-
-  for (const accName of tryNames) {
-    const meta = await getAccountHeadMeta(creds, accName);
-    if (!meta) continue;
-    if (meta.account_type !== "Receivable") continue;
-    if (meta.account_currency !== sc) continue;
-    return accName;
-  }
-
-  const rows = await erp.getList(creds, "Account", {
-    filters: [
-      ["company", "=", companyDoc],
-      ["account_type", "=", "Receivable"],
-      ["is_group", "=", 0],
-      ["disabled", "=", 0],
-      ["account_currency", "=", sc],
-    ],
-    fields: ["name", "account_name"],
-    order_by: "name asc",
-    limit_page_length: 80,
-  });
-
-  for (const raw of rows) {
-    const r = asRecord(raw);
-    if (!r) continue;
-    const n = `${String(r.name ?? "")} ${String(r.account_name ?? "")}`.toLowerCase();
-    if (n.includes("advance") || n.includes("employee")) {
-      return String(r.name ?? "").trim() || null;
-    }
-  }
-  if (rows.length === 1) {
-    const r = asRecord(rows[0]);
-    if (r?.name) return String(r.name);
-  }
-  return null;
-}
-
-async function alignCompanyDefaultEmployeeAdvanceAccount(
-  creds: ErpCredentials,
-  companyDoc: string,
-  salaryCurrency: string,
-  resolvedAdvance: string
-): Promise<void> {
-  const comp = (await erp.getDoc(creds, "Company", companyDoc)) as Record<string, unknown>;
-  const cur = String(comp.default_employee_advance_account ?? "").trim();
-  if (cur === resolvedAdvance) return;
-  if (!cur) return;
-  const m = await getAccountHeadMeta(creds, cur);
-  const curOk = Boolean(
-    m && m.account_type === "Receivable" && m.account_currency === salaryCurrency
-  );
-  if (curOk) return;
-  await erp.callMethod(creds, "frappe.client.set_value", {
-    doctype: "Company",
-    name: companyDoc,
-    fieldname: "default_employee_advance_account",
-    value: resolvedAdvance,
-  });
-}
-
-async function alignEmployeeMasterAdvanceAccount(
-  creds: ErpCredentials,
-  employee: string,
-  salaryCurrency: string,
-  resolvedAdvance: string,
-  existingEmp?: Record<string, unknown>
-): Promise<void> {
-  const emp = existingEmp ?? ((await erp.getDoc(creds, "Employee", employee)) as Record<string, unknown>);
-  const cur = String(emp.employee_advance_account ?? "").trim();
-  if (cur === resolvedAdvance) return;
-  if (cur) {
-    const m = await getAccountHeadMeta(creds, cur);
-    const curOk = Boolean(
-      m && m.account_type === "Receivable" && m.account_currency === salaryCurrency
-    );
-    if (curOk) return;
-  }
-  await erp.callMethod(creds, "frappe.client.set_value", {
-    doctype: "Employee",
-    name: employee,
-    fieldname: "employee_advance_account",
-    value: resolvedAdvance,
-  });
-}
-
-/** Max advance as a share of latest Salary Structure Assignment `base` (monthly, company currency). */
-const SALARY_ADVANCE_MAX_SALARY_FRACTION = 0.5;
-
-/** Latest SSA `base` in company / payroll terms (same as GET /v1/payroll/team). */
-async function getLatestSalaryBase(
-  creds: ErpCredentials,
-  companyDoc: string,
-  employee: string
-): Promise<number | null> {
-  const rows = await erp.getList(creds, "Salary Structure Assignment", {
-    filters: [
-      ["company", "=", companyDoc],
-      ["employee", "=", employee],
-    ],
-    fields: ["base", "from_date"],
-    order_by: "from_date desc",
-    limit_page_length: 1,
-  });
-  const r = asRecord(rows[0]);
-  if (!r) return null;
-  const base = Number(r.base ?? 0);
-  if (!Number.isFinite(base) || base <= 0) return null;
-  return base;
-}
-
-/** Inclusive [start, end] for `postingDate`'s calendar month (YYYY-MM-DD). */
-function postingMonthRange(postingDate: string): { start: string; end: string } {
-  const m = String(postingDate ?? "").match(/^(\d{4})-(\d{2})/);
-  const y = m ? parseInt(m[1], 10) : new Date().getFullYear();
-  const mo = m ? parseInt(m[2], 10) : new Date().getMonth() + 1;
-  const start = `${y}-${String(mo).padStart(2, "0")}-01`;
-  const lastDay = new Date(y, mo, 0).getDate();
-  const end = `${y}-${String(mo).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
-  return { start, end };
-}
-
-function isPastPostingDate(postingDate: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(postingDate ?? "").trim())) return false;
-  const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  return postingDate < today;
-}
-
-/** Month-to-date non-cancelled advance total in company currency for the posting month. */
-async function sumEmployeeAdvancesInSameMonthCompanyCurrency(
-  creds: ErpCredentials,
-  companyDoc: string,
-  companyCurrency: string,
-  employee: string,
-  postingDate: string,
-  options?: { excludeName?: string | null }
-): Promise<number> {
-  const { start, end } = postingMonthRange(postingDate);
-  const rows = await erp.getList(creds, "Employee Advance", {
-    filters: [
-      ["company", "=", companyDoc],
-      ["employee", "=", employee],
-      ["posting_date", ">=", start],
-      ["posting_date", "<=", end],
-      ["docstatus", "!=", 2],
-    ],
-    fields: ["name", "advance_amount", "currency", "exchange_rate"],
-    limit_page_length: 200,
-  });
-  if (!Array.isArray(rows) || rows.length === 0) return 0;
-  const excludeName = String(options?.excludeName ?? "").trim();
-  let total = 0;
-  for (const raw of rows) {
-    const row = asRecord(raw);
-    const name = String(row?.name ?? "").trim();
-    if (excludeName && name === excludeName) continue;
-    const amount = Number(row?.advance_amount ?? 0);
-    if (!Number.isFinite(amount) || amount <= 0) continue;
-    const currency = String(row?.currency ?? "").trim();
-    const exchangeRate = Number(row?.exchange_rate ?? 0);
-    const inCompanyCurrency =
-      !currency || currency === companyCurrency
-        ? amount
-        : amount * (Number.isFinite(exchangeRate) && exchangeRate > 0 ? exchangeRate : 1);
-    total += inCompanyCurrency;
-  }
-  return Math.round(total * 100) / 100;
-}
 const BULK_APPROVE_MAX = 40;
 const EXPORT_MAX_ROWS = 2000;
 
@@ -804,60 +498,6 @@ async function mapRowsWithPolicy(rows: unknown[], companyKey: string): Promise<u
   });
 }
 
-/** Sum `amount` on Expense Claim Detail rows per parent claim (receipt / line totals from ERP). */
-async function sumExpenseLineAmountsByParent(
-  creds: ErpCredentials,
-  parentNames: string[],
-): Promise<Record<string, number>> {
-  const unique = Array.from(new Set(parentNames.map((n) => String(n).trim()).filter(Boolean)));
-  const sums: Record<string, number> = {};
-  if (unique.length === 0) return sums;
-
-  const chunkSize = 45;
-  for (let i = 0; i < unique.length; i += chunkSize) {
-    const chunk = unique.slice(i, i + chunkSize);
-    const res = await erp.listDocs(creds, "Expense Claim Detail", {
-      filters: [["parent", "in", chunk]],
-      fields: ["parent", "amount"],
-      limit_page_length: Math.min(5000, chunk.length * 100),
-    });
-    for (const row of res.data ?? []) {
-      const rec = asRecord(row);
-      if (!rec) continue;
-      const p = String(rec.parent ?? "").trim();
-      if (!p) continue;
-      const amt = Number(rec.amount ?? 0);
-      sums[p] = (sums[p] ?? 0) + (Number.isFinite(amt) ? amt : 0);
-    }
-  }
-  return sums;
-}
-
-/** Adds `centy_receipt_lines_total` for list/export rows (sum of claim line amounts). */
-async function enrichExpenseClaimRowsWithReceiptLineTotals(
-  creds: ErpCredentials,
-  rows: unknown[],
-): Promise<unknown[]> {
-  const names = rows.map((r) => String(asRecord(r)?.name ?? "").trim()).filter(Boolean);
-  let sums: Record<string, number> = {};
-  try {
-    sums = await sumExpenseLineAmountsByParent(creds, names);
-  } catch (e) {
-    console.warn("[expenses] receipt line totals skipped:", e instanceof Error ? e.message : String(e));
-  }
-  return rows.map((r) => {
-    const rec = asRecord(r);
-    if (!rec) return r;
-    const name = String(rec.name ?? "").trim();
-    const total = name ? sums[name] : undefined;
-    return {
-      ...rec,
-      centy_receipt_lines_total:
-        total !== undefined && Number.isFinite(total) ? total : null,
-    };
-  });
-}
-
 export const expenseRoutes: FastifyPluginAsync = async (app) => {
   await app.register(multipart, { limits: { fileSize: 15 * 1024 * 1024 } });
 
@@ -1028,8 +668,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       const raw = res.data ?? [];
       const hasMore = raw.length > pageSize;
       const slice = hasMore ? raw.slice(0, pageSize) : raw;
-      const enriched = await enrichExpenseClaimRowsWithReceiptLineTotals(ctx.creds, slice);
-      const data = await mapRowsWithPolicy(enriched, ctx.company);
+      const data = await mapRowsWithPolicy(slice, ctx.company);
       return {
         data,
         meta: { page, page_size: pageSize, has_more: hasMore },
@@ -1447,8 +1086,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       const raw = res.data ?? [];
       const hasMore = raw.length > pageSize;
       const slice = hasMore ? raw.slice(0, pageSize) : raw;
-      const enriched = await enrichExpenseClaimRowsWithReceiptLineTotals(ctx.creds, slice);
-      const data = await mapRowsWithPolicy(enriched, ctx.company);
+      const data = await mapRowsWithPolicy(slice, ctx.company);
       return {
         data,
         meta: { page, page_size: pageSize, has_more: hasMore },
@@ -1515,8 +1153,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       });
       const hasMore = unpaid.length > pageSize;
       const slice = hasMore ? unpaid.slice(0, pageSize) : unpaid;
-      const enriched = await enrichExpenseClaimRowsWithReceiptLineTotals(ctx.creds, slice);
-      const data = await mapRowsWithPolicy(enriched, ctx.company);
+      const data = await mapRowsWithPolicy(slice, ctx.company);
       return {
         data,
         meta: { page, page_size: pageSize, has_more: hasMore },
@@ -1591,7 +1228,6 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       });
 
       const raw = res.data ?? [];
-      const enriched = await enrichExpenseClaimRowsWithReceiptLineTotals(ctx.creds, raw);
       const header = [
         "name",
         "employee",
@@ -1603,12 +1239,11 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         "docstatus",
         "grand_total",
         "total_claimed_amount",
-        "centy_receipt_lines_total",
         "total_sanctioned_amount",
         "total_amount_reimbursed",
       ];
       const lines = [header.join(",")];
-      for (const row of enriched) {
+      for (const row of raw) {
         const rec = asRecord(row);
         if (!rec) continue;
         const cells = header.map((key) =>
@@ -1683,6 +1318,132 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
+  // ── Salary Advance — Kenyan 1/3-rule helpers ─────────────────────────────
+
+  /** NSSF employee contribution: 6% of earnings up to UEL (KES 108,000). Year-4 rates. */
+  function calcNSSF(gross: number): number {
+    return Math.round(Math.min(Math.max(gross, 0), 108_000) * 0.06);
+  }
+
+  /** SHIF: 2.75% of gross, minimum KES 300. */
+  function calcSHIF(gross: number): number {
+    return Math.max(300, Math.round(gross * 0.0275));
+  }
+
+  /** AHL (Affordable Housing Levy): 1.5% of gross. */
+  function calcAHL(gross: number): number {
+    return Math.round(gross * 0.015);
+  }
+
+  /** PAYE on monthly taxable income (gross − NSSF), 2024 bands, personal relief KES 2,400. */
+  function calcPAYE(taxable: number): number {
+    const g = Math.max(0, taxable);
+    const bands: [number, number][] = [
+      [24_000, 0.10],
+      [32_333, 0.25],
+      [500_000, 0.30],
+      [800_000, 0.325],
+      [Infinity, 0.35],
+    ];
+    let tax = 0;
+    let prev = 0;
+    for (const [limit, rate] of bands) {
+      if (g <= prev) break;
+      tax += (Math.min(g, limit) - prev) * rate;
+      prev = limit;
+    }
+    return Math.max(0, Math.round(tax - 2_400));
+  }
+
+  /**
+   * Compute the 1/3-rule monthly advance cap for an employee.
+   * Returns null when no active salary assignment exists on postingDate.
+   */
+  async function computeOneThirdCap(
+    creds: import("../erpnext/client").ErpCredentials,
+    company: string,
+    empName: string,
+    postingDate: string,
+  ): Promise<{
+    grossPay: number;
+    baseSalary: number;
+    nssf: number;
+    paye: number;
+    shif: number;
+    ahl: number;
+    totalStatutory: number;
+    oneThirdFloor: number;
+    monthlyCap: number;
+    assignmentFromDate: string | null;
+  } | null> {
+    const assignments = await erp.getList(creds, "Salary Structure Assignment", {
+      filters: [
+        ["employee", "=", empName],
+        ["company", "=", company],
+        ["docstatus", "=", 1],
+        ["from_date", "<=", postingDate],
+      ],
+      fields: ["base", "from_date", "salary_structure"],
+      order_by: "from_date desc",
+      limit_page_length: 1,
+    });
+
+    const assignment = asRecord(assignments[0] ?? null);
+    const base = assignment ? Number(assignment.base ?? 0) : 0;
+    if (!base || base <= 0) return null;
+
+    // Try to add fixed-amount earning components from the salary structure
+    let grossPay = base;
+    const structureName = assignment ? String(assignment.salary_structure ?? "").trim() : "";
+    if (structureName) {
+      try {
+        const structureDoc = (await erp.getDoc(creds, "Salary Structure", structureName)) as Record<string, unknown>;
+        const earnings = Array.isArray(structureDoc.earnings)
+          ? (structureDoc.earnings as Array<Record<string, unknown>>)
+          : [];
+        for (const comp of earnings) {
+          // Only sum fixed amounts — skip formula-driven components
+          const amt = Number(comp.amount ?? 0);
+          if (amt > 0 && !comp.formula && !comp.condition) {
+            grossPay += amt;
+          }
+        }
+      } catch { /* use base only */ }
+    }
+
+    const nssf = calcNSSF(grossPay);
+    const paye = calcPAYE(Math.max(0, grossPay - nssf));
+    const shif = calcSHIF(grossPay);
+    const ahl = calcAHL(grossPay);
+    const totalStatutory = nssf + paye + shif + ahl;
+    const oneThirdFloor = Math.ceil(grossPay / 3);
+    const monthlyCap = Math.max(0, grossPay - totalStatutory - oneThirdFloor);
+
+    return {
+      grossPay,
+      baseSalary: base,
+      nssf,
+      paye,
+      shif,
+      ahl,
+      totalStatutory,
+      oneThirdFloor,
+      monthlyCap,
+      assignmentFromDate: assignment ? String(assignment.from_date ?? "") : null,
+    };
+  }
+
+  /** Helper: inclusive month start/end strings from a YYYY-MM-DD date. */
+  function monthBoundsFromDate(d: string): { monthStart: string; monthEnd: string } {
+    const y = parseInt(d.slice(0, 4), 10);
+    const m = parseInt(d.slice(5, 7), 10);
+    const monthStart = `${y}-${String(m).padStart(2, "0")}-01`;
+    const nextY = m === 12 ? y + 1 : y;
+    const nextM = m === 12 ? 1 : m + 1;
+    const monthEnd = `${nextY}-${String(nextM).padStart(2, "0")}-01`;
+    return { monthStart, monthEnd };
+  }
+
   /** Employee Advance rows (HRMS). Empty if doctype unavailable on site. */
   app.get("/v1/expenses/advances", async (req, reply) => {
     let ctx;
@@ -1742,115 +1503,11 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Salary-advance eligibility for the employee portal / HR issue flow.
-   * Uses the same latest Salary Structure Assignment base rule as Employee Advance creation.
+   * Salary advance eligibility — Kenyan Employment Act s.19 (1/3-rule).
+   * Returns breakdown of gross pay, statutory deductions, 1/3 floor, cap, used, remaining.
    */
   app.get("/v1/expenses/advances/eligibility", async (req, reply) => {
-    let ctx: HrContext;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-
-    try {
-      const query = (req.query as Record<string, unknown>) ?? {};
-      const qEmp = String(query.employee ?? "").trim();
-      const eligibilityPostingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(query.posting_date ?? "").trim())
-        ? String(query.posting_date).trim()
-        : new Date().toISOString().slice(0, 10);
-      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
-      const companyCurrency = await getCompanyDefaultCurrency(ctx.creds, companyDoc);
-      if (!companyCurrency) {
-        return reply.status(400).send({ error: "Set company default currency in ERPNext." });
-      }
-
-      let employee = "";
-      if (ctx.canSubmitOnBehalf) {
-        employee = qEmp;
-        if (!employee) {
-          const mine = await getLinkedEmployeeName(ctx);
-          if (mine) employee = mine;
-        }
-        if (!employee) {
-          return {
-            eligible: false,
-            maxAmount: null,
-            baseSalary: null,
-            reason: "no_employee_linked",
-          };
-        }
-      } else {
-        const mine = await getLinkedEmployeeName(ctx);
-        if (!mine) {
-          return {
-            eligible: false,
-            maxAmount: null,
-            baseSalary: null,
-            reason: "no_employee_linked",
-          };
-        }
-        if (qEmp && qEmp !== mine) {
-          return reply.status(403).send({ error: "You can only check advance eligibility for your own profile." });
-        }
-        employee = mine;
-      }
-
-      const empDoc = (await erp.getDoc(ctx.creds, "Employee", employee)) as Record<string, unknown>;
-      if (String(empDoc.company ?? "").trim() !== companyDoc) {
-        return reply.status(403).send({ error: "Employee not in your Company" });
-      }
-
-      const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, employee);
-      if (monthlySalaryBase == null) {
-        return {
-          eligible: false,
-          maxAmount: null,
-          baseSalary: null,
-          reason: "no_salary_structure",
-        };
-      }
-
-      const maxAmount = Math.round(monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION * 100) / 100;
-      const alreadyRequestedThisMonth = await sumEmployeeAdvancesInSameMonthCompanyCurrency(
-        ctx.creds,
-        companyDoc,
-        companyCurrency,
-        employee,
-        eligibilityPostingDate,
-      );
-      const remainingAmount = Math.max(0, Math.round((maxAmount - alreadyRequestedThisMonth) * 100) / 100);
-      return {
-        eligible: remainingAmount > 0,
-        maxAmount: remainingAmount,
-        baseSalary: monthlySalaryBase,
-        usedAmount: alreadyRequestedThisMonth,
-        monthlyCap: maxAmount,
-        reason: remainingAmount > 0 ? "ok" : "monthly_limit_reached",
-      };
-    } catch (e) {
-      if (e instanceof ErpError && e.status === 404) {
-        return {
-          eligible: false,
-          maxAmount: null,
-          baseSalary: null,
-          reason: "no_salary_structure",
-        };
-      }
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
-    }
-  });
-
-  /**
-   * POST /v1/expenses/advances
-   * Creates **Employee Advance** in ERPNext HR.
-   * HR may pass `employee`; employees without submit-on-behalf may only create for their linked Employee row.
-   * Blocked if no SSA base or if the month-to-date total would exceed half the monthly salary.
-   */
-  app.post("/v1/expenses/advances", async (req, reply) => {
-    let ctx: HrContext;
+    let ctx;
     try {
       ctx = resolveHrContext(req);
     } catch (e) {
@@ -1860,6 +1517,9 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
 
     const q = (req.query ?? {}) as Record<string, unknown>;
     const qEmp = String(q.employee ?? "").trim();
+    const qDate = String(q.posting_date ?? "").trim();
+    const today = new Date().toISOString().slice(0, 10);
+    const postingDate = qDate && /^\d{4}-\d{2}-\d{2}$/.test(qDate) ? qDate : today;
 
     try {
       let empName: string;
@@ -1867,71 +1527,75 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
         if (!qEmp) return reply.status(400).send({ error: "employee query param required for HR users." });
         empName = qEmp;
       } else {
-        const mine = await getLinkedEmployeeName(ctx);
-        if (!mine) {
+        const linked = await getLinkedEmployeeName(ctx);
+        if (!linked) {
           return reply.send({ eligible: false, maxAmount: null, reason: "no_employee_linked" });
         }
-        if (qEmp && qEmp !== mine) {
-          return reply.status(403).send({ error: "You can only check advance eligibility for your own profile." });
-        }
-        empName = mine;
+        empName = linked;
       }
 
-      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
-      const companyCurrency = await getCompanyDefaultCurrency(ctx.creds, companyDoc);
-      if (!companyCurrency) {
-        return reply.status(400).send({ error: "Set company default currency in ERPNext." });
+      // 1/3-rule cap computation
+      const cap = await computeOneThirdCap(ctx.creds, ctx.company, empName, postingDate);
+      if (!cap) {
+        return reply.send({ eligible: false, maxAmount: null, reason: "no_salary_assigned" });
       }
 
-      const empDoc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
-      if (String(empDoc.company ?? "").trim() !== companyDoc) {
-        return reply.status(403).send({ error: "Employee not in your Company" });
-      }
+      // Cumulative advances this calendar month
+      const { monthStart, monthEnd } = monthBoundsFromDate(postingDate);
+      const monthlyAdvances = await erp.getList(ctx.creds, "Employee Advance", {
+        filters: [
+          ["employee", "=", empName],
+          ["company", "=", ctx.company],
+          ["posting_date", ">=", monthStart],
+          ["posting_date", "<", monthEnd],
+          ["docstatus", "!=", 2],
+        ],
+        fields: ["name", "advance_amount", "docstatus", "posting_date"],
+        limit_page_length: 50,
+      });
 
-      const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, empName);
-      if (monthlySalaryBase == null) {
-        return {
-          eligible: false,
-          maxAmount: null,
-          baseSalary: null,
-          reason: "no_salary_structure",
-        };
-      }
-
-      const maxAmount = Math.round(monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION * 100) / 100;
-      const alreadyRequestedThisMonth = await sumEmployeeAdvancesInSameMonthCompanyCurrency(
-        ctx.creds,
-        companyDoc,
-        companyCurrency,
-        empName,
-        eligibilityPostingDate,
+      const usedAmount = monthlyAdvances.reduce(
+        (s, r) => s + Number(asRecord(r).advance_amount ?? 0), 0,
       );
-      const remainingAmount = Math.max(0, Math.round((maxAmount - alreadyRequestedThisMonth) * 100) / 100);
-      return {
-        eligible: remainingAmount > 0,
-        maxAmount: remainingAmount,
-        baseSalary: monthlySalaryBase,
-        usedAmount: alreadyRequestedThisMonth,
-        monthlyCap: maxAmount,
-        reason: remainingAmount > 0 ? "ok" : "monthly_limit_reached",
-      };
+      const remaining = Math.max(0, cap.monthlyCap - usedAmount);
+      const eligible = remaining > 0;
+
+      // Pending (draft, awaiting approval) advances
+      const pendingAdvances = monthlyAdvances.filter(r => Number(asRecord(r).docstatus ?? 0) === 0);
+
+      return reply.send({
+        eligible,
+        maxAmount: remaining,
+        usedAmount: Math.round(usedAmount),
+        monthlyCap: cap.monthlyCap,
+        baseSalary: cap.baseSalary,
+        grossPay: cap.grossPay,
+        reason: eligible ? undefined : "monthly_limit_reached",
+        hasPendingAdvance: pendingAdvances.length > 0,
+        pendingAdvanceCount: pendingAdvances.length,
+        breakdown: {
+          grossPay: cap.grossPay,
+          baseSalary: cap.baseSalary,
+          nssf: cap.nssf,
+          paye: cap.paye,
+          shif: cap.shif,
+          ahl: cap.ahl,
+          totalStatutory: cap.totalStatutory,
+          oneThirdFloor: cap.oneThirdFloor,
+          totalAdvanceSpace: cap.monthlyCap,
+          usedAmount: Math.round(usedAmount),
+          remaining,
+        },
+      });
     } catch (e) {
-      if (e instanceof ErpError && e.status === 404) {
-        return {
-          eligible: false,
-          maxAmount: null,
-          baseSalary: null,
-          reason: "no_salary_structure",
-        };
-      }
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
     }
   });
 
-  /** Create an Employee Advance (ERP draft). HR admins may supply `employee`; regular employees are self-only. */
+  /** Create an Employee Advance (ERP draft). Validates 1/3-rule cumulative cap and pending block. */
   app.post("/v1/expenses/advances", async (req, reply) => {
-    let ctx: HrContext;
+    let ctx;
     try {
       ctx = resolveHrContext(req);
     } catch (e) {
@@ -1940,89 +1604,82 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const body = (req.body ?? {}) as Record<string, unknown>;
+    const advAmt = Number(body.advance_amount ?? 0);
+    if (!Number.isFinite(advAmt) || advAmt <= 0) {
+      return reply.status(400).send({ error: "advance_amount must be a positive number." });
+    }
+    const postingDate = String(body.posting_date ?? "").trim();
+    if (!postingDate || !/^\d{4}-\d{2}-\d{2}$/.test(postingDate)) {
+      return reply.status(400).send({ error: "posting_date is required (YYYY-MM-DD)." });
+    }
+    const purpose = String(body.purpose ?? "Salary advance").trim() || "Salary advance";
 
     try {
-      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
-      const companyCurrency = await getCompanyDefaultCurrency(ctx.creds, companyDoc);
-      if (!companyCurrency) {
-        return reply.status(400).send({ error: "Set company default currency in ERPNext." });
-      }
-
-      let empName = "";
+      let empName: string;
       if (ctx.canSubmitOnBehalf) {
-        empName = String(body.employee ?? "").trim();
-        if (!empName) return reply.status(400).send({ error: "employee is required for HR users." });
-      } else {
-        const mine = await getLinkedEmployeeName(ctx);
-        if (!mine) return reply.status(403).send({ error: "No Employee linked to your account." });
-        const requested = String(body.employee ?? "").trim();
-        if (requested && requested !== mine) {
-          return reply.status(403).send({ error: "You can only request an advance for your own profile." });
+        const bodyEmp = String(body.employee ?? "").trim();
+        if (!bodyEmp) return reply.status(400).send({ error: "employee is required for HR users." });
+        const empDoc = (await erp.getDoc(ctx.creds, "Employee", bodyEmp)) as Record<string, unknown>;
+        if (String(empDoc.company) !== ctx.company) {
+          return reply.status(403).send({ error: "Employee is not in your Company." });
         }
-        empName = mine;
+        empName = bodyEmp;
+      } else {
+        const linked = await getLinkedEmployeeName(ctx);
+        if (!linked) return reply.status(403).send({ error: "No Employee linked to your account." });
+        empName = linked;
       }
 
-      const advanceAmount = Number(body.advance_amount ?? body.amount ?? 0);
-      if (!Number.isFinite(advanceAmount) || advanceAmount <= 0) {
-        return reply.status(400).send({ error: "advance_amount must be a positive number" });
-      }
-
-      const postingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.posting_date ?? "").trim())
-        ? String(body.posting_date).trim()
-        : new Date().toISOString().slice(0, 10);
-      if (isPastPostingDate(postingDate)) {
-        return reply.status(400).send({ error: "Salary advance date cannot be in the past." });
-      }
-      const purpose = String(body.purpose ?? body.notes ?? "Salary advance").trim() || "Salary advance";
-
-      const empDoc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
-      const empCompany = String(empDoc.company ?? "").trim();
-      if (empCompany !== companyDoc) {
-        return reply.status(403).send({ error: "That employee is not in your company." });
-      }
-
-      const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, empName);
-      if (monthlySalaryBase == null) {
-        return reply.status(400).send({ error: "Assign a salary in payroll before salary advance." });
-      }
-
-      const syncedExchange = await ensureEmployeeAdvanceExchangeOnDraft(
-        ctx.creds,
-        companyDoc,
-        "",
-        empName,
-        postingDate,
-      ).catch(() => null);
-
-      const salaryCurrency = String(syncedExchange?.salaryCurrency ?? companyCurrency).trim() || companyCurrency;
-      const exchangeRate = Number(syncedExchange?.exchangeRate ?? 1) || 1;
-
-      const maxInCompany = monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION;
-      const advanceInCompany =
-        salaryCurrency === companyCurrency ? advanceAmount : advanceAmount * exchangeRate;
-      const alreadyRequestedThisMonth = await sumEmployeeAdvancesInSameMonthCompanyCurrency(
-        ctx.creds,
-        companyDoc,
-        companyCurrency,
-        empName,
-        postingDate,
-      );
-      const round2 = (n: number) => Math.round(n * 100) / 100;
-      const remainingInCompany = Math.max(0, round2(maxInCompany - alreadyRequestedThisMonth));
-      if (round2(advanceInCompany) > round2(remainingInCompany)) {
-        return reply.status(400).send({
-          error: remainingInCompany > 0
-            ? `Advance cannot exceed the remaining monthly salary advance balance of ${remainingInCompany.toFixed(2)}.`
-            : "This employee has already used the full salary advance limit for this month.",
+      // Issue 4: Validate posting_date falls within an active salary structure assignment
+      const cap = await computeOneThirdCap(ctx.creds, ctx.company, empName, postingDate);
+      if (!cap) {
+        return reply.status(422).send({
+          error: "No active salary structure assignment found for this employee on the requested date. Ask HR to set up a salary structure before requesting an advance.",
         });
       }
 
+      // Issue 5: Block if a pending (draft) advance already exists
+      const { monthStart, monthEnd } = monthBoundsFromDate(postingDate);
+      const monthlyAdvances = await erp.getList(ctx.creds, "Employee Advance", {
+        filters: [
+          ["employee", "=", empName],
+          ["company", "=", ctx.company],
+          ["posting_date", ">=", monthStart],
+          ["posting_date", "<", monthEnd],
+          ["docstatus", "!=", 2],
+        ],
+        fields: ["name", "advance_amount", "docstatus"],
+        limit_page_length: 50,
+      });
+
+      const pendingAdvances = monthlyAdvances.filter(r => Number(asRecord(r).docstatus ?? 0) === 0);
+      if (pendingAdvances.length > 0) {
+        return reply.status(409).send({
+          error: "You already have a pending salary advance awaiting approval. Wait for it to be approved or cancel it before submitting a new request.",
+        });
+      }
+
+      // Issue 1: Cumulative 1/3-rule cap check
+      const usedAmount = monthlyAdvances.reduce(
+        (s, r) => s + Number(asRecord(r).advance_amount ?? 0), 0,
+      );
+      const remaining = Math.max(0, cap.monthlyCap - usedAmount);
+      if (advAmt > remaining) {
+        const fmt = (n: number) => Math.round(n).toLocaleString("en-KE");
+        return reply.status(422).send({
+          error: remaining <= 0
+            ? `You have used your full salary advance allowance for this month (${fmt(cap.monthlyCap)} under the 1/3 rule). You may apply again next month.`
+            : `Advance of ${fmt(advAmt)} exceeds the remaining allowance of ${fmt(remaining)} for this month. Under the Kenyan Employment Act (s.19), your net pay after all deductions must not fall below one-third of gross pay (${fmt(cap.oneThirdFloor)}). Gross: ${fmt(cap.grossPay)}, statutory deductions: ${fmt(cap.totalStatutory)}, advance space: ${fmt(cap.monthlyCap)}, already used: ${fmt(usedAmount)}.`,
+        });
+      }
+
+      const empDoc = (await erp.getDoc(ctx.creds, "Employee", empName)) as Record<string, unknown>;
       const created = await erp.createDoc(ctx.creds, "Employee Advance", {
         employee: empName,
         employee_name: String(empDoc.employee_name ?? empDoc.name ?? empName),
-        company: companyDoc,
+        company: ctx.company,
         posting_date: postingDate,
-        advance_amount: advanceAmount,
+        advance_amount: advAmt,
         purpose,
       }) as Record<string, unknown>;
       return reply.status(201).send({ data: created });
@@ -2061,104 +1718,7 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  /** Submit draft Employee Advance (docstatus 0 → submitted). */
-  app.post("/v1/expenses/advances/:name/submit", async (req, reply) => {
-    let ctx: HrContext;
-    try {
-      ctx = resolveHrContext(req);
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      throw e;
-    }
-    if (!ctx.canSubmitOnBehalf) {
-      return reply.status(403).send({ error: "HR access is required to submit this advance." });
-    }
-    const name = String((req.params as { name: string }).name ?? "").trim();
-    if (!name) return reply.status(400).send({ error: "Advance name is required" });
-    try {
-      const companyDoc = await resolveCompanyDocName(ctx.creds, ctx.company);
-      const cur = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
-      if (String(cur.company) !== companyDoc) {
-        return reply.status(403).send({ error: "Advance not in your company." });
-      }
-      const ds = Number(cur.docstatus ?? 0);
-      if (ds !== 0) {
-        return reply.status(409).send({ error: "This advance is already submitted in payroll." });
-      }
-
-      // Same business rules as POST /v1/expenses/advances (month-to-date total within half-salary cap).
-      const employee = String(cur.employee ?? "").trim();
-      const postingDate = /^\d{4}-\d{2}-\d{2}$/.test(String(cur.posting_date ?? "").trim())
-        ? String(cur.posting_date).trim()
-        : new Date().toISOString().slice(0, 10);
-      if (isPastPostingDate(postingDate)) {
-        return reply.status(400).send({ error: "Salary advance date cannot be in the past." });
-      }
-
-      let companyCurrency = "";
-      let exchangeRate = 0;
-      let salaryCurrency = "";
-      if (employee) {
-        const synced = await ensureEmployeeAdvanceExchangeOnDraft(
-          ctx.creds,
-          companyDoc,
-          name,
-          employee,
-          postingDate
-        );
-        companyCurrency = synced.companyCurrency;
-        salaryCurrency = synced.salaryCurrency;
-        exchangeRate = synced.exchangeRate;
-      }
-
-      const advanceAmount = Number(cur.advance_amount ?? 0);
-      if (employee && Number.isFinite(advanceAmount) && advanceAmount > 0) {
-        const monthlySalaryBase = await getLatestSalaryBase(ctx.creds, companyDoc, employee);
-        if (monthlySalaryBase == null) {
-          return reply
-            .status(400)
-            .send({ error: "Assign a salary in payroll before salary advance." });
-        }
-        if (exchangeRate <= 0) {
-          return reply.status(400).send({ error: "Add a currency exchange rate in ERP for this date." });
-        }
-        const maxInCompany = monthlySalaryBase * SALARY_ADVANCE_MAX_SALARY_FRACTION;
-        const advanceInCompany =
-          salaryCurrency === companyCurrency ? advanceAmount : advanceAmount * exchangeRate;
-        const round2 = (n: number) => Math.round(n * 100) / 100;
-        const existingMonthTotal = await sumEmployeeAdvancesInSameMonthCompanyCurrency(
-          ctx.creds,
-          companyDoc,
-          companyCurrency,
-          employee,
-          postingDate,
-          { excludeName: name },
-        );
-        const remainingInCompany = Math.max(0, round2(maxInCompany - existingMonthTotal));
-        if (round2(advanceInCompany) > round2(remainingInCompany)) {
-          return reply.status(400).send({
-            error: remainingInCompany > 0
-              ? `Advance cannot exceed the remaining monthly salary advance balance of ${remainingInCompany.toFixed(2)}.`
-              : "This employee has already used the full salary advance limit for this month.",
-          });
-        }
-      }
-      /* Full doc: `frappe.client.submit` uses `get_doc(sparse dict)` which does not reload from DB;
-       * omitted fields (e.g. exchange_rate) would stay at defaults and fail HR validate. */
-      await erp.submitDoc(ctx.creds, "Employee Advance", name, { mode: "full" });
-      const after = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
-      return { data: after };
-    } catch (e) {
-      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
-      if (e instanceof ErpError && e.status === 404) {
-        return reply.status(404).send({ error: "Advance not found in payroll." });
-      }
-      if (e instanceof ErpError) return replyErp(reply, e);
-      throw e;
-    }
-  });
-
-  /** Delete draft Employee Advance only (docstatus 0). HR: any draft in company; others: own draft only. */
+  /** Delete a draft Employee Advance. Employees may only delete their own drafts. */
   app.delete("/v1/expenses/advances/:name", async (req, reply) => {
     let ctx;
     try {
@@ -2185,6 +1745,97 @@ export const expenseRoutes: FastifyPluginAsync = async (app) => {
       }
       await erp.deleteDoc(ctx.creds, "Employee Advance", name);
       return reply.status(200).send({ ok: true });
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Submit a draft Employee Advance in ERPNext (transitions docstatus 0 → 1). HR-ops credentials. */
+  app.post("/v1/expenses/advances/:name/submit", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const name = (req.params as { name: string }).name;
+    try {
+      const doc = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      if (String(doc.company) !== ctx.company) {
+        return reply.status(403).send({ error: "Advance not in your Company." });
+      }
+      if (Number(doc.docstatus ?? 0) !== 0) {
+        return reply.status(409).send({ error: "Only draft advances can be submitted." });
+      }
+      const result = await erp.submitDoc(ctx.creds, "Employee Advance", name, { mode: "full" });
+      // Re-fetch so callers get the updated doc fields
+      const updated = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      return reply.send({ ok: true, data: updated, erp: result });
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Cancel a submitted Employee Advance in ERPNext (transitions docstatus 1 → 2). HR-ops credentials. */
+  app.post("/v1/expenses/advances/:name/cancel", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const name = (req.params as { name: string }).name;
+    try {
+      const doc = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      if (String(doc.company) !== ctx.company) {
+        return reply.status(403).send({ error: "Advance not in your Company." });
+      }
+      if (Number(doc.docstatus ?? 0) !== 1) {
+        return reply.status(409).send({ error: "Only submitted advances can be cancelled." });
+      }
+      await erp.cancelDoc(ctx.creds, "Employee Advance", name);
+      return reply.send({ ok: true, data: { employee: doc.employee, employee_name: doc.employee_name, advance_amount: doc.advance_amount } });
+    } catch (e) {
+      if (e instanceof ErpError) return replyErp(reply, e);
+      throw e;
+    }
+  });
+
+  /** Mark an approved Employee Advance as paid by updating paid_amount in ERPNext. Best-effort. */
+  app.post("/v1/expenses/advances/:name/mark-paid", async (req, reply) => {
+    let ctx;
+    try {
+      ctx = resolveHrContext(req);
+    } catch (e) {
+      if (e instanceof HttpError) return reply.status(e.status).send({ error: e.message });
+      throw e;
+    }
+    const name = (req.params as { name: string }).name;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const paidAmount = Number(body.paid_amount ?? 0);
+    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+      return reply.status(400).send({ error: "paid_amount must be a positive number." });
+    }
+    try {
+      const doc = (await erp.getDoc(ctx.creds, "Employee Advance", name)) as Record<string, unknown>;
+      if (String(doc.company) !== ctx.company) {
+        return reply.status(403).send({ error: "Advance not in your Company." });
+      }
+      if (Number(doc.docstatus ?? 0) !== 1) {
+        return reply.status(409).send({ error: "Only submitted advances can be marked as paid." });
+      }
+      // Use set_value for field-level update on a submitted document
+      await erp.callMethod(ctx.creds, "frappe.client.set_value", {
+        doctype: "Employee Advance",
+        name,
+        fieldname: "paid_amount",
+        value: paidAmount,
+      });
+      return reply.send({ ok: true });
     } catch (e) {
       if (e instanceof ErpError) return replyErp(reply, e);
       throw e;
