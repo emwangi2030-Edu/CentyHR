@@ -130,7 +130,8 @@ async function loadEmployeeReadableByCaller(ctx: HrContext, employeeId: string):
     const cached = erpCacheGet<Record<string, unknown>>(docCacheKey);
     const cur = cached ?? ((await erp.getDoc(ctx.creds, "Employee", employeeId)) as Record<string, unknown>);
     if (!cached) erpCacheSet(docCacheKey, cur, ERP_EMPLOYEE_DOC_TTL_MS);
-    if (String(cur.company) !== ctx.company) {
+    // HR admins can view employees across subsidiary companies (company-name mismatch on import is common).
+    if (!ctx.canSubmitOnBehalf && String(cur.company) !== ctx.company) {
       return { ok: false, status: 403, error: "Employee not in your Company" };
     }
     if (!ctx.canSubmitOnBehalf) {
@@ -1514,7 +1515,10 @@ export const employeeRoutes: FastifyPluginAsync = async (app) => {
       patch.status = st === "active" ? "Active" : "Inactive";
       try {
         const existing = (await erp.getDoc(ctx.creds, "Employee", name)) as Record<string, unknown>;
-        if (String(existing.company) !== ctx.company) {
+        // HR admins are allowed to activate/deactivate employees whose ERPNext company name differs
+        // from the bridge-token company (e.g. subsidiary or company-name mismatch on import).
+        // The ERP credentials already scoped the fetch; enforce the guard only for non-admins.
+        if (!ctx.canSubmitOnBehalf && String(existing.company) !== ctx.company) {
           return reply.status(403).send({ error: "Employee not in your Company" });
         }
         if (normalizeStatus(existing.status) === "left") {
