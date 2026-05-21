@@ -1,6 +1,14 @@
-# When HK-MBURU or NKGachoki push to `staging`, SSH to the app server and run
-# /opt/hr-staging-deploy-safe.sh → updates /opt/centy-hr-integration-clean (bff/),
-# restarts PM2 centy-hr-bff-clean, checks https://staging.centyhq.com/hr-api/health
+# When HK-MBURU or NKGachoki push to any deploy branch (see `on:` below), SSH to
+# the app server and run /opt/hr-staging-deploy-safe.sh → updates
+# /opt/centy-hr-integration-clean (bff/), restarts PM2 centy-hr-bff-clean,
+# checks https://staging.centyhq.com/hr-api/health
+#
+# The VPS always deploys the `staging` branch (--branch staging) regardless of
+# which branch triggered the run.
+#
+# NOTE: GitHub reads this trigger from the workflow file on the *pushed* branch,
+# so for a push to fire this, this file must exist on that branch. Keep it synced
+# to every branch listed under `on.push.branches` (merge this branch into each).
 #
 # Reuses the same Actions secrets/variables as B2B-Pay-Hub (same SSH host + key).
 #
@@ -8,7 +16,13 @@ name: Deploy HR BFF staging VPS
 
 on:
   push:
-    branches: [staging]
+    branches:
+      - main
+      - staging
+      - recruitment
+      - performance
+      - CentyGuard
+      - 'feature/**'
   workflow_dispatch:
 
 concurrency:
